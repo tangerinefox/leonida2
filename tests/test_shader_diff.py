@@ -16,12 +16,11 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 import shader_diff as sd
 
 
-@pytest.mark.parametrize("seed", [3179, 1, 99])
-def test_integer_operands_never_read_float_results(seed):
-    # Seed 3179 exhausts the clean register pool before an integer add. Floating
-    # results may differ in NaN payload, so their bits cannot feed integer checks.
-    # Seeds 1 and 99 check the general invariant without requiring exhaustion.
-    lines, writers = sd.generate_program(random.Random(seed), 150)
+@pytest.mark.parametrize("seed, ops", [(0, (*sd._FLOAT_OPS, "v_add_nc_u32")), (1, None), (99, None)])
+def test_integer_operands_never_read_float_results(seed, ops):
+    # The restricted pool with seed 0 exhausts the clean registers before an
+    # integer add. Seeds 1 and 99 check the invariant with the default op mix.
+    lines, writers = sd.generate_program(random.Random(seed), 150, ops=ops)
     float_results = set()
     recovered = False
     for line in lines:
@@ -34,15 +33,15 @@ def test_integer_operands_never_read_float_results(seed):
             float_results.add(dst)
         else:
             assert not (set(sources) & float_results), line
-            if op == "v_mov_b32" and float_results == set(sd.SCRATCH):
+            if line == f"v_mov_b32 v{dst}, 0" and float_results == set(sd.SCRATCH):
                 recovered = True
             float_results.discard(dst)
-    if seed == 3179:
+    if ops is not None:
         assert recovered, "fixture must reach the exhausted-pool boundary"
     for reg, (op, index) in writers.items():
         assert lines[index - 1].startswith(f"{op.split('/')[0]} v{reg},")
         assert not any(line.split()[1] == f"v{reg}," for line in lines[index:])
-    assert (lines, writers) == sd.generate_program(random.Random(seed), 150)
+    assert (lines, writers) == sd.generate_program(random.Random(seed), 150, ops=ops)
 
 
 
@@ -61,8 +60,8 @@ def test_program_generation_is_deterministic(seed):
 
 
 @pytest.mark.parametrize("seed, n_ops, expected_reg, seed_only", [
-    pytest.param(24, 6, 10, True, id="preserve-three-alu-results"),
-    pytest.param(3, 18, 11, False, id="replace-oldest-last-alu-write"),
+    pytest.param(1, 6, 9, True, id="preserve-three-alu-results"),
+    pytest.param(1, 18, 10, False, id="replace-oldest-last-alu-write"),
 ])
 def test_scalar_copy_destination_from_write_history(seed, n_ops, expected_reg, seed_only):
     lines, writers = sd.generate_program(random.Random(seed), n_ops)
@@ -104,7 +103,7 @@ def test_run_one_observes_scalar_copy(monkeypatch):
 
     def corrupt_scalar_copy(path, body, with_export):
         if with_export:
-            # Only the translated listing gets the wrong scalar (seeds are under 256).
+            # Only the translated listing gets a word outside the scalar seed pool.
             body = body[:-1] + [f"{opcode} {dst} 12345"]
         write_listing(path, body, with_export)
 

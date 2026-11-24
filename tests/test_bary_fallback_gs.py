@@ -785,6 +785,11 @@ class TestMainAndCLI(unittest.TestCase):
             self.assertEqual(p.stdout, "")
             self.assertNotIn("Traceback", p.stderr)
 
+    def test_gs_spvasm_rejects_negative_or_bool_bary_location(self) -> None:
+        for bad in (-1, True, False, "1"):
+            with self.assertRaises(ValueError):
+                bary_fallback_gs.gs_spvasm([0], bad)
+
 
 if __name__ == "__main__":
     unittest.main()

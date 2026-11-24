@@ -173,19 +173,22 @@ def classify(dim, fmt, words):
             entry["control"].append(f"texel {i}: x read back 0x{got[0]:08x}, staged 0x{texel[0]:08x}")
         if channels == 2 and got[3] != texel[1]:
             entry["control"].append(f"texel {i}: y read back 0x{got[3]:08x}, staged 0x{texel[1]:08x}")
+        x_rules = rules(texel[0])
+        y_rules = rules(texel[1]) if channels == 2 else None
         for form, k in forms.items():
             lo, hi = got[k] & 0xFFFF, got[k] >> 16
+            matches_saturation = False
             for r in agree[form]:
-                want = rules(texel[0])[r]
-                ok = lo == want
+                ok = lo == x_rules[r]
                 if channels == 2:
-                    ok = ok and hi == rules(texel[1])[r]
+                    ok = ok and hi == y_rules[r]
                 agree[form][r] += ok
+                matches_saturation |= ok and r in ("sat_u", "sat_s")
             if channels == 1:
                 key = "kept" if hi == SEED >> 16 else f"0x{hi:04x}"
                 high[form][key] = high[form].get(key, 0) + 1
-            if len(first_off[form]) < 4 and not any(
-                    (lo == rules(texel[0])[r]) for r in ("sat_u", "sat_s")):
+            # Keep examples that match neither saturation rule. The packed word holds X low and Y high.
+            if len(first_off[form]) < 4 and not matches_saturation:
                 first_off[form].append({"in": [f"0x{v:08x}" for v in texel], "got": f"0x{got[k]:08x}"})
     for form in forms:
         entry["forms"][form] = {"match": agree[form], "high_half": high[form] or "n/a (two channels)",

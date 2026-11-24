@@ -92,6 +92,35 @@ class ProgramText(unittest.TestCase):
             leftovers = [p for p in Path(tmp).iterdir() if p.name.startswith("vk_fuzz_")]
             self.assertEqual(leftovers, [])
 
+    def test_read_dump_takes_the_first_wave_of_a_larger_buffer(self):
+        import struct
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            dump = Path(tmp) / "d.bin"
+            # wave32, words=1: vk_compute_test's buffer is at least 64 words, so the dump is 64 words long. Each lane
+            # stores its own value, and the tail holds a sentinel that is not the harness fill, so a read that took
+            # the wrong words, the wrong order or the tail would not match.
+            sentinel = 0xDEADBEEF
+            self.assertNotEqual(sentinel, R.FILL)
+            dump.write_bytes(struct.pack("<64I", *([0x100 + lane for lane in range(32)] + [sentinel] * 32)))
+            lanes = R.read_dump(str(dump), 1, 32)
+            self.assertEqual(lanes, [[0x100 + lane] for lane in range(32)])
+            self.assertNotIn([sentinel], lanes)
+            # wave64, words=1 from a two-group dump (128 words): the buffer is longer than the request the other way
+            # round, and only the first 64 words are the wave's.
+            dump.write_bytes(struct.pack("<128I", *([0x200 + lane for lane in range(64)] + [sentinel] * 64)))
+            self.assertEqual(R.read_dump(str(dump), 1, 64), [[0x200 + lane] for lane in range(64)])
+            # An exact-size dump still reads as before.
+            dump.write_bytes(struct.pack("<128I", *range(128)))
+            lanes = R.read_dump(str(dump), 4, 32)
+            self.assertEqual(len(lanes), 32)
+            self.assertEqual(lanes[0], [0, 1, 2, 3])
+            self.assertEqual(lanes[31], [124, 125, 126, 127])
+            # Too short or missing: no result.
+            dump.write_bytes(struct.pack("<31I", *range(31)))
+            self.assertIsNone(R.read_dump(str(dump), 1, 32))
+            self.assertIsNone(R.read_dump(str(Path(tmp) / "missing.bin"), 1, 32))
+
     def test_judge_counts_skips_and_mismatches(self):
         import unittest.mock as mock
         obs = ["v_mov_b32 v8, v1", "v_mov_b32 v9, v2", "v_mov_b32 v10, v3", "v_mov_b32 v11, v4"]

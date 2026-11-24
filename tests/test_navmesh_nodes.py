@@ -272,6 +272,8 @@ class ArchiveTest(unittest.TestCase):
     def test_cli_refuses_an_unwritable_out_before_the_archives_are_read(self):
         # Both archives are read before the summary is written, so a --out that cannot be written used to cost
         # the whole run and then end in a traceback.
+        if os.name != "nt" and os.geteuid() == 0:
+            self.skipTest("root bypasses read-only file mode")
         out = os.path.join(self.tmp.name, "read-only.json")
         with open(out, "w", encoding="utf-8", newline="\n") as f:
             f.write("{}\n")

@@ -20,6 +20,7 @@ PASS = "import unittest\nimport helper\nclass T(unittest.TestCase):\n    def tes
        "    def test_b(self): pass\n"
 FAIL = "import unittest\nclass T(unittest.TestCase):\n    def test_a(self): self.assertEqual(1, 2, 'boom-msg')\n"
 BROKEN = "import no_such_module_anywhere\n"
+HANG = "import time\nprint('before-sleep-marker', flush=True)\ntime.sleep(60)\n"
 
 
 def suite(tmp, files):
@@ -44,11 +45,59 @@ def cli(*argv):
 
 
 class RunnerTest(unittest.TestCase):
+    def test_parallel_timeout_reports_partial_output_and_keeps_healthy_modules(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            suite(tmp, {"helper.py": "X = 1\n", "test_hang.py": HANG,
+                        "test_pass_one.py": PASS, "test_pass_two.py": PASS})
+            result = cli(tmp, "-j", "2", "--timeout", "1")
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("before-sleep-marker", result.stdout)
+            self.assertIn("==== FAILED: test_hang", result.stdout)
+            self.assertIn("TIMED OUT after 1 s: test_hang", result.stdout)
+            self.assertIn("3 files, 4 tests, 1 files failed", result.stdout)
+            self.assertNotIn("Traceback", result.stdout + result.stderr)
+
+    def test_serial_timeout_keeps_discover_output_and_names_the_suite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            suite(tmp, {"test_hang.py": HANG})
+            result = cli(tmp, "-j", "1", "--timeout", "1")
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("before-sleep-marker", result.stdout)
+            self.assertIn("TIMED OUT after 1 s: unittest discover in", result.stderr)
+            self.assertIn(tmp, result.stderr)
+            self.assertNotIn("Traceback", result.stdout + result.stderr)
+
+    def test_timeout_requires_positive_finite_seconds(self):
+        for value in ("0", "-1", "nan", "inf", "-inf"):
+            with self.subTest(value=value):
+                result = cli("unused-suite", "--timeout=" + value)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("positive finite", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+
+    def test_out_of_range_timeout_is_rejected_before_running_the_suite(self):
+        for jobs in (1, 2):
+            for value in ("86400.1", "1e100"):
+                with self.subTest(jobs=jobs, value=value):
+                    result = cli("unused-suite", "-j", str(jobs), "--timeout=" + value)
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn("no greater than 86400", result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+                    self.assertNotIn("TIMED OUT", result.stdout + result.stderr)
+                    self.assertNotIn("no test*.py files", result.stdout)
+
+    def test_maximum_timeout_runs_a_passing_suite_in_both_modes(self):
+        for jobs in (1, 2):
+            with self.subTest(jobs=jobs), tempfile.TemporaryDirectory() as tmp:
+                suite(tmp, {"helper.py": "X = 1\n", "test_pass.py": PASS})
+                result = cli(tmp, "-j", str(jobs), "--timeout", "86400")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_custom_patterns_find_only_python_modules_in_packages(self):
         with tempfile.TemporaryDirectory() as tmp:
             suite(tmp, {"case_one.py": "", "case_two.txt": "", "case_bad-name.py": "",
                         "pkg/__init__.py": "", "pkg/case_two.py": "", "plain/case_three.py": ""})
-            self.assertEqual(r.test_modules(tmp, "case_*.py"), ["case_one", "pkg.case_two"])
+            self.assertEqual(r.test_modules(tmp, "case_*.py"), ["case_one", "pkg.__init__", "pkg.case_two"])
             self.assertEqual(r.test_modules(tmp, "*"), ["case_one", "pkg.__init__", "pkg.case_two"])
 
     def test_pattern_selects_files_without_importing_excluded_modules(self):
@@ -65,7 +114,7 @@ class RunnerTest(unittest.TestCase):
                     if jobs == 1:
                         self.assertIn("Ran 4 tests", result.stderr)
                     else:
-                        self.assertIn("2 files, 4 tests, 0 files failed", result.stdout)
+                        self.assertIn("3 files, 4 tests, 0 files failed", result.stdout)
 
     def test_pattern_no_matches_is_an_error_in_both_modes(self):
         for jobs in (1, 2):
@@ -99,7 +148,58 @@ class RunnerTest(unittest.TestCase):
             suite(tmp, {"test_one.py": "", "helper.py": "", "pkg/__init__.py": "", "pkg/test_two.py": "",
                         "plain_dir/test_three.py": "", "testx.py": ""})
             # discover enters packages only, and its pattern is test*.py
-            self.assertEqual(r.test_modules(tmp), ["test_one", "testx", "pkg.test_two"])
+            self.assertEqual(r.test_modules(tmp), ["test_one", "testx", "pkg.__init__", "pkg.test_two"])
+
+    def test_package_initializer_failure_is_seen_in_both_modes(self):
+        init_fail = "import unittest\nclass T(unittest.TestCase):\n" \
+                    "    def test_fail(self): self.assertEqual(1, 2, 'init-boom')\n"
+        for jobs in (1, 2):
+            with self.subTest(jobs=jobs), tempfile.TemporaryDirectory() as tmp:
+                suite(tmp, {"helper.py": "X = 1\n", "pkg/__init__.py": init_fail, "pkg/test_child.py": PASS})
+                result = cli(tmp, "-j", str(jobs))
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("init-boom", result.stdout + result.stderr)
+                if jobs == 1:
+                    self.assertIn("Ran 3 tests", result.stderr)
+                else:
+                    self.assertIn("==== FAILED: pkg.__init__", result.stdout)
+                    self.assertIn("2 files, 3 tests, 1 files failed", result.stdout)
+
+    def test_package_initializer_runs_when_no_filename_matches_pattern(self):
+        init_fail = "import unittest\nclass T(unittest.TestCase):\n" \
+                    "    def test_fail(self): self.assertEqual(1, 2, 'init-boom')\n"
+        for jobs in (1, 2):
+            with self.subTest(jobs=jobs), tempfile.TemporaryDirectory() as tmp:
+                suite(tmp, {"helper.py": "X = 1\n", "pkg/__init__.py": init_fail, "pkg/test_child.py": PASS})
+                result = cli(tmp, "-j", str(jobs), "-p", "zzz*.py")
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("init-boom", result.stdout + result.stderr)
+
+    def test_package_initializer_runs_once_in_parallel(self):
+        # `python -m unittest pkg.__init__` imports pkg and then runs the same file again as pkg.__init__, so this
+        # registration happens twice; the runner hands unittest the package name instead.
+        init = ("import unittest\n"
+                "registrations = []\n"
+                "registrations.append(__name__)\n"
+                "class T(unittest.TestCase):\n"
+                "    def test_once(self):\n"
+                "        self.assertEqual(registrations, ['pkg'])\n")
+        for jobs in (1, 2):
+            with self.subTest(jobs=jobs), tempfile.TemporaryDirectory() as tmp:
+                suite(tmp, {"pkg/__init__.py": init})
+                result = cli(tmp, "-j", str(jobs))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_empty_package_alone_is_not_a_false_green(self):
+        # -j 1 forwards to discover, which exits 5 when nothing ran; a parallel run whose only job is an empty
+        # initializer must not report success either.
+        for jobs in (1, 2):
+            with self.subTest(jobs=jobs), tempfile.TemporaryDirectory() as tmp:
+                suite(tmp, {"pkg/__init__.py": ""})
+                result = cli(tmp, "-j", str(jobs))
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                if jobs == 2:
+                    self.assertIn("no tests ran", result.stdout)
 
     def test_all_pass(self):
         with tempfile.TemporaryDirectory() as tmp:

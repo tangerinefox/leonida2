@@ -382,7 +382,9 @@ class ShadersStageWithTheDll(unittest.TestCase):
 
             def fake_translate(disasm, spirv, jobs, emulate=False, fallbacks=()):
                 ran.append("translate")
-                touch(spirv, "index.json")
+                os.makedirs(spirv, exist_ok=True)
+                with open(os.path.join(spirv, "index.json"), "w", encoding="utf-8") as f:
+                    json.dump({"shader": {"stage": "vs"}}, f)
 
             def stage():
                 ran.clear()

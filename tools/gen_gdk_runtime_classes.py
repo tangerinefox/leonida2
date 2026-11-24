@@ -133,6 +133,9 @@ def main(argv: list[str] | None = None) -> int:
     problems = check(table["classes"], table["interfaces"])
     for p in problems:
         print(f"warning: {p}", file=sys.stderr)
+    parent = os.path.dirname(os.path.abspath(a.out))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     with open(a.out, "w", encoding="utf-8", newline="\n") as f:
         json.dump(table, f, indent=1, sort_keys=True)
         f.write("\n")

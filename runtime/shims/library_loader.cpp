@@ -266,7 +266,7 @@ FARPROC WINAPI get_proc_address(HMODULE module, LPCSTR name) {
         SetLastError(ERROR_PROC_NOT_FOUND);
         return nullptr;
     }
-    if (module && !IS_INTRESOURCE(name)) {
+    if (module) {
         const DWORD error = GetLastError();
         const std::string dll = host_module_name(module);
         void* shim = dll.empty() ? nullptr : find(dll, what);

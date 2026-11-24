@@ -586,6 +586,47 @@ int main() {
         EXPECT(ms.count() >= 45 && ms.count() < 1000);
     }
 
+    // TOKEN_ON_TIMEOUT (flag 2) and multi-event pacing (origin poll + blocking flip/vblank wait).
+    {
+        ManualFrameClock clock;
+        FramePacer pacer(clock);
+        EXPECT(pacer.set_frame_interval(period, 3, 0) == pacer_hr::ok);
+        EXPECT(pacer.schedule_frame_event(frame_event_origin, 0, 0) == pacer_hr::ok);
+        EXPECT(pacer.schedule_frame_event(frame_event_vblank, 0, 0) == pacer_hr::ok);
+        EXPECT(pacer.schedule_frame_event(frame_event_flip, 0, 0) == pacer_hr::ok);
+
+        // Origin poll with timeout 0 and TOKEN_ON_TIMEOUT issues a consecutive token and returns S_FALSE.
+        std::uint64_t tok1 = 0;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, frame_wait_flag_token_on_timeout, &tok1) ==
+               pacer_hr::false_);
+        EXPECT(tok1 == 1);
+        EXPECT(pacer.check_present_token(tok1) == pacer_hr::ok);
+
+        // A blocking flip wait paces to the next tick and preserves the caller's token unchanged.
+        auto flip_wait = std::async(std::launch::async, [&] {
+            std::uint64_t preserved = tok1;
+            const std::int32_t hr = pacer.wait_frame_event(frame_event_flip, infinite_timeout_ms, 0, &preserved);
+            return Result{hr, preserved};
+        });
+        EXPECT(blocked(flip_wait));
+        clock.advance_us(period);
+        const Result fr = flip_wait.get();
+        EXPECT(fr.hr == pacer_hr::ok && fr.token == tok1);
+
+        // Second flip wait blocks for the following tick; vblank wait on tick 1 succeeds immediately (independent).
+        EXPECT(pacer.wait_frame_event(frame_event_vblank, 0, 0, nullptr) == pacer_hr::ok);
+        auto flip_wait2 = std::async(std::launch::async, [&] {
+            return Result{pacer.wait_frame_event(frame_event_flip, infinite_timeout_ms, 0, nullptr), 0};
+        });
+        EXPECT(blocked(flip_wait2));
+        clock.advance_us(period);
+        EXPECT(flip_wait2.get().hr == pacer_hr::ok);
+
+        // Origin wait at tick 2 advances consecutively after the early-started token 1.
+        std::uint64_t tok2 = 0;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &tok2) == pacer_hr::ok && tok2 == 2);
+    }
+
     std::printf("frame_pacer_test: all cases pass\n");
     return 0;
 }

@@ -453,6 +453,44 @@ exceptions. The chunk table's offsets are 256-byte aligned (physical) and 4 KiB 
 (virtual), and the virtual ranges cover every allocation the parser could lay out. The
 12-bit padding on BCPack chunks is zero-filled (see the header section).
 
+### No name streams in the pools
+
+A pool holds no name table and no string data (BUILD-1368). An earlier claim described a
+`nameTable` stream of 64-byte records (65,536 slots) and a `nameData` stream of ASCII strings;
+neither exists in this install. Every byte of a pool falls into one of the regions below
+(`tools/ttpf_mips.py` `Pool`; all 57 pools, counts only):
+
+| Region | Where | What it holds |
+|---|---|---|
+| RDS5 header and chunk table | 0x00 to `0x18 + (count − 1) * 8`, zero-padded to the ETPF index | the fields in the table above |
+| ETPF header | `etpf`, 16 bytes | magic, version, `textures`, `area` |
+| descriptors | `etpf + 0x10`, 16 bytes × `textures` | one texture record each |
+| asset keys | after the descriptors, 8 bytes × `textures` | one u64 per record; unique within each pool (57 / 57), 357,115 keys |
+| trailing metadata | after the keys, to `etpf + 0x10 + area + 32 × textures` | `area + 8 × textures` bytes: 13,973,528 in all |
+| zero padding | to chunk 0's physical offset | 0 non-zero bytes in 57 / 57 pools |
+| texture data | the chunk ranges | one virtual allocation per texture |
+
+- **The virtual space has no room for another stream.** Chunk 0's virtual offset is the
+  4 KiB-aligned metadata size and equals the lowest texture base in 57 / 57 pools. Texture bases
+  rise strictly in record order (0 duplicates, 0 unmapped), each allocation runs to the next base
+  and the last one to the virtual size (`Pool.span`).
+- **The trailing metadata reads as uniform random bytes.** In each of the 52 pools with at least
+  1 KiB of it, it has 7.87–8.00 bits/byte. It holds 54,497 zero bytes against 54,584 for uniform
+  bytes, and 0 repeated aligned 16-byte blocks. Its 3,166 printable ASCII runs of 8 bytes or more
+  (longest 17) match the 3,161 that uniform bytes give. Neither zlib nor raw deflate inflates it
+  from its start, from the end of the descriptors or from the end of `area`.
+  *Hypothesis:* per-texture digests or encrypted data. Under the ground rules it stays unread.
+- **The names occur nowhere else either.** The literal strings `nameTable`, `nameData` and
+  `streamName` occur 0 times in the 57 pool files (raw bytes, 57.94 GiB) and in the inflated
+  streams of `common.rpf` (954 streams), `script.rpf` (1,057) and `data.rpf` (28,509). Only 5 of
+  those streams contain `ttdb` at all: 2 XML content documents in `common.rpf` and 3 `RBF0` UI
+  documents in `data.rpf`. The UI documents use it in a member that holds a texture ID; no stream
+  holds a name table.
+
+What links a texture to the rest of the game is its u64 asset key. Models and materials
+reference textures by that key, and exported textures are named `texture_<index>_<key>`. The
+original texture names are not in the pools, and none of the streams searched above holds them.
+
 ### Codec ids are the BCPack mode
 
 The on-disk codec ids are `0x04, 0x0C, 0x10, 0x14, 0x18, 0x1C, 0x20`; shifting right by 26

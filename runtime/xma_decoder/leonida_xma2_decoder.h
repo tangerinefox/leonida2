@@ -25,6 +25,10 @@ enum LeonidaXma2Status {
 
 int32_t leonida_xma2_decoder_create(uint32_t sample_rate, uint32_t channels,
                                     LeonidaXma2Decoder **out_decoder);
+/* Like leonida_xma2_decoder_create, but decodes like the console's XMA hardware: the first
+   frame is kept and there is no 64-sample start skip; the caller applies the context's skip. */
+int32_t leonida_xma2_decoder_create_hardware(uint32_t sample_rate, uint32_t channels,
+                                             LeonidaXma2Decoder **out_decoder);
 int32_t leonida_xma2_decode_buffer(LeonidaXma2Decoder *decoder,
                                    const uint8_t *input, size_t input_len,
                                    LeonidaXma2PcmBlock **out_block);

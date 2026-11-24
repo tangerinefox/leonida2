@@ -3,7 +3,8 @@
 They used to list only build.py, compute_fixture.py, rdna2spirv.py and their .asm files, so an edit to a module the
 translator imports (tools/spirv_asm.py, spirv_asm_tables.py, shader_ir.py, ...) left the last build's SPIR-V in place
 (old #3752, BUILD-1064). The rules now depend on LEONIDA_TRANSLATOR_DEPS (runtime/cmake/translator_deps.cmake); this
-checks that list against what build.py reaches. No compiler needed; the cmake -P case is skipped without cmake.
+checks the imports of build.py and the native catalog writer. No compiler is needed. The cmake -P check runs when
+cmake is on PATH.
 """
 import ast
 import os
@@ -33,11 +34,12 @@ def listed():
 
 
 def reached():
-    """build.py, the tools scripts it runs (named by a string literal) and every local module they import."""
+    """build.py, the scripts it runs, the native shader catalog and their transitive local imports."""
     tree = ast.parse(BUILD_PY.read_text(encoding="utf-8"))
-    todo = [BUILD_PY] + [TOOLS / n.value for n in ast.walk(tree)
-                         if isinstance(n, ast.Constant) and isinstance(n.value, str)
-                         and n.value.endswith(".py") and (TOOLS / n.value).is_file()]
+    todo = [BUILD_PY, TOOLS / "native_pso_hashes.py"]
+    todo.extend(TOOLS / n.value for n in ast.walk(tree)
+                if isinstance(n, ast.Constant) and isinstance(n.value, str)
+                and n.value.endswith(".py") and (TOOLS / n.value).is_file())
     seen = set()
     while todo:
         path = todo.pop()
@@ -60,7 +62,7 @@ def reached():
 
 
 class TranslatorDepsTest(unittest.TestCase):
-    def test_the_list_covers_every_local_module_build_py_reaches(self):
+    def test_the_list_covers_build_py_and_native_catalog_imports(self):
         self.assertEqual({p for p in listed() if p.endswith(".py")}, reached())
 
     def test_the_list_has_the_data_files_the_translator_reads(self):

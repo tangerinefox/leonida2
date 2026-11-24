@@ -85,11 +85,14 @@ class Rpf9dumpExitCodeTest(unittest.TestCase):
             src = root / "audio.rpf"
             awc_rpf(src)
             wav = root / "out" / "audio" / "xma" / "audio_0001_at_0000000000001000" / "00001234.xma.wav"
-            blocker = Path(str(wav) + ".partial")
+            # Util.WriteAtomic stages to unique <path>.<pid>.<tid>.<guid>.partial names, while
+            # File.Exists(wav) is false for a directory, so creating wav as a directory blocks MoveReplace.
+            blocker = wav
             blocker.mkdir(parents=True)          # the write of this one stream fails
             failed = run("xma", src, root / "out")
             self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
-            self.assertFalse(wav.exists())
+            self.assertFalse(wav.is_file())
+            self.assertEqual(list(wav.parent.glob("*.partial")), [])
             blocker.rmdir()
             retry = run("xma", src, root / "out")
             self.assertEqual(retry.returncode, 0, retry.stdout + retry.stderr)
@@ -106,11 +109,12 @@ class Rpf9dumpExitCodeTest(unittest.TestCase):
             texture_dictionary_rpf(src)
             sub = root / "out" / "textures" / "textures"
             dds = sub / "dictionary_at_0000000000001010" / "000_probe.dds"
-            blocker = Path(str(dds) + ".partial")
+            blocker = dds
             blocker.mkdir(parents=True)          # the write of this one DDS fails
             failed = run("textures", src, root / "out")
             self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
-            self.assertFalse(dds.exists(), failed.stdout)          # the blocked write must not have succeeded
+            self.assertFalse(dds.is_file(), failed.stdout)          # the blocked write must not have succeeded
+            self.assertEqual(list(dds.parent.glob("*.partial")), [])
             self.assertFalse((sub / "manifest.json").exists(), failed.stdout)
             self.assertFalse((sub / "manifest.json.partial").exists())
             blocker.rmdir()

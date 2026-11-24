@@ -155,17 +155,23 @@ class DrmOracle(runner.Oracle):
         self.node = find_node()
         self.clang = runner.find_clang()
         self.chunk = chunk
+        owned = not workdir   # a temporary directory made here is removed if the constructor fails
         self.workdir = workdir or tempfile.mkdtemp(prefix="leonida-hw-oracle-")
-        self._offsets, self._registers = {}, {}
-        self.exe = self._build_launcher()
-        self.arch = arch or os.environ.get("LEONIDA_HW_ARCH") or self._device_arch()
         try:
-            asm.family(self.arch)
-        except ValueError as e:   # as in runner.Oracle: an architecture without spellings is a skip
-            raise Unavailable(f"{e} (set LEONIDA_HW_ARCH)") from None
-        self.device = self._probe()
-        if hasattr(self, "_probe_waves"):   # runner.Oracle has it once it runs kernels of both wave sizes
-            self._probe_waves()
+            self._offsets, self._registers = {}, {}
+            self.exe = self._build_launcher()
+            self.arch = arch or os.environ.get("LEONIDA_HW_ARCH") or self._device_arch()
+            try:
+                asm.family(self.arch)
+            except ValueError as e:   # as in runner.Oracle: an architecture without spellings is a skip
+                raise Unavailable(f"{e} (set LEONIDA_HW_ARCH)") from None
+            self.device = self._probe()
+            if hasattr(self, "_probe_waves"):   # runner.Oracle has it once it runs kernels of both wave sizes
+                self._probe_waves()
+        except BaseException:   # close() never runs for an object that was not built: remove the directory here
+            if owned:
+                shutil.rmtree(self.workdir, ignore_errors=True)
+            raise
 
     def _build_launcher(self):
         with open(SOURCE, "rb") as f:

@@ -42,7 +42,10 @@ class GitError(Exception):
 
 
 def git(repo, *args, check=True):
-    r = subprocess.run(["git", "-C", repo, *args], capture_output=True)
+    try:
+        r = subprocess.run(["git", "-C", repo, *args], capture_output=True)
+    except OSError as e:  # git is not on PATH, or cannot be executed: a usage error (exit 2), not a traceback
+        raise GitError(f"cannot run git: {e.strerror or e}") from None
     # Decode without universal-newline translation: a bare CR inside a Git line is content.
     r.stdout = r.stdout.decode("utf-8", "replace")
     r.stderr = r.stderr.decode("utf-8", "replace")
@@ -64,7 +67,7 @@ def _merged_pr_number(subject):
 def prior_merges(repo, main, numbers, depth):
     out = git(repo, "log", main, "--first-parent", f"-n{depth}", "--format=%H%x09%s").stdout
     hits = {number: [] for number in numbers}
-    for line in out.splitlines():
+    for line in out.split("\n"):
         sha, _, subject = line.partition("\t")
         number = _merged_pr_number(subject)
         if number in hits:

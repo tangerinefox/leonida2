@@ -127,8 +127,8 @@ int main() {
     vk.query_pool = [&](QueryHeapId id) -> QueryPool* {
         return id == 1 ? &heap : id == 6 ? &statistics_heap : nullptr;
     };
-    vk.sum_statistics = [](VkCommandBuffer, VkQueryPool pool, VkQueryPool, const std::uint8_t*, std::uint32_t first,
-                           std::uint32_t count, VkBuffer, VkDeviceSize) {
+    vk.sum_statistics = [](VkCommandBuffer, VkQueryPool pool, VkQueryPool, VkQueryPool, const std::uint8_t*,
+                           std::uint32_t first, std::uint32_t count, VkBuffer, VkDeviceSize) {
         g_trace->events.push_back(query_event("sum_statistics", pool, first) + "+" + std::to_string(count));
     };
     vk.resolve_binary_occlusion = [](VkCommandBuffer, VkQueryPool, std::uint32_t, std::uint32_t, VkBuffer,
@@ -685,14 +685,18 @@ int main() {
         auto segments = std::make_shared<OcclusionSegmentPool>();
         segments->pool = handle<VkQueryPool>(9);
         segments->mesh_pool = handle<VkQueryPool>(10);
+        segments->primitives_pool = handle<VkQueryPool>(11);
         segments->mesh = prepared.statistics_mesh;
         segments->destroy = mock_destroy_pool;
         QueryReplay queries;
         expect(queries.plan(prepared, {}, 0, true, segments, 0) == ReplayResult::success, "plan mixed list");
         expect(prepared.statistics_mesh_pool == handle<VkQueryPool>(10), "mixed list: the mesh pool is the list's");
+        expect(prepared.statistics_primitives_pool == handle<VkQueryPool>(11),
+               "mixed list: the mesh-primitives pool is the list's");
         expect(q[6].resolves.size() == 1 && q[6].resolves[0].sum && q[6].resolves[0].first == 3 &&
                    q[6].resolves[0].count == 1 && q[6].resolves[0].mesh_pool == handle<VkQueryPool>(10) &&
-                   q[6].resolves[0].mesh && q[6].resolves[0].mesh[3] == 1,
+                   q[6].resolves[0].primitives_pool == handle<VkQueryPool>(11) && q[6].resolves[0].mesh &&
+                   q[6].resolves[0].mesh[3] == 1,
                "mixed list: the mesh-only query's resolve sums its one mesh segment");
         expect(queries.needs_statistics_sum, "mixed list: the statistics sum helper is needed");
 
@@ -753,6 +757,21 @@ int main() {
         // queries[] follows the commands: Begin 0, Begin 1, End 0, End 1.
         expect(q[2].statistics_first == 0 && q[2].statistics_count == 2, "overlap-mesh: query 0 sums segments 0-1");
         expect(q[3].statistics_first == 1 && q[3].statistics_count == 3, "overlap-mesh: query 1 sums segments 1-3");
+    }
+
+    // 17. D3D-291: the pool a mesh draw runs in must not enable a counter
+    //     VUID-vkCmdDrawMeshTasksEXT-pipelineStatistics-07076 forbids, or the validation layer reports the VUID on
+    //     every DispatchMesh inside a statistics query. The VUID leaves the fragment and compute invocations
+    //     allowed, and those are the two the mesh pool counts; the nine it names are the rest of the eleven.
+    {
+        constexpr VkQueryPipelineStatisticFlags all_counters = 0x7ff;  // the counters of a D3D12 statistics heap
+        expect((kMeshStatisticsFlags & kForbiddenMeshStatisticsFlags) == 0,
+               "the mesh pool enables none of the counters the VUID forbids");
+        expect((all_counters & ~kForbiddenMeshStatisticsFlags) == kMeshStatisticsFlags,
+               "the mesh pool counts every counter the VUID leaves allowed");
+        expect(kMeshStatisticsFlags == (VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT |
+                                        VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT),
+               "the mesh pool counts the fragment and compute invocations");
     }
 
     if (failures) return 1;

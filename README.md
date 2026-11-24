@@ -20,7 +20,8 @@
   <a href="#want-to-help">Want to help?</a> |
   <a href="#credits">Credits</a> |
   <a href="#license">License</a> |
-  <a href="https://discord.gg/ETf4qj5acN">Discord</a>
+  <a href="https://discord.gg/ETf4qj5acN">Discord</a> |
+  <a href="https://t.me/mandyport">Telegram</a>
 </p>
 
 Leonida is a static recompilation project. The Xbox Series CPU is x86-64 like a PC, so the game's code is loaded
@@ -40,6 +41,8 @@ happens **on your PC, from your own copy of the game**.
 > that point belongs to NotRexed and the contributors listed in the history.
 
 Discord: https://discord.gg/ETf4qj5acN
+
+Telegram: https://t.me/mandyport
 
 Original author's Git Mirror: https://git.notrexed.dev/notrexed/Leonida
 <br>
@@ -137,6 +140,29 @@ can sit on another drive. The runtime maps the package in place, so a read-only 
 files in `work/shaders/dxbc/disasm` in place: the next run checks them against the list in `disasm.done` and
 disassembles the missing ones again (all of them for a folder whose `disasm.done` predates that list), then
 translates every shader again. A `disasm` folder that is a symlink is refused when the stage has to clear it.
+
+**Disk space and drives:** the build uses three folders, and each can be on its own drive:
+
+| Folder | Flag | What is in it | Size | Read when playing |
+|---|---|---|---|---|
+| your package | `--game` | your copy of the game; only read, never written | as copied | yes, in place (`game_path.txt`) |
+| work | `--work` (default `<out>\work`) | `shaders` (carved, disassembled, translated) and `assets` (exports) | about 30 GB + about 370 GB | only `shaders\spirv` (`shader_path.txt`) |
+| port | `--out` (default `Documents\Leonida`) | `gta6rt.exe`, its DLL, the path files, the pipeline cache, `overlay` | small | yes |
+
+The free-space check before a build counts the `--work` drive only, because that is where the large files go.
+Nothing in `<work>\assets` is read by the game, so with a small SSD you can keep what the game loads on the SSD and
+put the exports on a hard drive, in two runs:
+
+```powershell
+# on the SSD: the package, the port and the translated shaders (about 30 GB of work files)
+python -I make_game.py --game "S:\Games\package" --out "S:\Games\Leonida" --work "S:\Games\Leonida\work" --stages check,shaders,runtime,pipelines
+# on the hard drive: the asset exports (about 370 GB), only for the asset tools
+python -I make_game.py --game "S:\Games\package" --out "S:\Games\Leonida" --work "H:\leonida-assets" --stages check,assets
+```
+
+The second run does not rebuild the runtime, so `shader_path.txt` keeps pointing at the SSD. Pass the same
+`--work` again for later runs of each stage so they resume. A single `--work "H:\leonida-work"` also works; the
+game then loads its translated shaders from that drive.
 
 **From a terminal**, with the same behaviour and more control:
 

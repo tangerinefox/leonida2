@@ -30,7 +30,8 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 from spirv_asm_tables import (  # noqa: E402
-    BIT_ENUMS, GLSL_STD_450, INSTRUCTIONS, NONSEMANTIC_DEBUGPRINTF, VALUE_ENUMS,
+    BIT_ENUMS, GLSL_STD_450, INSTRUCTIONS, NONSEMANTIC_DEBUGPRINTF,
+    NONSEMANTIC_SHADER_DEBUGINFO_100, VALUE_ENUMS,
 )
 
 SPIRV_MAGIC = 0x07230203
@@ -54,6 +55,7 @@ TARGET_ENV_VERSION = {
 _ID_KINDS = frozenset(("IdRef", "IdResult", "IdResultType", "IdScope", "IdMemorySemantics"))
 _ID_RE = re.compile(r"%[A-Za-z0-9_]+")
 _EXT_SETS = {
+    "NonSemantic.Shader.DebugInfo.100": NONSEMANTIC_SHADER_DEBUGINFO_100,
     "GLSL.std.450": GLSL_STD_450,
     "NonSemantic.DebugPrintf": NONSEMANTIC_DEBUGPRINTF,    # spirv-dis writes its instruction by name
 }
@@ -638,7 +640,7 @@ def _assemble(instructions, version: int, track_switch_types: bool) -> bytes:
 
         cur_ext_table = None
         switch_type = None                 # (width, signed) of the OpSwitch selector's integer type
-        if opname == "OpExtInst" and arg_idx < len(toks):
+        if opname in ("OpExtInst", "OpExtInstWithForwardRefsKHR") and arg_idx < len(toks):
             cur_ext_table = ext_imports.get(get_id(toks[arg_idx], lineno))
         elif opname == "OpSwitch" and arg_idx < len(toks):
             sel_id = get_id(toks[arg_idx], lineno)

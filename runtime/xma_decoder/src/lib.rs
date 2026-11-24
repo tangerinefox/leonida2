@@ -59,6 +59,28 @@ pub unsafe extern "C" fn leonida_xma2_decoder_create(
     channels: u32,
     out_decoder: *mut *mut LeonidaXma2Decoder,
 ) -> i32 {
+    unsafe { create_with(sample_rate, channels, out_decoder, Xma2Stream::new) }
+}
+
+/// Like `leonida_xma2_decoder_create`, but decodes like the console's XMA hardware: the first
+/// frame is kept and there is no 64-sample start skip; the caller applies the context's skip.
+/// # Safety
+/// Same as `leonida_xma2_decoder_create`.
+#[no_mangle]
+pub unsafe extern "C" fn leonida_xma2_decoder_create_hardware(
+    sample_rate: u32,
+    channels: u32,
+    out_decoder: *mut *mut LeonidaXma2Decoder,
+) -> i32 {
+    unsafe { create_with(sample_rate, channels, out_decoder, Xma2Stream::new_hardware) }
+}
+
+unsafe fn create_with<E>(
+    sample_rate: u32,
+    channels: u32,
+    out_decoder: *mut *mut LeonidaXma2Decoder,
+    make: impl FnOnce(u32, usize) -> Result<Xma2Stream, E>,
+) -> i32 {
     if out_decoder.is_null() {
         return LEONIDA_XMA2_INVALID_ARGUMENT;
     }
@@ -68,8 +90,8 @@ pub unsafe extern "C" fn leonida_xma2_decoder_create(
     }
 
     match catch_unwind(AssertUnwindSafe(|| {
-        let stream = Xma2Stream::new(sample_rate, channels as usize)
-            .map_err(|_| LEONIDA_XMA2_INVALID_FORMAT)?;
+        let stream =
+            make(sample_rate, channels as usize).map_err(|_| LEONIDA_XMA2_INVALID_FORMAT)?;
         try_new_handle(LeonidaXma2Decoder {
             stream: Mutex::new(stream),
             channels: channels as usize,
@@ -87,7 +109,8 @@ pub unsafe extern "C" fn leonida_xma2_decoder_create(
 /// Decodes a buffer containing one or more complete 2048-byte XMA2 packets.
 ///
 /// # Safety
-/// `decoder` must be a live handle returned by `leonida_xma2_decoder_create`.
+/// `decoder` must be a live handle returned by `leonida_xma2_decoder_create`
+/// or `leonida_xma2_decoder_create_hardware`.
 /// `input` must reference `input_len` readable bytes and `out_block` must be writable.
 /// Do not destroy a decoder concurrently with this call. The returned PCM block remains valid
 /// until `leonida_xma2_pcm_destroy` is called.
@@ -160,8 +183,8 @@ pub unsafe extern "C" fn leonida_xma2_decode_buffer(
 /// Destroys a decoder. Passing null is a no-op.
 ///
 /// # Safety
-/// A non-null pointer must be a live handle returned by `leonida_xma2_decoder_create`,
-/// and no calls may be using it concurrently.
+/// A non-null pointer must be a live handle returned by `leonida_xma2_decoder_create`
+/// or `leonida_xma2_decoder_create_hardware`. No calls may be using it concurrently.
 #[no_mangle]
 pub unsafe extern "C" fn leonida_xma2_decoder_destroy(decoder: *mut LeonidaXma2Decoder) {
     if !decoder.is_null() {
@@ -230,6 +253,24 @@ mod tests {
         );
         assert!(!decoder.is_null());
         unsafe { leonida_xma2_decoder_destroy(decoder) };
+    }
+
+    #[test]
+    fn create_hardware_accepts_stereo_and_rejects_three_channels() {
+        let mut decoder = ptr::null_mut();
+        assert_eq!(
+            unsafe { leonida_xma2_decoder_create_hardware(48_000, 2, &mut decoder) },
+            LEONIDA_XMA2_OK
+        );
+        assert!(!decoder.is_null());
+        unsafe { leonida_xma2_decoder_destroy(decoder) };
+
+        let mut decoder = ptr::dangling_mut();
+        assert_eq!(
+            unsafe { leonida_xma2_decoder_create_hardware(48_000, 3, &mut decoder) },
+            LEONIDA_XMA2_INVALID_FORMAT
+        );
+        assert!(decoder.is_null());
     }
 
     #[test]

@@ -79,6 +79,19 @@ def program_text(name, lines, words, wave, opaque=False, rewrite=True):
     return "\n".join(out) + "\n"
 
 
+def read_dump(path, words, wave):
+    """The `wave` lanes of `words` words each from a VKC_DUMP file, or None when it is missing or too short.
+    vk_compute_test's output buffer is at least one 64-thread group of words (VKC_OUT_WORDS only raises it), and
+    VKC_DUMP writes the whole buffer, so a request under 64 words (wave32 with words=1) gives a larger file: only its
+    first words * wave words are the program's stores, the rest keep the fill."""
+    need = 4 * words * wave
+    if not os.path.isfile(path) or os.path.getsize(path) < need:
+        return None
+    with open(path, "rb") as f:
+        flat = struct.unpack(f"<{words * wave}I", f.read(need))
+    return [list(flat[k:k + words]) for k in range(0, words * wave, words)]
+
+
 def run_programs(texts, words=4, wave=32, build=None, work_parent=None, retries=2, opaque=True, rewrite=True,
                  per_lane=False, uniform=True):
     """Per program lane 0's `words` words, or a str (see the module docstring). words must be 1, 2, 4 or 8."""
@@ -158,12 +171,11 @@ def run_programs(texts, words=4, wave=32, build=None, work_parent=None, retries=
                 results[i] = "vk_compute_test: " + (msg.splitlines()[-1] if msg else "unsupported")
             elif wave == 32 and unpinned_subgroup(msg):
                 results[i] = f"the device can't run 32-lane subgroups ({unpinned_subgroup(msg)} lanes)"
-            elif r.returncode or not os.path.isfile(dump) or os.path.getsize(dump) != 4 * words * wave:
+            elif r.returncode:
                 results[i] = f"vk_compute_test exit {r.returncode}"
+            elif (lanes := read_dump(dump, words, wave)) is None:
+                results[i] = f"vk_compute_test: no dump of {4 * words * wave} bytes or more"
             else:
-                with open(dump, "rb") as f:
-                    flat = struct.unpack(f"<{words * wave}I", f.read())
-                lanes = [list(flat[k:k + words]) for k in range(0, words * wave, words)]
                 odd = [k for k, w in enumerate(lanes) if w != lanes[0]]
                 if per_lane:
                     results[i] = lanes

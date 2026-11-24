@@ -46,6 +46,9 @@ class F64ConversionTest(unittest.TestCase):
             scale = result(rf"OpBitcast %float {constant}")
             value = result(rf"OpFMul %float {value} {scale}")
         if clamp:
+            # DX10_CLAMP: a NaN is replaced by +0 before FClamp (Gen.clamp_mods).
+            nan = result(rf"OpIsNan %bool {value}")
+            value = result(rf"OpSelect %float {nan} %f0 {value}")
             value = result(rf"OpExtInst %float %glsl FClamp {value} %f0 %f1")
         word = result(rf"OpBitcast %uint {value}")
         dest = result(r"OpAccessChain %_ptr_Function_uint %vgpr %c3")

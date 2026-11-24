@@ -25,6 +25,7 @@ import pe_inspect  # noqa: E402
 IMAGE_BASE = 0x140000000
 TEXT_RVA = 0x1000
 IDATA_RVA = 0x2000
+DIRECTORIES = 0x58 + 112
 
 # .text layout (RVAs): three thunks, then the callers.
 THUNK_FOO = TEXT_RVA + 0x00
@@ -35,6 +36,19 @@ IAT_FOO = IDATA_RVA + 0x60
 IAT_BAR = IAT_FOO + 8
 IAT_ORD = IAT_FOO + 16
 OTHER_IAT_RVA = IDATA_RVA + 0xE0
+
+DELAY_DIRECTORY = DIRECTORIES + 13 * 8
+DELAY_DESC = IDATA_RVA + 0x100
+DELAY_IAT = IDATA_RVA + 0x140
+DELAY_INT = IDATA_RVA + 0x160
+DELAY_DLL = IDATA_RVA + 0x180
+DELAY_NAME = IDATA_RVA + 0x1A0
+DELAY_THUNK = TEXT_RVA + 0x30
+DELAY_ORD_THUNK = TEXT_RVA + 0x40
+DELAY_CALLS = [TEXT_RVA + 0x110, TEXT_RVA + 0x120]
+DELAY_JMP = TEXT_RVA + 0x130
+DELAY_ORD_CALL = TEXT_RVA + 0x140
+NORMAL_CALL = TEXT_RVA + 0x100
 
 
 def rel32(from_end, target):
@@ -56,7 +70,7 @@ def build_image(callers, dll=b"xmem.dll"):
     struct.pack_into("<I", buf, opt + 56, 0x3000)  # SizeOfImage
     struct.pack_into("<I", buf, opt + 60, 0x1000)  # SizeOfHeaders
     struct.pack_into("<I", buf, opt + 108, 16)  # NumberOfRvaAndSizes
-    struct.pack_into("<II", buf, opt + 112 + 8, IDATA_RVA, 40)  # import directory
+    struct.pack_into("<II", buf, DIRECTORIES + 8, IDATA_RVA, 40)  # import directory
     table = opt + 0xF0
     for i, (name, rva, chars) in enumerate(((b".text", TEXT_RVA, 0x60000020), (b".idata", IDATA_RVA, 0xC0000040))):
         at = table + i * 40
@@ -85,6 +99,32 @@ def build_image(callers, dll=b"xmem.dll"):
         buf[at] = opcode
         buf[at + 1:at + 5] = rel32(at + 5, target)
     return bytes(buf)
+
+
+def build_delay_image(attributes=1, *, dll=b"delay.dll", name=b"LateFoo"):
+    """Add two delay-import slots and their callers to the ordinary-import fixture."""
+    data = bytearray(build_image([
+        (NORMAL_CALL, 0xE8, THUNK_FOO),
+        (DELAY_CALLS[0], 0xE8, DELAY_THUNK),
+        (DELAY_CALLS[1], 0xE8, DELAY_THUNK),
+        (DELAY_JMP, 0xE9, DELAY_THUNK),
+        (DELAY_ORD_CALL, 0xE8, DELAY_ORD_THUNK),
+    ]))
+    # Descriptor fields are DWORDs. A legacy descriptor needs a low image base to hold its VAs.
+    base = IMAGE_BASE if attributes & 1 else 0x10000000
+    field_base = 0 if attributes & 1 else base
+    struct.pack_into("<Q", data, 0x58 + 24, base)
+    struct.pack_into("<II", data, DELAY_DIRECTORY, DELAY_DESC, 64)
+    struct.pack_into("<8I", data, DELAY_DESC, attributes, field_base + DELAY_DLL, 0,
+                     field_base + DELAY_IAT, field_base + DELAY_INT, 0, 0, 0)
+    struct.pack_into("<3Q", data, DELAY_INT, field_base + DELAY_NAME, (1 << 63) | 42, 0)
+    # A delay IAT holds addresses of resolver code before binding. Import names come from the INT.
+    struct.pack_into("<3Q", data, DELAY_IAT, base + TEXT_RVA + 0x60, base + TEXT_RVA + 0x70, 0)
+    data[DELAY_DLL:DELAY_DLL + len(dll) + 1] = dll + b"\0"
+    data[DELAY_NAME + 2:DELAY_NAME + len(name) + 3] = name + b"\0"
+    for thunk, slot in ((DELAY_THUNK, DELAY_IAT), (DELAY_ORD_THUNK, DELAY_IAT + 8)):
+        data[thunk:thunk + 6] = b"\xff\x25" + rel32(thunk + 6, slot)
+    return data
 
 
 class ImportCallSitesTest(unittest.TestCase):
@@ -209,6 +249,122 @@ class ImportCallSitesTest(unittest.TestCase):
             self.assertTrue(err.getvalue().strip())
             with contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(import_call_sites.main([os.path.join(tmp, "missing.exe")]), 2)
+
+
+class DelayImportCallSitesTest(unittest.TestCase):
+    def _assert_sites(self, entry, *, thunks, call, jmp):
+        self.assertEqual((entry["thunks"], entry["call"], entry["jmp"]), (thunks, call, jmp))
+
+    def test_rva_and_va_descriptors_report_named_and_ordinal_sites(self):
+        for attributes in (1, 0):
+            with self.subTest(attributes=attributes):
+                data = build_delay_image(attributes)
+                out = import_call_sites.call_sites(data)["imports"]
+                self._assert_sites(out["delay.dll!LateFoo"],
+                                   thunks=[DELAY_THUNK], call=DELAY_CALLS, jmp=[DELAY_JMP])
+                self._assert_sites(out["delay.dll!#42"],
+                                   thunks=[DELAY_ORD_THUNK], call=[DELAY_ORD_CALL], jmp=[])
+                self._assert_sites(out["xmem.dll!XMemFoo"],
+                                   thunks=[THUNK_FOO], call=[NORMAL_CALL], jmp=[])
+
+    def test_a_delay_only_image_can_filter_by_ordinal(self):
+        data = build_delay_image()
+        struct.pack_into("<II", data, DIRECTORIES + 8, 0, 0)
+        self.assertEqual(set(import_call_sites.call_sites(data)["imports"]), {"delay.dll!LateFoo", "delay.dll!#42"})
+        out = import_call_sites.call_sites(data, wanted={"DELAY.DLL!#42"})["imports"]
+        self.assertEqual(list(out), ["delay.dll!#42"])
+        self._assert_sites(out["delay.dll!#42"], thunks=[DELAY_ORD_THUNK], call=[DELAY_ORD_CALL], jmp=[])
+
+    def test_same_name_in_both_tables_keeps_both_slots(self):
+        data = build_delay_image(dll=b"xmem.dll", name=b"XMemFoo")
+        out = import_call_sites.call_sites(data, wanted={"xmem.dll!XMemFoo"})["imports"]
+        self.assertEqual(list(out), ["xmem.dll!XMemFoo"])
+        self._assert_sites(out["xmem.dll!XMemFoo"],
+                           thunks=[THUNK_FOO, DELAY_THUNK], call=[NORMAL_CALL, *DELAY_CALLS], jmp=[DELAY_JMP])
+
+    def test_overlapping_delay_slots_keep_the_ordinary_import_names(self):
+        data = build_delay_image()
+        struct.pack_into("<I", data, DELAY_DESC + 12, IAT_FOO)
+        out = import_call_sites.call_sites(data)["imports"]
+        self.assertNotIn("delay.dll!LateFoo", out)
+        self.assertNotIn("delay.dll!#42", out)
+        self.assertEqual(out["xmem.dll!XMemFoo"]["call"], [NORMAL_CALL])
+
+    def test_cli_counts_and_lists_delay_import_sites(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "image.exe")
+            with open(path, "wb") as f:
+                f.write(build_delay_image())
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(import_call_sites.main([path, "--dll", "DELAY.DLL"]), 0)
+            self.assertRegex(out.getvalue(), r"delay\.dll!LateFoo +1 +2 +1")
+            self.assertIn("2 import(s), 4 call site(s)", out.getvalue())
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(import_call_sites.main([path, "--dll", "delay.dll", "--json"]), 0)
+            self.assertEqual(json.loads(out.getvalue())["imports"]["delay.dll!LateFoo"]["call"],
+                             [hex(rva) for rva in DELAY_CALLS])
+
+    def test_absent_empty_and_truncated_directories_preserve_ordinary_sites(self):
+        for rva, size in ((0, 64), (DELAY_DESC, 0), (DELAY_DESC, 31),
+                          (DELAY_DESC + 32, 32), (0x2FF0, 64), (0x3000, 0xFFFFFFFF)):
+            with self.subTest(rva=rva, size=size):
+                data = build_delay_image()
+                struct.pack_into("<II", data, DELAY_DIRECTORY, rva, size)
+                self.assertEqual(import_call_sites.call_sites(data),
+                                 import_call_sites.call_sites(build_image([(NORMAL_CALL, 0xE8, THUNK_FOO)])))
+
+        data = build_delay_image()[:DELAY_DESC + 31]
+        self.assertEqual(import_call_sites.call_sites(data)["imports"]["xmem.dll!XMemFoo"]["call"], [NORMAL_CALL])
+        self.assertEqual(import_call_sites.call_sites(data, dlls={"delay.dll"})["imports"], {})
+
+    def test_bad_descriptor_addresses_are_skipped(self):
+        for field, value in ((4, 0x3000), (12, 0), (12, 0x3000), (16, 0), (16, 0x3000)):
+            with self.subTest(field=field, value=value):
+                data = build_delay_image()
+                struct.pack_into("<I", data, DELAY_DESC + field, value)
+                self.assertEqual(import_call_sites.call_sites(data, dlls={"delay.dll"})["imports"], {})
+        data = build_delay_image()
+        struct.pack_into("<I", data, DELAY_DESC, 0)  # The DWORD fields cannot address this high image base.
+        self.assertEqual(import_call_sites.call_sites(data, dlls={"delay.dll"})["imports"], {})
+        # Legacy VA descriptors: underflowed pINT or a DLL-name VA equal to ImageBase (RVA 0 / DOS header).
+        data = build_delay_image(attributes=0)
+        struct.pack_into("<I", data, DELAY_DESC + 16, 0x0FFF0000)
+        self.assertEqual(import_call_sites.call_sites(data, dlls={"delay.dll"})["imports"], {})
+        data = build_delay_image(attributes=0)
+        struct.pack_into("<I", data, DELAY_DESC + 4, 0x10000000)
+        self.assertNotIn("MZ!LateFoo", import_call_sites.call_sites(data)["imports"])
+
+    def test_malformed_descriptor_does_not_hide_a_later_valid_descriptor(self):
+        data = build_delay_image()
+        struct.pack_into("<I", data, DELAY_DIRECTORY + 4, 96)
+        data[DELAY_DESC + 32:DELAY_DESC + 64] = data[DELAY_DESC:DELAY_DESC + 32]
+        struct.pack_into("<I", data, DELAY_DESC + 4, 0x3000)
+        self.assertEqual(import_call_sites.call_sites(data)["imports"]["delay.dll!LateFoo"]["call"], DELAY_CALLS)
+
+    def test_bad_lookup_name_does_not_shift_the_following_slot(self):
+        data = build_delay_image()
+        struct.pack_into("<Q", data, DELAY_INT, 0x3000)
+        out = import_call_sites.call_sites(data, dlls={"delay.dll"})["imports"]
+        self.assertEqual(out["delay.dll!?"]["thunks"], [DELAY_THUNK])
+        self.assertEqual(out["delay.dll!#42"]["call"], [DELAY_ORD_CALL])
+
+    def test_truncated_lookup_and_address_tables_keep_only_whole_slots(self):
+        for field in (12, 16):  # IAT, then INT
+            with self.subTest(field=field):
+                data = build_delay_image()
+                table = len(data) - 12  # One whole slot and half of the next one.
+                struct.pack_into("<I", data, DELAY_DESC + field, table)
+                if field == 12:
+                    for thunk, slot in ((DELAY_THUNK, table), (DELAY_ORD_THUNK, table + 8)):
+                        data[thunk + 2:thunk + 6] = rel32(thunk + 6, slot)
+                else:
+                    struct.pack_into("<Q", data, table, DELAY_NAME)
+                out = import_call_sites.call_sites(data, dlls={"delay.dll"})["imports"]
+                self.assertEqual(list(out), ["delay.dll!LateFoo"])
+                self._assert_sites(out["delay.dll!LateFoo"],
+                                   thunks=[DELAY_THUNK], call=DELAY_CALLS, jmp=[DELAY_JMP])
 
 
 if __name__ == "__main__":

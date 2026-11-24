@@ -61,7 +61,20 @@ class FspxPrologueProbeTests(unittest.TestCase):
             with redirect_stderr(err):
                 rc = probe.main(["--oracle", "hw"])
         self.assertEqual(rc, 77)
-        self.assertIn("no GPU", err.getvalue())
+        self.assertEqual(err.getvalue(), "hardware oracle unavailable: no GPU\n")
+
+    def test_hw_run_unavailable_returns_77_and_closes_oracle(self):
+        oracle = self._mock_oracle(None)
+        oracle.run.side_effect = hw_runner.Unavailable("launcher unavailable\r\ndevice disconnected")
+        out, err = io.StringIO(), io.StringIO()
+        with unittest.mock.patch.object(hw_runner, "open_oracle", return_value=oracle):
+            with redirect_stdout(out), redirect_stderr(err):
+                rc = probe.main(["--oracle", "hw"])
+        self.assertEqual(rc, 77)
+        self.assertEqual(out.getvalue(), "")
+        self.assertEqual(err.getvalue(), "hardware oracle unavailable: launcher unavailable device disconnected\n")
+        oracle.run.assert_called_once()
+        oracle.close.assert_called_once_with()
 
     def _mock_oracle(self, outputs):
         mock_oracle = unittest.mock.MagicMock()
@@ -91,33 +104,41 @@ class FspxPrologueProbeTests(unittest.TestCase):
 
     def test_mocked_hw_pass_and_failure_detection(self):
         good = self._passing_outputs()
-        out_buf = io.StringIO()
-        with unittest.mock.patch.object(hw_runner, "open_oracle", return_value=self._mock_oracle(good)):
-            with redirect_stdout(out_buf):
+        oracle = self._mock_oracle(good)
+        out_buf, err_buf = io.StringIO(), io.StringIO()
+        with unittest.mock.patch.object(hw_runner, "open_oracle", return_value=oracle):
+            with redirect_stdout(out_buf), redirect_stderr(err_buf):
                 rc = probe.main(["--oracle", "hw"])
         self.assertEqual(rc, 0)
+        self.assertEqual(err_buf.getvalue(), "")
         self.assertIn("PASS: 50/50", out_buf.getvalue())
+        oracle.close.assert_called_once_with()
 
         # Positive clobber must fail
         clobbered = [list(row) for row in good]
         clobbered[0][0] ^= 1
+        oracle = self._mock_oracle(clobbered)
         out_buf, err_buf = io.StringIO(), io.StringIO()
-        with unittest.mock.patch.object(hw_runner, "open_oracle", return_value=self._mock_oracle(clobbered)):
+        with unittest.mock.patch.object(hw_runner, "open_oracle", return_value=oracle):
             with redirect_stdout(out_buf), redirect_stderr(err_buf):
                 rc = probe.main(["--oracle", "hw"])
         self.assertEqual(rc, 1)
-        self.assertIn("FAIL", err_buf.getvalue())
+        self.assertEqual(err_buf.getvalue(), "FAIL vgpr/zero/w32: mismatch (first diff at word 0)\n")
+        self.assertIn("FAIL: 1 failure(s) across 50 prologue checks and 8 negative controls", out_buf.getvalue())
+        oracle.close.assert_called_once_with()
 
         # Missed negative control must also fail
         missed_neg = [list(row) for row in good]
         _, negatives = probe.build_probe_plan()
         missed_neg[-len(negatives)] = list(negatives[0][2])
+        oracle = self._mock_oracle(missed_neg)
         out_buf, err_buf = io.StringIO(), io.StringIO()
-        with unittest.mock.patch.object(hw_runner, "open_oracle", return_value=self._mock_oracle(missed_neg)):
+        with unittest.mock.patch.object(hw_runner, "open_oracle", return_value=oracle):
             with redirect_stdout(out_buf), redirect_stderr(err_buf):
                 rc = probe.main(["--oracle", "hw"])
         self.assertEqual(rc, 1)
         self.assertIn("negative control failed", err_buf.getvalue())
+        oracle.close.assert_called_once_with()
 
 
 if __name__ == "__main__":

@@ -46,12 +46,16 @@ public:
         constexpr VkDeviceSize alignment = 256, minimum = 4u << 20;
         if (!loaded_ || !bytes) return false;
         for (auto& chunk : current_.chunks) {
-            const VkDeviceSize start = (chunk.used + alignment - 1) / alignment * alignment;
-            if (start <= chunk.size && bytes <= chunk.size - start) {
-                chunk.used = start + bytes;
-                buffer = chunk.buffer;
-                offset = start;
-                return true;
+            const VkDeviceSize rem = chunk.used % alignment;
+            const VkDeviceSize pad = rem ? alignment - rem : 0;
+            if (pad <= chunk.size - chunk.used) {
+                const VkDeviceSize start = chunk.used + pad;
+                if (bytes <= chunk.size - start) {
+                    chunk.used = start + bytes;
+                    buffer = chunk.buffer;
+                    offset = start;
+                    return true;
+                }
             }
         }
         Chunk chunk;

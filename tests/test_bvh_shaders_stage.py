@@ -386,7 +386,7 @@ class ShadersStageWithTheDlls(unittest.TestCase):
 
             def fake_translate(disasm, spirv, jobs, emulate=False, fallbacks=()):
                 ran.append("translate")
-                write("", spirv, "index.json")
+                write('{"shader": {"stage": "vs"}}', spirv, "index.json")
 
             def stage():
                 ran.clear()

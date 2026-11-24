@@ -13,6 +13,8 @@
 ; Run: vk_compute_test cs_w32_lds_u8_d16.spv 1 dump
 ;   -> out[0..7] = 0xBEEF00FF 0x00FF1234 0xBEEFFF80 0xFF801234 0xBEEF007F 0x007F1234 0xBEEF0080 0xFFFF1234
 ; mattr: +wavefrontsize32,-wavefrontsize64
+; Only lane 0 accesses LDS and writes output; identical writes from all lanes would still race.
+v_cmpx_eq_u32_e32 0, v0
 v_mov_b32_e32 v2, 0
 v_mov_b32_e32 v3, 0x7f80ff01
 ds_write_b32 v2, v3
@@ -36,7 +38,6 @@ ds_read_u8_d16 v16, v1 offset:2
 v_mov_b32_e32 v1, 1
 ds_read_i8_d16_hi v17, v1
 s_waitcnt lgkmcnt(0)
-v_cmpx_eq_u32_e32 0, v0
 v_mov_b32_e32 v21, 0
 buffer_store_dword v10, v21, s[0:3], 0 offen
 v_mov_b32_e32 v21, 4

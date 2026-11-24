@@ -30,14 +30,15 @@ PARTIAL = {n for n, _ in check.W64X_PARTIAL}
 WAVE32_WORDS = {n: w for n, w in check.CS_DUMPS if n in check.WAVE32_DUMPS and n not in ("cs_store", "cs_smem_soffset_imm")}
 
 
-# All check.py cases, including the six vk_store_test shaders and the three mesh fixtures, and TEST-184's
+# All check.py cases, including the seven vk_store_test shaders and the three mesh fixtures, and TEST-184's
 # vk_store_test "words" fixtures and image_get_lod draws.
-TOTAL = (len(check.COMPUTE) + 7 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 6
+TOTAL = (len(check.COMPUTE) + 7 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 7
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
          + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS)
-         + len(check.TEXTURE_CONSTANTS) + 16)  # three mesh fixtures, ps_tex, ps_imgatomic, ps_table_fetch, six compute fixtures,
-         # ps_ssharp, vs_base_ids, main's standalone cs_fmt_d16_xyz / cs_heap_init dumps (net one more case) and cs_fmt_all
+         + len(check.TEXTURE_CONSTANTS) + 17)  # three mesh fixtures, ps_tex, ps_imgatomic, ps_table_fetch, six compute fixtures,
+         # ps_ssharp, vs_base_ids, main's standalone cs_fmt_d16_xyz / cs_heap_init dumps (net one more case), cs_fmt_all
+         # and cs_w32_shift64
 CVT = {bits: [u, s] for bits, u, s in check.CVT_F32_SAT_CASES}
 
 
@@ -96,6 +97,14 @@ class Wave64Checks(unittest.TestCase):
                     env.get("VKC_OUT_WORDS") == "68"
                 words = check.HEAP_INIT_EXPECTED if seeded else [0xEEEEEEEE] * 8
                 return 0, "out[0..7] = " + " ".join(map(str, words)) + "\n"
+            if name == "cs_w32_shift64":
+                # The shifted words come back only if check.py seeded the input records through VKC_HEAP_INIT.
+                initial, expected = check.shift64_words()
+                self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), str(len(expected))))
+                seeded = Path(env["VKC_HEAP_INIT"]).read_bytes() == struct.pack(f"<{len(initial)}I", *initial)
+                words = expected if seeded else initial
+                Path(env["VKC_DUMP"]).write_bytes(struct.pack(f"<{len(words)}I", *words))
+                return 0, ""
             if name == "cs_user_sgprs":
                 # The seeded words come back only if check.py passed them in VKC_SGPRS.
                 seeded = (env or {}).get("VKC_SGPRS") == check.USER_SGPRS_ENV["VKC_SGPRS"]
@@ -159,8 +168,8 @@ class Wave64Checks(unittest.TestCase):
                 return 0, "out[0..7] = " + " ".join(map(str, (WAVE32_WORDS[name] + [0] * 8)[:8])) + "\n"
             if name == "cs_workgroup_yz":     # #186: vk_compute_test's 2x3x4 Y/Z histogram line
                 return 0, "2x3x4 workgroup Y/Z: 0 mismatches\n"
-            if name in ("cs_imgstore", "cs_imgload", "cs_imgload_tfe", "cs_imgload_d16", "cs_imgload_d16_tfe",
-                        "cs_sample_lz_int_d16"):   # vk_store_test checks
+            if name in ("cs_imgstore", "cs_imgstore_cube", "cs_imgload", "cs_imgload_tfe", "cs_imgload_d16",
+                        "cs_imgload_d16_tfe", "cs_sample_lz_int_d16"):   # vk_store_test checks
                 return 0, "0 bad\n0 bad\n0 bad\n"
             if name in check.STORE_WORDS:     # vk_store_test "words": the three images, judged by check.py
                 self.assertEqual(args, ("words",))

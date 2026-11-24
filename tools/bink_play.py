@@ -84,13 +84,16 @@ def load_names(archive, mount, use_cache=True):
         tmp.unlink(missing_ok=True)
     if use_cache:
         fd, name = tempfile.mkstemp(prefix="bink_names.", suffix=".part", dir=cache.parent)
-        with open(fd, "w", encoding="utf-8", newline="") as f:
-            f.write("# " + key + "\n")
-            w = csv.writer(f, lineterminator="\n")
-            w.writerow(CACHE_FIELDS)
-            for r in rows:
-                w.writerow([r["path"], r["offset"], r["width"], r["height"], r["frames"]])
-        os.replace(name, cache)
+        try:
+            with open(fd, "w", encoding="utf-8", newline="") as f:
+                f.write("# " + key + "\n")
+                w = csv.writer(f, lineterminator="\n")
+                w.writerow(CACHE_FIELDS)
+                for r in rows:
+                    w.writerow([r["path"], r["offset"], r["width"], r["height"], r["frames"]])
+            os.replace(name, cache)
+        finally:
+            Path(name).unlink(missing_ok=True)
     return [(r["path"], int(r["offset"]), r["width"], r["height"], r["frames"]) for r in rows]
 
 

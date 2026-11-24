@@ -16,7 +16,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-from support import rdna2spirv, translate_listing  # noqa: E402
+from support import mrt0_words, rdna2spirv, translate_listing  # noqa: E402
 
 # llvm-mc -mcpu=gfx1013 -mattr=+wavefrontsize64 -show-encoding (LLVM 21.1.8).
 PROGRAM = [
@@ -59,6 +59,27 @@ class PrintedEncodingTest(unittest.TestCase):
 
     def test_matching_blob_translates(self):
         self.assertIn("OpEntryPoint Fragment", self.translate(listing(PROGRAM), blob(PROGRAM)))
+
+    def test_llvm19_sdwa_inline_float_uses_stored_width_and_operand(self):
+        # src0_sel:WORD_1 takes the high half of the inline constant's f32 bits.
+        # LLVM 19 prints it as a zero-extended half-precision literal and advances the listing by 12.
+        setup = ("v_mov_b32_e32 v5, 0xaaaa5555", "ff 02 0a 7e 55 55 aa aa")
+        export = ("exp mrt0 v5, v5, v5, v5 done vm", "0f 18 00 f8 05 05 05 05")
+        for op, opcode in (("u16", "a0"), ("i16", "a2")):
+            mods = "dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE src0_sel:WORD_1"
+            native = (f"v_cvt_f16_{op}_sdwa v5, 1.0 {mods}", f"f9 {opcode} 0a 7e f2 14 85 00")
+            shown = (f"v_cvt_f16_{op}_sdwa v5, 0x3c00 {mods}", f"f9 {opcode} 0a 7e ff 14 85 00 00 3c 00 00")
+            stored = blob([setup, native, native, export, PROGRAM[-1]])
+            printed = listing([setup, shown, shown, export, PROGRAM[-1]], end=len(stored))
+            for tail in (b"", b"; warning: invalid instruction encoding\n"):
+                with self.subTest(op=op, reanchor=bool(tail)):
+                    self.assertEqual(mrt0_words(self.translate(printed + tail, stored)), [0xaaaa73f0] * 4)
+            # A different literal or a changed selection field is still a real mismatch.
+            for index, value in ((9, 0x40), (6, 0x84)):
+                different = listing(with_byte([setup, shown, shown, export, PROGRAM[-1]], 1, index, value),
+                                    end=len(stored))
+                with self.assertRaises(rdna2spirv.Unsupported):
+                    self.translate(different, stored)
 
     def test_dropped_vopc_op_sel_is_refused(self):
         # The blob holds v_cmp_lt_f16_e64 with op_sel:[1,0] (word 0 bit 11); LLVM printed it without.

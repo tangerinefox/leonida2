@@ -380,6 +380,11 @@ positions stay byte for byte as `awc_opus.py` wrote them, and a second run repla
 streams are not touched. A tags packet that would not fit in one Ogg page (65,024 bytes) is skipped and counted;
 dialogue tags are a few kilobytes. `--dry-run` counts without writing.
 
+CSV headers are matched exactly after an optional leading UTF-8 BOM is removed. If either CSV repeats a column
+used for tagging, the tool reports the duplicated headers and exits with code 2 before modifying any Ogg file.
+This covers `bank`, `stream_id`, `name` and `source` in the names CSV, and `wave`, `label`, `speaker` and
+`text_<lang>` in the dialogue CSV. Extra columns are ignored, even if they repeat.
+
 Checked on the 1.0.2.1 package (2026-11-22) with all 638 `shared_minigame000.rpf` banks and the first 3,000
 `story000.rpf` banks (83,088 Ogg Opus files): 45,311 named streams tagged, exactly the names CSV rows for those
 banks; 1,980 of them are dialogue lines and 1,703 have a subtitle. A fresh `awc_opus.py` export of

@@ -1341,14 +1341,42 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
             f.write(sources + "\n")
         translate(disasm, spirv, jobs, emulate=emulate, fallbacks=fallbacks)
     verify_translation_completeness(dxbc, spirv)
+    native_pso_hashes(dxbc, spirv)
     fspx_shaders(game, work, signature, emulate=emulate, fallbacks=fallbacks)
     bvh_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
     library_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
     log("shaders: done")
 
 
+def native_pso_hashes(dxbc: str, spirv: str) -> None:
+    """Index the carved containers named by native graphics PSOs, including on a resumed translation."""
+    import native_pso_hashes as tool
+
+    index = os.path.join(spirv, "index.json")
+    if not os.path.isfile(index) or not os.path.isdir(dxbc):
+        return
+    output = os.path.join(spirv, tool.OUT_NAME)
+    if os.path.isfile(output):
+        stamp = os.stat(output).st_mtime_ns
+        inputs = (index, dxbc, os.path.join(dxbc, "index.json"), tool.__file__,
+                  os.path.join(os.path.dirname(tool.__file__), "shader_carve.py"))
+        if all(not os.path.exists(p) or os.stat(p).st_mtime_ns <= stamp for p in inputs):
+            with os.scandir(dxbc) as files:
+                if all(not f.name.endswith(".dxbc") or f.stat().st_mtime_ns <= stamp for f in files):
+                    return
+    try:
+        table = tool.build(dxbc, spirv)
+        tool.write(spirv, table)
+    except (OSError, ValueError) as error:
+        fail(f"shaders: could not index native graphics pipelines: {error}")
+    log(f"shaders: indexed {len(table)} native shader digests")
+
+
 FSPX_DLL = "amd_fidelityfx_upscaler_xbox.dll"
-FSPX_TOOLS = ("fspx_unpack.py", "shader_disasm.py")   # with TRANSLATION_SOURCES, what the FSPX outputs come from
+# What the FSPX outputs come from, with TRANSLATION_SOURCES. fspx_unpack.py --disasm imports shader_disasm.py
+# (tools/fspx_unpack.py:205), which decodes through rdna2_decode.py, its tables and mc_command.py: the listings these
+# three produce are what rdna2spirv.py translates, so an edited decoder must rebuild the cache, not be reused from it.
+FSPX_TOOLS = ("fspx_unpack.py", "shader_disasm.py", "rdna2_decode.py", "rdna2_isa_tables.py", "mc_command.py")
 
 
 def file_sha256(path: str) -> str:
@@ -1424,7 +1452,11 @@ def fspx_shaders(game: str, work: str, mc_signature: str, emulate: bool = False,
 
 
 LIBRARY_ARCHIVE = "shaders.rpf"
-LIBRARY_TOOLS = ("shader_library.py", "fspx_unpack.py", "shader_disasm.py")  # with TRANSLATION_SOURCES
+# With TRANSLATION_SOURCES, what the library's compute programs come from: shader_library.py carves with
+# shader_carve.py (tools/shader_library.py:201) and unpacks/disassembles with fspx_unpack.py, so the decoder
+# shader_disasm.py imports belongs here too (the same list as FSPX_TOOLS).
+LIBRARY_TOOLS = ("shader_library.py", "shader_carve.py", "shader_carve_accel.py",
+                 "fspx_unpack.py", "shader_disasm.py", "rdna2_decode.py", "rdna2_isa_tables.py", "mc_command.py")
 
 
 def library_settings(archive: str, mc_signature: str, emulate: bool, fallbacks: tuple[str, ...]) -> str:
@@ -1527,7 +1559,8 @@ def fspx_key_clash(spirv: str):
 
 
 BVH_DLL = "XboxBvhBuilder.dll"
-BVH_TOOLS = ("pe_shader_containers.py", "fssm_unpack.py", "shader_disasm.py")   # as FSPX_TOOLS, for the builder
+BVH_TOOLS = ("pe_shader_containers.py", "fssm_unpack.py", "shader_disasm.py",   # as FSPX_TOOLS, for the builder:
+             "rdna2_decode.py", "rdna2_isa_tables.py", "mc_command.py")          # what shader_disasm.py decodes with
 # rdna2spirv.py's --max-shared-memory for the builder's programs: 32768, the maxComputeSharedMemorySize of the AMD
 # Windows and Intel drivers (docs/design.md, "Workgroup memory limit"). The constructor creates a pipeline for every
 # program and gives up at the first one that fails, so one module over the device's limit costs the whole builder.
@@ -1805,11 +1838,12 @@ def runtime_gpu_max_push_constants():
     return int(v) if isinstance(v, int) and not isinstance(v, bool) and v > 0 else None
 
 
-# Source and data files that produce the translated modules, metadata and partner stubs.
-TRANSLATION_SOURCES = ("rdna2spirv.py", "shader_ir.py", "cfg_structure.py", "fssm_header.py", "lane_masks.py", "wave64_halves.py",
+# Source and data files that produce the translated modules, metadata, partner stubs and native PSO catalog.
+TRANSLATION_SOURCES = ("rdna2spirv.py", "shader_ir.py", "cfg_structure.py", "file_mode.py", "fssm_header.py", "lane_masks.py", "wave64_halves.py",
                        "wave64_emulate_opt.py", "shader_meta.py", "spirv_stubs.py", "spirv_asm.py", "spirv_asm_tables.py",
                        "spirv_opt.py", "report_paths.py", "replace_retry.py", "fssm_unpack.py", "shader_stage_manifest.py",
-                       "gfx10_formats.json")
+                       "rdna2_decode.py", "rdna2_isa_tables.py", "gfx10_formats.json",
+                       "native_pso_hashes.py", "shader_carve.py", "shader_carve_accel.py")
 
 
 def sources_digest(folder: str, names, lead: str = "") -> str:

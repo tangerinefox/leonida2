@@ -171,6 +171,18 @@ class KernelTests(unittest.TestCase):
                 expected_n = len(pr.EDGE_F16) * len(pr.LDEXP_EXPS) if op == "v_ldexp_f16" else len(pr.EDGE_F16)
                 self.assertEqual(len(pairs), expected_n)
 
+    def test_build_jobs_deduplicates_selections_in_first_seen_order(self):
+        ops = ["v_ldexp_f16", "v_frexp_mant_f16"]
+        waves = [64, 32]
+        unique_kernels, unique_meta = pr.build_jobs(ops, waves)
+        kernels, meta = pr.build_jobs([*ops, ops[0]], [*waves, waves[0]])
+        self.assertEqual(meta, unique_meta)
+        self.assertEqual([(k.wave, k.lines) for k in kernels], [(k.wave, k.lines) for k in unique_kernels])
+        self.assertEqual(
+            [(wave, op) for kind, wave, op, mod, _ in meta if kind == "grid" and not mod],
+            [(64, ops[0]), (64, ops[1]), (32, ops[0]), (32, ops[1])],
+        )
+
     def test_kernels_assemble_when_amd_clang_available(self):
         try:
             clang = runner.find_clang()
@@ -190,6 +202,41 @@ class KernelTests(unittest.TestCase):
                     text=True,
                 )
             self.assertEqual(res.returncode, 0, res.stderr[:800])
+
+
+class EvaluationTests(unittest.TestCase):
+    def test_repeated_selections_do_not_count_a_measurement_twice(self):
+        ops = ["v_frexp_mant_f16"]
+        waves = [32]
+        kernels, meta = pr.build_jobs(ops, waves)
+        raw = FakeOracle().run(kernels)
+        raw[0][0] ^= 1
+        unique = pr.evaluate_results(ops, waves, meta, raw)
+        self.assertEqual(unique["total_words"], 257)
+        self.assertEqual(unique["mismatches"], 1)
+        self.assertEqual(pr.evaluate_results(ops * 2, waves * 2, meta, raw), unique)
+
+    def test_evaluator_rejects_duplicate_measurements(self):
+        ops = ["v_frexp_mant_f16"]
+        waves = [32]
+        kernels, meta = pr.build_jobs(ops, waves)
+        raw = FakeOracle().run(kernels)
+        for job_kind in ("grid", "src_mods", "flush_ctrl", "ieee_ctrl"):
+            with self.subTest(kind=job_kind):
+                index = next(i for i, job in enumerate(meta) if job[0] == job_kind)
+                kind, wave, op, mod, _ = meta[index]
+                bad_raw = [words.copy() for words in raw]
+                bad_raw[index][0] ^= 1
+                baseline = pr.evaluate_results(ops, waves, meta, bad_raw)
+                self.assertEqual(baseline["mismatches"], 1)
+                # A later copy of the same job must keep the first mismatch visible and flag a harness error.
+                result = pr.evaluate_results(ops, waves, [*meta, meta[index]], [*bad_raw, raw[index]])
+                self.assertEqual(result["total_words"], baseline["total_words"])
+                self.assertEqual(result["mismatches"], 1)
+                self.assertEqual(result["first_mismatches"], baseline["first_mismatches"])
+                self.assertEqual(result["harness_errors"], [
+                    {"kind": kind, "wave": wave, "op": op, "mod": mod, "error": "duplicate job result"},
+                ])
 
 
 class ProbeCliTests(unittest.TestCase):
@@ -212,6 +259,42 @@ class ProbeCliTests(unittest.TestCase):
             self.assertEqual(doc["wave_diffs"], 0)
             self.assertEqual(doc["omod_diffs"], 0)
             self.assertEqual(doc["total_words"], 3466)
+
+    def test_duplicate_cli_selections_cannot_hide_first_measurement(self):
+        op = "v_frexp_mant_f16"
+        for ops, waves in ((op, "32,32"), (f"{op},{op}", "32")):
+            with self.subTest(ops=ops, waves=waves):
+                oracle = FakeOracle()
+                run = oracle.run
+
+                def flip_first_word(kernels):
+                    raw = run(kernels)
+                    raw[0][0] ^= 1
+                    return raw
+
+                with mock.patch.object(oracle, "run", side_effect=flip_first_word) as run_oracle:
+                    rc, out, err = _run_main(oracle, "--ops", ops, "--waves", waves)
+                self.assertEqual(rc, 1, out + err)
+                self.assertIn("total_words=257", out)
+                self.assertIn("mismatches=1", out)
+                self.assertIn("MISMATCH grid wave32 v_frexp_mant_f16 '' h=0x0000,n=0: got 0xdead0001, want 0xdead0000", out)
+                run_oracle.assert_called_once()
+                self.assertEqual(len(run_oracle.call_args.args[0]), len(pr.MODS) + 3)
+
+    def test_duplicate_cli_selections_match_unique_report_in_first_seen_order(self):
+        ops = ["v_ldexp_f16", "v_frexp_mant_f16"]
+        with tempfile.TemporaryDirectory() as d:
+            report = os.path.join(d, "report.json")
+            docs = []
+            for op_spec, wave_spec in ((",".join(ops), "64,32"), (", ".join([*ops, ops[0]]), "64, 32, 64")):
+                rc, out, err = _run_main(FakeOracle(), "--ops", op_spec, "--waves", wave_spec, "--json", report)
+                self.assertEqual(rc, 0, out + err)
+                with open(report, encoding="utf-8") as f:
+                    docs.append(json.load(f))
+            self.assertEqual(docs[0]["ops"], ops)
+            self.assertEqual(docs[0]["waves"], [64, 32])
+            self.assertEqual(docs[0]["total_words"], 2948)
+            self.assertEqual(docs[1], docs[0])
 
     def test_fake_oracle_grid_mismatch_exits_1(self):
         rc, out, _ = _run_main(FakeOracle(bad_grid=True), "--ops", "v_frexp_mant_f16", "--waves", "32")

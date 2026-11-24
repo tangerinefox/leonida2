@@ -43,7 +43,7 @@ def _is_inline(tok):
 
 def literals(line):
     """The distinct 32-bit literal values an instruction needs (SOPK immediates are not literals)."""
-    op, _, rest = line.partition(" ")
+    op, _, rest = line.strip().partition(" ")
     if not op.startswith("s_") or op.rstrip("_") in _LITERAL_FREE or re.match(r"s_cmpk_", op):
         return set()
     toks = [t.strip() for t in rest.split(",")] if rest else []
@@ -55,10 +55,11 @@ def skip_reason(lines, arch):
     """Why a program cannot be run on this architecture, or None. Hardware allows one literal per instruction."""
     removed = {"gfx10": {}, "gfx11": GFX11_REMOVED, "gfx12": GFX12_REMOVED}[family(arch)]
     for line in lines:
-        op = line.partition(" ")[0]
+        stripped = line.strip()
+        op = stripped.partition(" ")[0]
         if op in removed:
             return f"{op}: {removed[op]}"
-        if len(literals(line)) > 1:
+        if len(literals(stripped)) > 1:
             return "two different literals in one instruction (not encodable)"
     return None
 

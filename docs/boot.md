@@ -5,8 +5,9 @@ repository's test corpus does not contain `game_scarlett_master.exe` (RT-5); the
 separately maps it and leaves 30 imports unimplemented, and `--init` runs its TLS callbacks and the package DLLs'
 `DllMain`s without an exception
 ([`runtime_imports.md`](runtime_imports.md#the-retail-executable-rt-5)), so this page is still the procedure and the
-trace tool for the first boot. The executable's `ws2_32.dll` imports bind to the host's, so run `--run` with the
-network off. Nothing here quotes game data; a real trace stays on the player's machine.
+trace tool for the first boot. Outbound `ws2_32.dll` and `winhttp.dll` calls are restricted offline by the shims
+(`ws2_offline.cpp` permits loopback only; `winhttp_offline.cpp` refuses all requests), though running with the network
+off remains good defence in depth. Nothing here quotes game data; a real trace stays on the player's machine.
 
 ## 1. What the first boot produces
 
@@ -31,6 +32,11 @@ DllMain/TLS results, exceptions with their stack frames, the exit, and the D3D12
 per method. The `[rt]` lines in the same stderr log carry the device parameters, feature ids and warnings; the
 summary leaves them as a count, so grep `^\[rt\]` for those.
 
+For `xmem_physical_pages`, the shim records the first request for each distinct attribute word. The text and
+JSON summaries list the API, raw attribute word, requested page count and caller for the first `--limit`
+records in trace order. Use `--limit 0` to keep the total with no records. Text shows how many records were
+omitted, and JSON keeps the full count in `startup.kinds.xmem_physical_pages`.
+
 ## 2. Commands
 
 Windows (from the repository root):
@@ -41,7 +47,8 @@ $exe = "C:\path\to\game_scarlett_master.exe"
 $pkg = "C:\path\to\the\package"
 $trace = Join-Path $env:TEMP boot.jsonl
 $log = Join-Path $env:TEMP d3d12.log
-.\runtime\build\gta6rt.exe --run $exe --game-dir $pkg --trace $trace --trace-d3d12 2>&1 |
+& { $ErrorActionPreference = 'Continue'
+    .\runtime\build\gta6rt.exe --run $exe --game-dir $pkg --trace $trace --trace-d3d12 2>&1 } |
     ForEach-Object { $_.ToString() } |
     Out-File -LiteralPath $log -Width 4096 -Encoding utf8
 python -I tools\boot_trace.py $trace --d3d12 $log
@@ -50,6 +57,13 @@ python -I tools\boot_trace.py $trace --d3d12 $log
 The capture pipeline writes each message as text to avoid PowerShell 5.1 wrapping the first stderr record at a
 narrow output width. The tool also reads existing UTF-16LE logs saved with `2>` in PowerShell 5.1 and recognizes
 the `program.exe : ` prefix on the first stderr line.
+
+The `& { ... }` block matters when the session (or a profile or script) has `$ErrorActionPreference = 'Stop'`:
+Windows PowerShell 5.1 then turns the first stderr line into a terminating error, the run stops there, and the log
+holds no `[d3d12-trace]` line, so it reads as a run with no D3D12 call. The block sets `Continue` for the run only
+(`scripts/first_look.ps1` captures its dry run the same way). Measured on 5.1.26100 with a stand-in that prints three
+trace lines to stderr and exits 37: without the block, all three with `Continue` and none with `Stop`; with it, all
+three with either, `$LASTEXITCODE` 37, and the session's preference unchanged.
 
 Linux under Wine (a cross build made with xwin, or the `runtime-windows` artifact; the backend must be Vulkan):
 
@@ -61,10 +75,17 @@ wine runtime/build/windows/gta6rt.exe --run /path/to/game_scarlett_master.exe \
 python3 -I tools/boot_trace.py /tmp/boot.jsonl --d3d12 /tmp/d3d12.log
 ```
 
+`runtime\build\gta6rt.exe` is where `scripts\build_runtime.ps1` (Ninja) puts it; the direct CMake path in
+[runtime/README.md](../runtime/README.md) uses the multi-config Visual Studio generator, which writes
+`runtime\build\RelWithDebInfo\gta6rt.exe` instead.
+
 `--trace FILE` **refuses an existing file** (exit 2): it is created before the loader reads anything, so use a
 fresh name or delete the old one. `LEONIDA_D3D12=vulkan` selects the Vulkan-backed device, the only backend that
-writes the `[d3d12-trace]` lines; without it the layer uses the Windows D3D12 device and the trace has nothing to
-read. Keep the traces out of the repository: they can quote whatever the game prints.
+traces command lists, resources and pipelines; without it the layer uses the Windows D3D12 device, and the
+`[d3d12-trace]` lines are only what the Xbox-ABI proxy forwards (device creation, queue, fence and allocator
+calls), which `boot_trace.py` summarizes without complaint. A run on the Vulkan device prints
+`[rt] d3d12: Vulkan device: <name>`; check the log for it (a runtime built without the Vulkan headers accepts the
+variable and stays on the Windows device). Keep the traces out of the repository: they can quote whatever the game prints.
 
 Useful switches:
 
@@ -85,7 +106,8 @@ Useful switches:
 * `DISABLE_RTSS_LAYER=1` and `DISABLE_VULKAN_OBS_CAPTURE=1` when MSI Afterburner or OBS is installed; their
   implicit layers add swapchain usage that shows up as validation errors ([testing.md](testing.md), "Known
   problems").
-* `--overlay DIR` sends the guest's writes to a private folder instead of the package.
+* `--overlay DIR` sends the guest's writes to DIR instead of the default `<game-dir>\overlay` (useful when the
+  package drive is read-only); the package itself is never written.
 
 ## 3. Triage order
 
@@ -105,8 +127,9 @@ Read the startup trace first; the first event that is not the expected one is th
    the final slot for the last observed exception. The trace also includes handled exceptions, so the last
    observation alone does not establish what caused the run to stop.
 5. **`exit` / `error`** — a clean exit is not a correct frame; continue to the D3D12 trace.
-6. **D3D12 trace** — the `failed`, `unsupported`, `refused` and `partial` lines name the method. A `partial`
-   submission ran the supported commands from a list. The runtime's `[rt]` diagnostic names the command it left out.
+6. **D3D12 trace** — the `failed`, `unsupported` and `refused` lines name the method. A `failed`
+   `ExecuteCommandLists` submitted nothing from its lists. (`boot_trace.py` also lists a `partial` outcome, a
+   submission that ran only the supported commands; the runtime does not write it yet.)
    Compare the method's position with the public SDK vtable. An unknown slot is expected until the executable names it
    (Q2, Q6). The `[rt]` lines in the same log carry the 24 device words, feature IDs and warnings.
    The summary expects `#1` first, then one more than the last observed number. It counts each mismatch once and
@@ -125,8 +148,8 @@ is `null`; if neither input yields a report, stdout is empty.
 
 ## 4. The open questions, and the trace signal for each
 
-The questions are in [`d3d12_vulkan.md`](d3d12_vulkan.md) §8.2; that table repeats 16, 19 and 20, and this one is
-the de-duplicated 1–22. It maps each question to the event to look for; it does not answer them.
+The questions are in [`d3d12_vulkan.md`](d3d12_vulkan.md) §8.2; this table takes the same 1–22 in
+order. It maps each question to the event to look for; it does not answer them.
 
 | # | Question | Signal in the first trace |
 |---|---|---|
@@ -167,5 +190,6 @@ the de-duplicated 1–22. It maps each question to the event to look for; it doe
 The retail executable is not in the package, so this page is untested against it; the tool and the trace formats
 are tested on synthetic fixtures and on `tiny_game` (which has no D3D12 calls). The present slots (Q6) and the
 Xbox device parameters (Q1) remain the first things the executable itself has to name. The D3D12 trace needs the
-Vulkan backend; a build without it runs the game's calls through the PC device and records nothing. The runbook
+Vulkan backend; a build without it runs the game's calls through the PC device and records only the proxy's
+device, queue, fence and allocator calls. The runbook
 does not make the game boot; it makes the first real trace readable.

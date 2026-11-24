@@ -40,8 +40,10 @@ anything.
 
 ## Run
 
+Run this command from the `tools/conformance/native` directory used for the build.
+
 ```bat
-tools/conformance/native\build\Release\conform_native.exe tools/conformance/native\out\run1
+.\build\Release\conform_native.exe .\out\run1
 ```
 
 ```

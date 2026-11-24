@@ -25,6 +25,7 @@ on:
       - "tools/cfg_structure.py"
       - "tools/cpu_ref.py"
       - "tools/f32_fuzz.py"
+      - "tools/file_mode.py"
       - "tools/first_light.py"
       - "tools/fspx_unpack.py"
       - "tools/fssm_header.py"
@@ -34,10 +35,15 @@ on:
       - "tools/lane_masks.py"
       - "tools/mc_command.py"
       - "tools/mesh_compute_vs.py"
+      - "tools/native_pso_hashes.py"
+      - "tools/rdna2_decode.py"
+      - "tools/rdna2_isa_tables.py"
       - "tools/rdna2spirv.py"
       - "tools/replace_retry.py"
       - "tools/report_paths.py"
       - "tools/shader_carve.py"
+      - "tools/shader_carve_accel.py"
+      - "tools/shader_carve_native/**"
       - "tools/shader_disasm.py"
       - "tools/shader_ir.py"
       - "tools/shader_meta.py"
@@ -64,6 +70,7 @@ on:
       - "tools/cfg_structure.py"
       - "tools/cpu_ref.py"
       - "tools/f32_fuzz.py"
+      - "tools/file_mode.py"
       - "tools/first_light.py"
       - "tools/fspx_unpack.py"
       - "tools/fssm_header.py"
@@ -73,10 +80,15 @@ on:
       - "tools/lane_masks.py"
       - "tools/mc_command.py"
       - "tools/mesh_compute_vs.py"
+      - "tools/native_pso_hashes.py"
+      - "tools/rdna2_decode.py"
+      - "tools/rdna2_isa_tables.py"
       - "tools/rdna2spirv.py"
       - "tools/replace_retry.py"
       - "tools/report_paths.py"
       - "tools/shader_carve.py"
+      - "tools/shader_carve_accel.py"
+      - "tools/shader_carve_native/**"
       - "tools/shader_disasm.py"
       - "tools/shader_ir.py"
       - "tools/shader_meta.py"
@@ -102,7 +114,9 @@ concurrency:
 jobs:
   windows:
     runs-on: windows-latest
-    timeout-minutes: 20
+    # A build with a cold sccache took 18.3 min (main, 24 Nov), which left a 20-minute job under 2 min for the
+    # whole ctest run. The ctest step bounds each test on its own, so a hung test no longer needs this to stop it.
+    timeout-minutes: 35
     outputs:
       wine-artifact: ${{ steps.upload-wine-artifact.outcome }}
     env:
@@ -243,6 +257,7 @@ jobs:
           -DCMAKE_BUILD_TYPE=RelWithDebInfo
           -DLEONIDA_D3D12_SHIM_TESTS=ON
           -DLEONIDA_REQUIRE_VULKAN=ON
+          -DLEONIDA_REQUIRE_XMA2_DECODER=ON
           -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
           -DCMAKE_POLICY_DEFAULT_CMP0141=NEW
           -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
@@ -288,8 +303,10 @@ jobs:
             runtime/build/windows-root.txt
           retention-days: 7
           if-no-files-found: error
+      # --timeout: a test without a TIMEOUT of its own fails after 5 min instead of the CTest default of 25, which
+      # is longer than the job. The slowest on Linux and macOS (xdxr_build_check) takes 50 and 106 s.
       - name: CPU runtime tests
-        run: ctest --test-dir runtime/build --output-on-failure
+        run: ctest --test-dir runtime/build --output-on-failure --timeout 300
 
   # Runs the Windows build's tests under Wine, so a change that breaks the loader on Linux (through Wine or Proton)
   # shows up. The required ones are the loader and the stand-in game run end to end; the table in the job summary

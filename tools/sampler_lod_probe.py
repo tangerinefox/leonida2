@@ -182,10 +182,10 @@ def kernel(arch, table):
     return out + tsharp._longs(ramp)
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--oracle", choices=("rule", "hw"), default="rule")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     table = rows()
     if a.oracle == "rule":
         for name, instr, lod, s, t in table:
@@ -200,44 +200,47 @@ def main():
     except runner.Unavailable as e:
         print(f"hardware oracle unavailable: {e}")
         return 77
-    print(f"device: {oracle.device}")
-    got = {}
-    for wave in (32, 64):
-        try:
-            k = asm.Kernel(kernel(oracle.arch, table), wave=wave, threads=1, words=len(table), raw=True,
-                           vgprs=16, sgprs=24)
-        except ValueError as e:
-            print(f"cannot build the kernel: {e}")
+    try:
+        print(f"device: {oracle.device}")
+        got = {}
+        for wave in (32, 64):
+            try:
+                k = asm.Kernel(kernel(oracle.arch, table), wave=wave, threads=1, words=len(table), raw=True,
+                               vgprs=16, sgprs=24)
+            except ValueError as e:
+                print(f"cannot build the kernel: {e}")
+                return 2
+            res = oracle.run([k])[0]
+            if isinstance(res, str):
+                print(f"wave{wave}: kernel rejected: {res}")
+                return 2
+            got[wave] = [struct.unpack("<f", struct.pack("<I", w))[0] if w != tsharp.POISON else None for w in res]
+        if any(v is None for v in got[32] + got[64]):
+            print("the texture did not land 256-byte aligned (POISON)")
             return 2
-        res = oracle.run([k])[0]
-        if isinstance(res, str):
-            print(f"wave{wave}: kernel rejected: {res}")
+        # The calibration rows name the level starts. They need only be distinct (gfx1036 puts a linear chain smallest
+        # level first, each row padded to 256 bytes); wave64 must agree.
+        starts = [got[32][n] for n in range(LEVELS)]
+        print("level starts (dwords): " + ", ".join(f"{n}:{s:.0f}" for n, s in enumerate(starts)))
+        if len(set(starts)) != LEVELS or starts != [got[64][n] for n in range(LEVELS)]:
+            print("calibration: the level starts are not distinct, or wave32 and wave64 disagree; cannot name levels")
             return 2
-        got[wave] = [struct.unpack("<f", struct.pack("<I", w))[0] if w != tsharp.POISON else None for w in res]
-    if any(v is None for v in got[32] + got[64]):
-        print("the texture did not land 256-byte aligned (POISON)")
-        return 2
-    # The calibration rows name the level starts. They need only be distinct (gfx1036 puts a linear chain smallest
-    # level first, each row padded to 256 bytes); wave64 must agree.
-    starts = [got[32][n] for n in range(LEVELS)]
-    print("level starts (dwords): " + ", ".join(f"{n}:{s:.0f}" for n, s in enumerate(starts)))
-    if len(set(starts)) != LEVELS or starts != [got[64][n] for n in range(LEVELS)]:
-        print("calibration: the level starts are not distinct, or wave32 and wave64 disagree; cannot name levels")
-        return 2
-    level_of = {s: n for n, s in enumerate(starts)}
-    bad = vk_diff = 0
-    for i, (name, instr, lod, s, t) in enumerate(table):
-        want, vk = rule_level(instr, lod, s, t), vulkan_level(instr, lod, s, t)
-        g32, g64 = level_of.get(got[32][i]), level_of.get(got[64][i])
-        ok = g32 == want and g64 == want
-        bad += not ok
-        vk_diff += g32 != vk
-        shown = "?" if g32 is None else str(g32)
-        extra = "" if g32 == g64 else f" (wave64 {g64})"
-        note = "" if g32 == vk else f"  Vulkan reads {vk}"
-        print(f"{name:18} hw level {shown:>2}{extra:12} rule {want}  {'ok' if ok else 'DIFFERS'}{note}")
-    print(f"{len(table) - bad}/{len(table)} rows match the rule; Vulkan's level differs on {vk_diff}")
-    return 1 if bad else 0
+        level_of = {s: n for n, s in enumerate(starts)}
+        bad = vk_diff = 0
+        for i, (name, instr, lod, s, t) in enumerate(table):
+            want, vk = rule_level(instr, lod, s, t), vulkan_level(instr, lod, s, t)
+            g32, g64 = level_of.get(got[32][i]), level_of.get(got[64][i])
+            ok = g32 == want and g64 == want
+            bad += not ok
+            vk_diff += g32 != vk
+            shown = "?" if g32 is None else str(g32)
+            extra = "" if g32 == g64 else f" (wave64 {g64})"
+            note = "" if g32 == vk else f"  Vulkan reads {vk}"
+            print(f"{name:18} hw level {shown:>2}{extra:12} rule {want}  {'ok' if ok else 'DIFFERS'}{note}")
+        print(f"{len(table) - bad}/{len(table)} rows match the rule; Vulkan's level differs on {vk_diff}")
+        return 1 if bad else 0
+    finally:
+        oracle.close()
 
 
 if __name__ == "__main__":

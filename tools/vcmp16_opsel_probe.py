@@ -138,10 +138,10 @@ def kernel(table):
     return out + ["s_waitcnt vmcnt(0)", "s_endpgm"]
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--oracle", choices=("rule", "hw"), default="rule")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     table = rows()
     if a.oracle == "rule":
         for row in table:
@@ -158,13 +158,24 @@ def main():
     print(f"device: {oracle.device}")
     got = {}
     controls = control_rows()
-    for wave in (32, 64):
-        res = oracle.run([asm.Kernel(kernel(table), wave=wave, threads=1, words=len(table) + len(controls),
-                                     raw=True, vgprs=16, sgprs=24)])[0]
-        if isinstance(res, str):
-            print(f"wave{wave}: kernel rejected: {res}")
-            return 2
-        got[wave] = res
+    try:
+        for wave in (32, 64):
+            words_expected = len(table) + len(controls)
+            raw = oracle.run([asm.Kernel(kernel(table), wave=wave, threads=1, words=words_expected,
+                                         raw=True, vgprs=16, sgprs=24)])
+            if not raw or raw[0] is None:
+                print(f"harness error: wave{wave}: no result from oracle")
+                return 2
+            res = raw[0]
+            if isinstance(res, str):
+                print(f"wave{wave}: kernel rejected: {res}")
+                return 2
+            if not isinstance(res, (list, tuple)) or len(res) != words_expected:
+                print(f"harness error: wave{wave}: expected {words_expected} words, got {len(res) if isinstance(res, (list, tuple)) else res!r}")
+                return 2
+            got[wave] = res
+    finally:
+        oracle.close()
     # The control must show the hand-set bits working on a VOP3 op that takes op_sel; otherwise nothing is measured.
     for k, (name, opsel) in enumerate(controls):
         h, ig = control_answer(opsel, True), control_answer(opsel, False)

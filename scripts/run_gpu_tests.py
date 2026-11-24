@@ -36,6 +36,7 @@ from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, CVT_PK_U8_WORDS, PK_MUL_
 from check import SIGNED_MIP_TEST, UINT_MIP_TEST
 from check import cbv_modulate_test
 from check import HEAP_INIT_EXPECTED, heap_init_env   # cs_heap_init: vk_compute_test's VKC_HEAP_INIT
+from check import shift64_test   # dynamic 64-bit vector shifts and overlapping destinations
 from check import judged_words, words_match   # dump words not judged on some devices (cs_signed_zero_nan)
 from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and arguments live in check.py
 from check import TEXOFF_FALLBACK, texoff_env   # LEONIDA_TEXOFF_FALLBACK=1: texel offsets without maintenance8
@@ -149,8 +150,13 @@ def spirv_as(asm_text: str, out_spv: str, assembler: str = "spirv-as") -> None:
         with open(out_spv, "wb") as f:
             f.write(spv_bytes)
         return
-    p = subprocess.run(["spirv-as", "--target-env", "vulkan1.2", "-o", out_spv, "-"],
-                       input=asm_text, capture_output=True, text=True)
+    try:
+        p = subprocess.run(["spirv-as", "--target-env", "vulkan1.2", "-o", out_spv, "-"],
+                           input=asm_text, capture_output=True, text=True)
+    except FileNotFoundError:
+        raise RuntimeError("spirv-as not found on PATH (use --assembler python to assemble with tools/spirv_asm.py)") from None
+    except OSError as exc:
+        raise RuntimeError(f"spirv-as could not be started: {exc.strerror or exc}") from None
     if p.returncode != 0:
         raise RuntimeError(f"spirv-as failed for {out_spv}:\n{p.stderr}")
 
@@ -258,6 +264,8 @@ def read_raw_u32(path: str) -> list[tuple[int, int, int, int]]:
     return [struct.unpack_from("<4I", data, 16 * i) for i in range(n)]
 
 
+# cs_div_fmas_f64_rt's operands a = 1 + 2^-30, c = -(1 + 2^-29) as s4..s7 (low word first).
+DIV_FMAS_F64_SGPRS = "0x00400000,0x3ff00000,0x00800000,0xbff00000"
 UNSUPPORTED = 77   # vk_harness: the device lacks a stage the test draws with (geometry or mesh shaders)
 
 
@@ -268,10 +276,11 @@ def unsupported_skip(msg: str) -> str:
 
 
 def verdict_line(rc: int, msg: str) -> str:
-    """The detail of a row whose test program judges itself and prints its verdict last: that line. A program that
-    exited non-zero gets its exit status in front, as in check.py, so one that died before its verdict (exit -11 on
-    Linux, 3221225477 = 0xC0000005 on Windows) does not read as a FAIL with only its device or extension line, or
-    with no detail at all."""
+    """Report the helper's verdict, prefixed with its exit status on failure."""
+    # run_cmd appends stderr to stdout. A device banner on stderr can follow the verdict.
+    output, _, last = msg.rstrip().rpartition("\n")
+    if output and last.startswith("device: "):
+        msg = output
     return failure(rc, msg, 1) if rc else msg.splitlines()[-1] if msg else ""
 
 
@@ -974,6 +983,10 @@ def run_suite(a, work: str) -> int:
         if name in CLIP_CASES:
             detail = clip_test(a.build, spirv_dir, name)
             results.append((name, None if isinstance(detail, Skip) else not detail, detail or "four pixel masks exact"))
+        elif name == "cs_w32_shift64":
+            detail = shift64_test(a.build, spirv_dir, cs_env)
+            results.append((name, None if isinstance(detail, Skip) else not detail,
+                            detail or "640 words exact (64 shift cases and unchanged inputs)"))
         elif name == "cs_workgroup_yz":
             rc, msg = run_cmd([vk_compute, spv, "2x3x4", "workgroup_yz"], env=cs_env)
             results.append((name,) + compute_result(rc, msg, rc == 0 and "2x3x4 workgroup Y/Z: 0 mismatches"
@@ -1091,10 +1104,12 @@ def run_suite(a, work: str) -> int:
                 ok, detail = judge_cs_dump(rc, msg, [0, 0x40040000], wave64=False, partial=False, emulated=False,
                                            hexwords=True)
                 results.append((name, ok, detail))
-        elif name == "cs_div_fmas_f64":
+        elif name in ("cs_div_fmas_f64", "cs_div_fmas_f64_rt"):
             # One-rounding binary64 FMA: strict where the translator emitted OpFmaKHR on doubles (shaderFmaFloat64,
             # --fma khr); under the default GLSL Fma the split result (0) is allowed, as cs_fma_fused allows it.
-            rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=cs_env)
+            # The _rt fixture reads the same operands from s4..s7, so the driver cannot fold the Fma at compile time.
+            env = dict(cs_env or os.environ, VKC_SGPRS=DIV_FMAS_F64_SGPRS) if name.endswith("_rt") else cs_env
+            rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=env)
             if rc == UNSUPPORTED:      # no shaderFloat64, or (--fma khr) no shaderFmaFloat64
                 results.append((name, None, unsupported_skip(msg)))
             else:
@@ -1104,7 +1119,8 @@ def run_suite(a, work: str) -> int:
                 ok = rc == 0 and (words == fused or (not strict and words == split))
                 detail = " ".join(hex(x) for x in words) if words else msg
                 if ok and words == split:
-                    detail += " (split: the driver rounds GLSL Fma on doubles twice; --fma khr fixes it)"
+                    detail += (" (split: the driver rounded GLSL Fma on doubles twice%s; --fma khr fixes it)"
+                               % ("" if name.endswith("_rt") else " when folding the constants"))
                 results.append((name, ok, detail))
         elif name == "cs_cvt_f32_sat":
             # #300's saturating float -> int conversions: one dispatch per input word in s4 (VKC_SGPRS).
@@ -1318,6 +1334,9 @@ def run_suite(a, work: str) -> int:
             results.append((name, ok, detail))
         elif name == "cs_imgstore":
             rc, msg = run_cmd([vk_store, spv])
+            results.append((name, *helper_result(rc, msg)))
+        elif name == "cs_imgstore_cube":   # GPU-CUBE-STORE: six-layer 2D-array views at bindings 11/12/13
+            rc, msg = run_cmd([vk_store, spv, "cube"])
             results.append((name, *helper_result(rc, msg)))
         elif name in ("cs_imgload", "cs_imgload_tfe", "cs_imgload_d16", "cs_imgload_d16_tfe", "cs_sample_lz_int_d16"):
             rc, msg = run_cmd([vk_store, spv, "load" if name in ("cs_imgload", "cs_imgload_tfe") else "load-d16"])

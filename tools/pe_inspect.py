@@ -25,6 +25,7 @@ import re
 import struct
 import sys
 from collections import Counter
+from collections.abc import Iterator
 
 SYSTEM32 = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
 
@@ -129,6 +130,34 @@ class PeImage:
     def directory(self, index: int) -> tuple[int, int]:
         return self.directories[index] if index < len(self.directories) else (0, 0)
 
+    def import_descriptors(self, index: int, *, delay: bool = False) -> Iterator[tuple[int, int, int, bool]]:
+        """Yield (dll_rva, iat_rva, lookup_rva, va_entries) for each import descriptor."""
+        rva, size = self.directory(index)
+        if not rva or not size:
+            return
+
+        step = 32 if delay else 20
+        for i in range(min(size // step, MAX_ENTRIES)):
+            at = self.offset(rva + i * step, step)
+            if at is None:
+                break
+            va_entries = False
+            if delay:
+                attributes, dll_rva, _handle, iat_rva, lookup_rva = struct.unpack_from("<5I", self.data, at)
+                if not dll_rva:
+                    break
+                # With dlattrRva clear, these DWORDs and named lookup entries hold legacy VAs.
+                if not attributes & 1:
+                    va_entries = True
+                    dll_rva -= self.image_base
+                    iat_rva -= self.image_base
+                    lookup_rva -= self.image_base
+            else:
+                lookup_rva, _stamp, _forwarder, dll_rva, iat_rva = struct.unpack_from("<5I", self.data, at)
+                if not dll_rva:
+                    break
+            yield dll_rva, iat_rva, lookup_rva, va_entries
+
     def _range(self, rva: int) -> tuple[int, int] | None:
         """Contiguous file [start, end) backed by headers or the single section holding `rva`."""
         if rva < 0:
@@ -177,7 +206,7 @@ class PeImage:
     def word(self, at: int) -> int:
         return struct.unpack_from("<Q" if self.is64 else "<I", self.data, at)[0]
 
-    def thunk_names(self, lookup_rva: int) -> list[str]:
+    def thunk_names(self, lookup_rva: int, *, va_entries: bool = False) -> list[str]:
         """Names (or '#ordinal') of one lookup table, which is terminated by a zero entry."""
         ordinal_flag = 1 << (63 if self.is64 else 31)
         out = []
@@ -192,40 +221,19 @@ class PeImage:
             if value & ordinal_flag:
                 out.append(f"#{value & 0xFFFF}")
                 continue
+            if va_entries:
+                value -= self.image_base
+                if value <= 0:
+                    out.append("?")
+                    continue
             name = self.string_at(value + 2)  # skip the 2-byte hint
             out.append(name if name is not None else "?")
         return out
 
 
 def _imports(img: PeImage, kind: str, index: int, delay: bool = False) -> list[dict]:
-    rva, size = img.directory(index)
-    if not rva or not size:
-        return []
-
     entries = []
-    step = 32 if delay else 20
-    for i in range(min(size // step, MAX_ENTRIES)):
-        base = img.offset(rva + i * step, step)
-        if base is None:
-            break
-        if delay:
-            (attributes, dll_rva, _handle, iat_rva, int_rva, _bound, _unload,
-             _stamp) = struct.unpack_from("<IIIIIIII", img.data, base)
-            if not dll_rva:
-                break
-            # dlattrRva (0x1) is set on every descriptor Windows writes; without it the fields are virtual
-            # addresses, which the linker uses for 32-bit images. Convert them so both kinds read the same here.
-            if not attributes & 1:
-                dll_rva = dll_rva - img.image_base
-                iat_rva = iat_rva - img.image_base
-                int_rva = int_rva - img.image_base
-        else:
-            oft, _stamp, _forwarder, dll_rva, iat_rva = struct.unpack_from("<IIIII", img.data, base)
-            int_rva = oft
-            if not dll_rva:
-                break
-        if dll_rva < 0:
-            continue
+    for dll_rva, iat_rva, int_rva, _va_entries in img.import_descriptors(index, delay=delay):
         dll = img.string_at(dll_rva)
         if dll is None:
             continue

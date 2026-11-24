@@ -10,8 +10,8 @@ it owns the program table, the seed and the comparison; cpu_ref stays a pure
 interpreter and is never modified here.
 
 Usage:
-    python -I tools/shader_diff.py [--programs N] [--seed S] [--max-ops N]
-    python -I tools/shader_diff.py --program-index I --seed S --max-ops N
+    python -I tools/shader_diff.py [--programs N] [--seed S] [--max-ops N] [--ops OP,...]
+    python -I tools/shader_diff.py --program-index I --seed S --max-ops N [--ops OP,...]
     python -I tools/shader_diff.py --self-test     # harness canaries (must fail loudly if broken)
     python -I tools/shader_diff.py --list-ops
 
@@ -51,6 +51,7 @@ EXPORT_REGS = (8, 9, 10, 11)
 # real semantic divergence, not a rounding convention.
 _SMALL_INTS = (0, 1, 2, 3, 5, 7, 15, 16, 31, 64, 127, 255)
 _EXACT_FLOATS = (0.5, 1.5, 2.5, -1.5, 4.0)
+_SCALAR_SEEDS = _SMALL_INTS + (0x7FFFFFFF, 0x80000000, 0xFFFFFFFE, 0xFFFFFFFF)
 
 
 def _u32_bits(value):
@@ -113,21 +114,6 @@ def _op_templates():
     ]
 
 
-# NOTE: s_add_u32 is deliberately NOT generated: the translator lowers scalar
-# adds to OpIAddCarry, which tests/semantic/spirv_mini_interp.py does not
-# model yet, so every such program would skip with a reason instead of
-# proving anything. Scalar reads are still covered: seeds are moved through
-# s_regs and observed via the v_mov_b32/sgpr copy into an exported VGPR. Extending the
-# mini-interp (not this runner) re-enables scalar ALU coverage.
-_VEC_OPS = ("v_mov_b32", "v_add_f32", "v_sub_f32", "v_mul_f32", "v_fma_f32",
-            "v_and_b32", "v_or_b32", "v_xor_b32", "v_lshlrev_b32",
-            "v_lshrrev_b32", "v_ashrrev_i32",
-            "v_add_nc_u32", "v_sub_nc_u32", "v_subrev_nc_u32", "v_mul_u32_u24",
-            "v_mul_i32_i24", "v_mul_lo_u32", "v_mul_hi_u32", "v_mul_hi_i32",
-            "v_mad_u32_u24", "v_mad_i32_i24", "v_min_u32", "v_max_u32",
-            "v_min_i32", "v_max_i32",
-            "v_bfe_u32", "v_bfe_i32", "v_bfi_b32", "v_alignbit_b32",
-            "v_alignbyte_b32", "v_perm_b32", "v_med3_i32", "v_med3_u32")
 _FLOAT_OPS = ("v_add_f32", "v_sub_f32", "v_mul_f32", "v_fma_f32")
 
 
@@ -137,7 +123,7 @@ def _seed_value(rng):
     return _u32_bits(rng.choice(_EXACT_FLOATS))
 
 
-def generate_program(rng, n_ops):
+def generate_program(rng, n_ops, *, ops=None):
     """One straight-line program. Returns (body_lines, export_writers).
 
     body_lines are tab-less assembly lines (seeds, ops). export_writers maps
@@ -151,8 +137,10 @@ def generate_program(rng, n_ops):
         writers[v] = ("v_mov_b32/seed", len(lines))
     s_regs = (4, 5, 6, 7)
     for s in s_regs:
-        lines.append(f"s_mov_b32 s{s}, {_seed_value(rng) % 256}")
-    vec_ops = [t for t in _op_templates() if t[0] in _VEC_OPS and t[0] != "v_mov_b32"]
+        lines.append(f"s_mov_b32 s{s}, {rng.choice(_SCALAR_SEEDS):#010x}")
+    templates = [(name, emit) for name, emit in _op_templates()
+                 if (name != "v_mov_b32" if ops is None else name in ops)]
+    scalar_result = None
     # A float op may return any NaN payload (Vulkan does not promise one) and the
     # comparison accepts both-NaN. If that value then fed an integer op, the two
     # payloads would produce different integer results, so integer ops never read
@@ -160,7 +148,13 @@ def generate_program(rng, n_ops):
     # both oracles; a later integer write clears the taint.
     tainted = set()
     for _ in range(n_ops):
-        name, emit = rng.choice(vec_ops)
+        name, emit = rng.choice(templates)
+        if name == "s_add_u32":
+            # Chain scalar adds so earlier sums contribute to the exported result.
+            src = rng.choice(s_regs) if scalar_result is None else scalar_result
+            scalar_result = 8
+            lines.append(emit(rng, scalar_result, (src, rng.choice(s_regs))))
+            continue
         dst = rng.choice(SCRATCH)
         clean = [v for v in SCRATCH if v not in tainted]
         if name not in _FLOAT_OPS and not clean:
@@ -178,10 +172,15 @@ def generate_program(rng, n_ops):
             tainted.add(dst)
         else:
             tainted.discard(dst)
-    # Reuse the oldest export: an untouched seed if possible, else an ALU result.
-    dst = min(EXPORT_REGS, key=lambda reg: writers[reg][1])
-    lines.append(f"v_mov_b32 v{dst}, s{rng.choice(s_regs)}")
-    writers[dst] = ("v_mov_b32/sgpr-copy", len(lines))
+    if scalar_result is None:
+        scalar_outputs = [(f"s{rng.choice(s_regs)}", "sgpr-copy")]
+    else:
+        scalar_outputs = [(f"s{scalar_result}", "sgpr-copy"), ("scc", "scc-copy")]
+    # Reuse the oldest exports: untouched seeds if possible, then ALU results.
+    export_order = sorted(EXPORT_REGS, key=lambda reg: writers[reg][1])
+    for dst, (src, kind) in zip(export_order, scalar_outputs):
+        lines.append(f"v_mov_b32 v{dst}, {src}")
+        writers[dst] = (f"v_mov_b32/{kind}", len(lines))
     return lines, writers
 
 
@@ -263,14 +262,17 @@ def run_one(name, lines, writers):
         return ("mismatch", mismatch)
 
 
-def run_suite(programs, seed, max_ops, limit=None, *, start=0):
+def run_suite(programs, seed, max_ops, limit=None, *, start=0, ops=None):
     """Generate the seeded sequence, executing cases from index start. Return (counts, first_failure)."""
     counts = {"pass": 0, "mismatch": 0, "skip": {}, "harness-error": 0}
     first_failure = None
     rng = random.Random(seed)
     total = programs if limit is None else min(programs, limit)
+    replay = f"--seed {seed} --max-ops {max_ops}"
+    if ops is not None:
+        replay += " --ops " + ",".join(ops)
     for i in range(total):
-        lines, writers = generate_program(rng, rng.randrange(1, max_ops + 1))
+        lines, writers = generate_program(rng, rng.randrange(1, max_ops + 1), ops=ops)
         if i < start:  # advance the original RNG stream, but skip both oracles
             continue
         name = f"ps_diff_{i:04d}"
@@ -280,7 +282,7 @@ def run_suite(programs, seed, max_ops, limit=None, *, start=0):
             counts["harness-error"] += 1
             if first_failure is None:
                 first_failure = (f"{name}: harness error {type(e).__name__}: {e}\n"
-                                 f"Replay: --seed {seed} --max-ops {max_ops} --program-index {i}")
+                                 f"Replay: {replay} --program-index {i}")
             continue
         if status == "match":
             counts["pass"] += 1
@@ -288,7 +290,7 @@ def run_suite(programs, seed, max_ops, limit=None, *, start=0):
             counts["mismatch"] += 1
             if first_failure is None:
                 first_failure = (f"{name} (seed {seed} program {i}): {detail}\n"
-                                 f"Replay: --seed {seed} --max-ops {max_ops} --program-index {i}\n" +
+                                 f"Replay: {replay} --program-index {i}\n" +
                                  "\n".join("\t" + line for line in lines))
         else:
             counts["skip"][detail] = counts["skip"].get(detail, 0) + 1
@@ -346,6 +348,7 @@ def main(argv=None):
                     help="maximum ops per generated program (default: 8)")
     ap.add_argument("--limit", type=_at_least_one, default=None,
                     help="run only the first N programs (N >= 1)")
+    ap.add_argument("--ops", help="comma-separated opcodes to generate (see --list-ops)")
     ap.add_argument("--list-ops", action="store_true", help="print the op table and exit")
     ap.add_argument("--self-test", action="store_true", help="run harness canaries and exit")
     a = ap.parse_args(argv)
@@ -355,15 +358,24 @@ def main(argv=None):
         return 0
     if a.self_test:
         return 0 if self_test() else 1
+    ops = None
+    if a.ops is not None:
+        ops = tuple(token.strip() for token in a.ops.split(","))
+        available = {name for name, _ in _op_templates()}
+        if not all(ops):
+            ap.error("--ops must be a comma-separated list of opcodes")
+        unknown = sorted(set(ops) - available)
+        if unknown:
+            ap.error("unknown --ops opcode(s): " + ", ".join(unknown))
     if a.program_index is None:
-        counts, first_failure = run_suite(a.programs or 200, a.seed, a.max_ops, a.limit)
+        counts, first_failure = run_suite(a.programs or 200, a.seed, a.max_ops, a.limit, ops=ops)
     else:
         if a.program_index < 0:
             ap.error("--program-index must be nonnegative")
         if a.limit is not None:
             ap.error("--program-index cannot be combined with --limit")
         print(f"replaying program {a.program_index} (seed {a.seed}, max ops {a.max_ops})")
-        counts, first_failure = run_suite(a.program_index + 1, a.seed, a.max_ops, start=a.program_index)
+        counts, first_failure = run_suite(a.program_index + 1, a.seed, a.max_ops, start=a.program_index, ops=ops)
     total_skips = sum(counts["skip"].values())
     total_run = counts["pass"] + counts["mismatch"] + total_skips + counts["harness-error"]
     print(f"{total_run} programs (seed {a.seed}): "

@@ -17,6 +17,7 @@
 #include "d3d12_depth24_compare.h"  // D24 clears compared with the host runtime
 #include "../src/vulkan_memory.h"  // D3D-96: resizable_bar
 
+#include <d3d12video.h>
 #include <dxgi1_4.h>
 
 #include <dxgi1_4.h>
@@ -4055,7 +4056,11 @@ int compare_invalid_arguments(ID3D12Device* ours) {
              return command_allocator(d, D3D12_COMMAND_LIST_TYPE(3));
          }},
         {"command allocator: type video encode", [](ID3D12Device* d) {
-             return command_allocator(d, D3D12_COMMAND_LIST_TYPE(6));
+             return command_allocator(d, D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE);
+         }, [](ID3D12Device* d) {
+             // A host without the D3D12 video interface, such as WARP on Windows 10, rejects video allocators.
+             Ref<ID3D12VideoDevice> video;
+             return d->QueryInterface(IID_PPV_ARGS(&video.p)) != E_NOINTERFACE;
          }},
         {"command allocator: type 7", [](ID3D12Device* d) { return command_allocator(d, D3D12_COMMAND_LIST_TYPE(7)); }},
         {"command allocator: type 99", [](ID3D12Device* d) {
@@ -5163,6 +5168,12 @@ int main() {
         EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))));
         EXPECT(options.ResourceBindingTier == D3D12_RESOURCE_BINDING_TIER_3);
         EXPECT(options.MaxGPUVirtualAddressBitsPerResource == 40);
+        // Console 0x40-byte (16-dword) D3D12_OPTIONS query (docs/d3d12_xs_surface.md §7.1): 0x3C PC prefix + zero tail.
+        UINT console_opts[16]{};
+        console_opts[15] = 0xdeadbeefu;
+        EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, console_opts, sizeof(console_opts))));
+        EXPECT(std::memcmp(console_opts, &options, sizeof(options)) == 0);
+        EXPECT(console_opts[15] == 0);
 
         D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT va_support{};
         EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT, &va_support, sizeof(va_support))));

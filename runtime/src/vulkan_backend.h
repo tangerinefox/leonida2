@@ -244,12 +244,16 @@ public:
 
     // Adds `count` pipeline-statistics results into one D3D12_QUERY_DATA_PIPELINE_STATISTICS at dst + offset: the
     // segments of a statistics query that was split around helper dispatches (D3D-162) or mesh draws (D3D-291).
-    // Segment i is in `mesh_queries` when mesh[i] is set (four counters: clipping, fragment and compute; see
-    // statistics_sum.comp), otherwise in `queries` (all eleven).
-    void sum_statistics(VkCommandBuffer cb, VkQueryPool queries, VkQueryPool mesh_queries, const std::uint8_t* mesh,
-                        std::uint32_t first, std::uint32_t count, VkBuffer dst, VkDeviceSize offset) const {
+    // Segment i is in `mesh_queries` when mesh[i] is set (two counters: fragment and compute; see
+    // statistics_sum.comp), otherwise in `queries` (all eleven). A mesh segment's clipping invocations come from
+    // `primitives_queries`, the mesh-primitives count of that segment (D3D-MESH-CLIPPING-COUNTER); it is null when
+    // the device has no meshShaderQueries, and the field then reads 0.
+    void sum_statistics(VkCommandBuffer cb, VkQueryPool queries, VkQueryPool mesh_queries,
+                        VkQueryPool primitives_queries, const std::uint8_t* mesh, std::uint32_t first,
+                        std::uint32_t count, VkBuffer dst, VkDeviceSize offset) const {
         constexpr VkDeviceSize result = statistics_counters * word_size;
-        constexpr VkDeviceSize mesh_slot = 5 * word_size;  // CInvocations, where the mesh pool's first counter goes
+        constexpr VkDeviceSize mesh_slot = 7 * word_size;  // PSInvocations, where the mesh pool's first counter goes
+        constexpr VkDeviceSize clipping_slot = 5 * word_size;  // CInvocations, where the mesh-primitives count goes
         begin_scratch_write(cb);
         vk_.vkCmdFillBuffer(cb, scratch_, 0, result, 0);
         bind(cb, statistics_pipeline_);
@@ -258,9 +262,18 @@ public:
             std::uint32_t chunk = 1;
             while (chunk < std::min(count, statistics_capacity) && bool(mesh && mesh[first + chunk]) == in_mesh)
                 ++chunk;
+            if (in_mesh) {
+                // The mesh pool holds only the fragment and compute counters, so the clipping field of a mesh
+                // segment reads 0 unless the mesh-primitives count fills it (D3D-MESH-CLIPPING-COUNTER).
+                vk_.vkCmdFillBuffer(cb, scratch_, result, chunk * result, 0);
+                barrier(cb, transfer, transfer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+            }
             vk_.vkCmdCopyQueryPoolResults(cb, in_mesh ? mesh_queries : queries, first, chunk, scratch_,
                                           result + (in_mesh ? mesh_slot : 0), result,
                                           VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+            if (in_mesh && primitives_queries)
+                vk_.vkCmdCopyQueryPoolResults(cb, primitives_queries, first, chunk, scratch_, result + clipping_slot,
+                                              result, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
             barrier(cb, transfer | compute, compute, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
                     shader_access);
             dispatch(cb, chunk, 1, in_mesh);
@@ -923,6 +936,10 @@ struct TileRange {
 #endif
 class VulkanContext {
 public:
+    // mesh_queries: VK_EXT_mesh_shader's meshShaderQueries feature is enabled on `device`, so a mesh segment's
+    // clipping invocations can come from a mesh-primitives query (D3D-MESH-CLIPPING-COUNTER). Set by the device
+    // that created the context.
+    bool mesh_queries = false;
     // conditional_rendering: VK_EXT_conditional_rendering is enabled on `device` (SetPredication).
     // ray_tracing: VK_KHR_acceleration_structure + VK_KHR_ray_query are enabled on `device`.
     // xdxr: acceleration-structure builds write XDXR BVH4 records (xdxr_build.h) instead; needs bufferDeviceAddress.
@@ -1000,7 +1017,7 @@ public:
         // binding's host pointer is null on DEFAULT and READBACK heaps, whose mapped bytes the GPU can write.
         replay_.host_at = [this](std::uint64_t va, std::uint64_t bytes, const std::uint8_t*& host) {
             BufferVaIndex<ResourceId>::Hit hit{};
-            if (!buffer_vas_.find(va, hit)) return HostReadStatus::absent;
+            if (!buffer_vas_.find(va, hit, bytes)) return HostReadStatus::absent;
             const ResourceBinding* b = resolve(hit.id);
             if (!b) return HostReadStatus::absent;
             if (!b->host) return HostReadStatus::not_cpu_written;
@@ -1483,12 +1500,23 @@ public:
     void note_bindless_upload() { bindless_upload_pending_ = true; }
 
     std::uint64_t completed_retire_ticket() {
-        std::lock_guard lock(submit_mutex_);
-        if (is_device_lost()) return 0;
-        return retire_tickets_.completed([this](VkSemaphore semaphore, std::uint64_t value) {
-            std::uint64_t done = 0;
-            return vk.vkGetSemaphoreCounterValue(device_, semaphore, &done) == VK_SUCCESS && done >= value;
-        });
+        bool lost = false;
+        std::uint64_t ticket = 0;
+        {
+            std::lock_guard lock(submit_mutex_);
+            if (is_device_lost()) return 0;
+            ticket = retire_tickets_.completed([this, &lost](VkSemaphore semaphore, std::uint64_t value) {
+                std::uint64_t done = 0;
+                const VkResult result = vk.vkGetSemaphoreCounterValue(device_, semaphore, &done);
+                if (result == VK_ERROR_DEVICE_LOST) lost = true;
+                return result == VK_SUCCESS && done >= value;
+            });
+        }
+        // Outside submit_mutex_, as in submit(): notifying the fence dispatcher can run callbacks that submit.
+        // A DEVICE_LOST seen here is the first Vulkan operation to discover it; it must not be mistaken for
+        // "this ticket has not completed".
+        if (lost) mark_device_lost();
+        return lost ? 0 : ticket;
     }
 
     void drain_deleted_resources(std::uint64_t current_ticket) {
@@ -2394,9 +2422,11 @@ private:
                 occlusion_resolve_->normalize(cb, pool, first, count, dst, offset);
             };
             replay.sum_statistics = [this](VkCommandBuffer cb, VkQueryPool pool, VkQueryPool mesh_pool,
-                                           const std::uint8_t* mesh, std::uint32_t first, std::uint32_t count,
-                                           VkBuffer dst, VkDeviceSize offset) {
-                occlusion_resolve_->sum_statistics(cb, pool, mesh_pool, mesh, first, count, dst, offset);
+                                           VkQueryPool primitives_pool, const std::uint8_t* mesh,
+                                           std::uint32_t first, std::uint32_t count, VkBuffer dst,
+                                           VkDeviceSize offset) {
+                occlusion_resolve_->sum_statistics(cb, pool, mesh_pool, primitives_pool, mesh, first, count, dst,
+                                                  offset);
             };
             replay.sum_binary_occlusion = [this](VkCommandBuffer cb, VkQueryPool pool, std::uint32_t first,
                                                  std::uint32_t count, VkBuffer dst, VkDeviceSize offset) {
@@ -2443,18 +2473,26 @@ private:
             if (std::find(statistics->mesh.begin(), statistics->mesh.end(), 1) == statistics->mesh.end()) {
                 statistics->mesh.clear();
             } else {
-                // The counters a mesh draw allows (VUID-vkCmdDrawMeshTasksEXT-pipelineStatistics-07076): clipping
-                // invocations and primitives, fragment and compute invocations (D3D-291).
+                // The counters a mesh draw allows (VUID-vkCmdDrawMeshTasksEXT-pipelineStatistics-07076): the
+                // fragment and compute invocations, and no other (D3D-291).
                 VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
                 info.queryType = VK_QUERY_TYPE_PIPELINE_STATISTICS;
                 info.queryCount = statistics_segments;
-                info.pipelineStatistics = VK_QUERY_PIPELINE_STATISTIC_CLIPPING_INVOCATIONS_BIT |
-                                          VK_QUERY_PIPELINE_STATISTIC_CLIPPING_PRIMITIVES_BIT |
-                                          VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT |
-                                          VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT;
+                info.pipelineStatistics = kMeshStatisticsFlags;
                 if (context_.vk.vkCreateQueryPool(statistics->device, &info, nullptr, &statistics->mesh_pool) !=
                     VK_SUCCESS)
                     return ReplayResult::unsupported;
+                // The mesh-primitives count of a mesh segment (D3D-MESH-CLIPPING-COUNTER): a query of its own type,
+                // which the pipeline-statistics pool cannot hold. The device needs the meshShaderQueries feature,
+                // or the clipping field of a mesh segment stays 0.
+                if (context_.mesh_queries) {
+                    VkQueryPoolCreateInfo primitives{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+                    primitives.queryType = VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT;
+                    primitives.queryCount = statistics_segments;
+                    if (context_.vk.vkCreateQueryPool(statistics->device, &primitives, nullptr,
+                                                      &statistics->primitives_pool) != VK_SUCCESS)
+                        return ReplayResult::unsupported;
+                }
             }
         }
         // QueryReplay::plan() reads QueryPool::ended / occlusion and QueryReplay::commit() writes them after
@@ -2514,6 +2552,18 @@ private:
         if (context_.vk.vkBeginCommandBuffer(command_buffer, &begin) != VK_SUCCESS) {
             discard();
             return ReplayResult::unsupported;
+        }
+        // D3D12 ends every ExecuteCommandLists with all its work done and its writes visible to the next one on the
+        // queue (implicit state decay relies on it), and a list may then touch the same memory without a barrier:
+        // two submissions copying into one buffer, say. Vulkan orders submissions on a queue only by what their
+        // barriers say, so this one starts with a full memory barrier against everything submitted before it
+        // (synchronization validation: WRITE_AFTER_WRITE between vk_queue_test's back-to-back copies).
+        if (context_.vk.vkCmdPipelineBarrier) {  // a mocked context may leave it out
+            VkMemoryBarrier full{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            full.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+            full.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+            context_.vk.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &full, 0, nullptr, 0, nullptr);
         }
         if (!tracker_lock.owns_lock()) tracker_lock.lock();
         if (!transfer_only && context_.bindless_prepare_ && !context_.bindless_prepare_(command_buffer)) {

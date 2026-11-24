@@ -32,6 +32,8 @@ def gs_spvasm(locations, bary_location, clip_count: int = 0, cull_count: int = 0
     """SPIR-V assembly for a triangle pass-through GS: Position and the vec4 inputs at `locations`, copied per vertex,
     plus the one-hot barycentric vec3 at `bary_location`."""
     locations = sorted(set(int(n) for n in locations))
+    if type(bary_location) is not int or bary_location < 0:
+        raise ValueError(f"bary location must be a non-negative integer, got {bary_location!r}")
     if bary_location in locations:
         raise ValueError(f"bary location {bary_location} collides with a pass-through location")
     ins = [f"%in{n}" for n in locations]

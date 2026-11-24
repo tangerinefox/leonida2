@@ -232,6 +232,37 @@ class Refusals(unittest.TestCase):
         doc["tree"]["attributes"][0]["descriptor"] = 40
         self.assertEqual(self.reason(doc=doc), "descriptor")
 
+    def test_non_string_descriptor_names_are_refused(self):
+        blob = Stream().open("root").close().bytes()
+        for value in (17, None, {}, [], True):
+            for fields in (("tree",), ("table",), ("tree", "table")):
+                with self.subTest(value=value, fields=fields):
+                    doc = rbf0_tree.parse_resource(blob)
+                    if "tree" in fields:
+                        doc["tree"]["name"] = value
+                    if "table" in fields:
+                        doc["descriptors"][0]["name"] = value
+                    with self.assertRaisesRegex(rbf0_encode.EncodeError, "value: descriptor 0 name must be a string"):
+                        rbf0_encode.encode(doc)
+
+    def test_missing_descriptor_table_name_uses_record_name(self):
+        blob = Stream().open("root").close().bytes()
+        doc = rbf0_tree.parse_resource(blob)
+        del doc["descriptors"][0]["name"]
+        self.assertEqual(rbf0_encode.encode(doc), blob)
+
+    def test_table_only_surrogate_name_is_refused(self):
+        doc = rbf0_tree.parse_resource(Stream().open("root").close().bytes())
+        doc["descriptors"][0]["name"] = "\ud800"
+        self.assertEqual(self.reason(doc=doc), "utf8")
+
+    def test_non_string_name_on_reused_descriptor_is_refused(self):
+        blob = Stream().open("root").int("id", 1).int("id", 2).close().bytes()
+        doc = rbf0_tree.parse_resource(blob)
+        doc["tree"]["content"][1]["name"] = None
+        with self.assertRaisesRegex(rbf0_encode.EncodeError, "value: descriptor 1 name must be a string"):
+            rbf0_encode.encode(doc)
+
     def test_reused_descriptor_with_conflicting_name_is_refused(self):
         blob = Stream().open("r").int("x", 1).int("x", 2).close().bytes()
         doc = rbf0_tree.parse_resource(blob)
@@ -355,6 +386,23 @@ class Cli(unittest.TestCase):
             self.assertEqual(f.read(), every_record(True))
         with self.assertRaises(SystemExit):                            # never into a non-empty directory
             self.run_main(report, out_dir)
+
+    def test_encode_report_refuses_non_string_names_and_writes_next_resource(self):
+        blob = Stream().open("root").close().bytes()
+        damaged = rbf0_tree.parse_resource(blob, offset=0x100)
+        damaged["tree"]["name"] = damaged["descriptors"][0]["name"] = 17
+        good = rbf0_tree.parse_resource(blob, offset=0x200)
+        report = os.path.join(self.tmp.name, "name-types.json")
+        with open(report, "w", encoding="utf-8", newline="\n") as f:
+            json.dump({"tool": "rbf0_tree", "resources": [damaged, good]}, f)
+        out_dir = os.path.join(self.tmp.name, "out")
+        code, out = self.run_main(report, out_dir)
+        self.assertEqual(code, 1, out)
+        self.assertIn("1 resource(s) written, 1 refused", out)
+        self.assertIn("0x100: value: descriptor 0 name must be a string", out)
+        self.assertEqual(os.listdir(out_dir), ["00000200.rbf"])
+        with open(os.path.join(out_dir, "00000200.rbf"), "rb") as f:
+            self.assertEqual(f.read(), blob)
 
     def test_cli_refuses_surrogates_and_continues_with_valid_resources(self):
         good = every_record(True)

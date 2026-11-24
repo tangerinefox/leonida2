@@ -122,15 +122,19 @@ def test_json_report_refuses_to_overwrite_index(tmp_path, capsys, output_kind):
 
     # same_report_path resolves each path once and calls the private helpers since #6268, so a case-folded volume is
     # simulated by patching those: the public path_key / same_name_on_folding_volume are no longer on its path.
+    # realpath is patched too: on Windows it returns an existing file's name as stored, so INDEX.JSON would resolve to
+    # index.json and match before the probe is asked (as in tests/test_wave64_graphics_scan.py).
     probe = mock.Mock(return_value=True)
+    folding = output_kind == "folding-volume-case"
     ctx = (mock.patch.multiple(report_paths, _resolved_key=mock.Mock(side_effect=str),
                                _same_resolved_name=probe)
-           if output_kind == "folding-volume-case" else contextlib.nullcontext())
+           if folding else contextlib.nullcontext())
     with ctx, (mock.patch.object(os.path, "samefile", side_effect=OSError("not same"))
-               if output_kind == "folding-volume-case" else contextlib.nullcontext()):
+               if folding else contextlib.nullcontext()),             (mock.patch.object(report_paths.os.path, "realpath", side_effect=os.path.abspath)
+             if folding else contextlib.nullcontext()):
         with pytest.raises(SystemExit) as exc:
             usc.main([str(index), "--json", str(output)])
-    if output_kind == "folding-volume-case":
+    if folding:
         probe.assert_called_once()
 
     assert exc.value.code == 2

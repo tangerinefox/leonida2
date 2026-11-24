@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -285,6 +286,26 @@ int main() {
             scratch.forget(sem_b);
             EXPECT(vk.live_buffers.find(reinterpret_cast<std::uintptr_t>(big_buf)) == vk.live_buffers.end());
             EXPECT(vk.live_buffers.size() == 5);
+        }
+        EXPECT(vk.live_buffers.empty() && vk.live_memory.empty());
+    }
+
+    // A chunk whose used byte count is within 255 bytes of UINT64_MAX must not wrap alignment back to offset 0.
+    {
+        FakeVulkan vk;
+        g_vk = &vk;
+        {
+            ScratchBuffers scratch(fake_get_device_proc, k_device, fake_allocate);
+            VkBuffer buf1 = VK_NULL_HANDLE, buf2 = VK_NULL_HANDLE;
+            VkDeviceSize off1 = 1, off2 = 1;
+            const std::uint64_t near_max = std::numeric_limits<std::uint64_t>::max() - 100u;
+            EXPECT(scratch.get(near_max, buf1, off1));
+            EXPECT(buf1 != VK_NULL_HANDLE && off1 == 0 && vk.create_buffer_calls == 1);
+
+            EXPECT(scratch.get(16, buf2, off2));
+            EXPECT(buf2 != VK_NULL_HANDLE && buf2 != buf1 && off2 == 0);
+            EXPECT(vk.create_buffer_calls == 2 && vk.allocate_calls == 2);
+            EXPECT(vk.live_buffers.size() == 2 && vk.live_memory.size() == 2);
         }
         EXPECT(vk.live_buffers.empty() && vk.live_memory.empty());
     }

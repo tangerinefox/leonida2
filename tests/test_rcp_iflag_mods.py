@@ -74,6 +74,9 @@ class RcpIflagModsTest(unittest.TestCase):
             self.assertNotRegex(spv, r"\bOpFMul %float\b")
 
         if clamp:
+            # DX10_CLAMP: a NaN is replaced by +0 before FClamp (Gen.clamp_mods).
+            nan = match_result(rf"OpIsNan %bool {value}")
+            value = match_result(rf"OpSelect %float {nan} %f0 {value}")
             value = match_result(rf"OpExtInst %float %glsl FClamp {value} %f0 %f1")
         else:
             self.assertNotIn("FClamp", spv)

@@ -248,9 +248,11 @@ def ieee_control_cases(ops: list[str]) -> list[ControlCase]:
 
 
 def build_jobs(ops: list[str], waves: list[int]):
-    """Build (kernels, metadata) pairs for oracle.run()."""
+    """Build (kernels, metadata) pairs for oracle.run() in first-seen selection order."""
     from hw_oracle import asm
 
+    ops = list(dict.fromkeys(ops))
+    waves = list(dict.fromkeys(waves))
     kernels, meta = [], []
     src_cases = tuple(c for c in SRC_MOD_CASES if c.op in ops)
     flush_cases = tuple(c for c in FLUSH_CONTROL_CASES if c.op in ops)
@@ -278,18 +280,30 @@ def build_jobs(ops: list[str], waves: list[int]):
 
 def evaluate_results(ops: list[str], waves: list[int], meta, raw_results) -> dict:
     """Compare hardware outputs against expected RDNA2 semantics and check wave and omod parity."""
+    ops = list(dict.fromkeys(ops))
+    waves = list(dict.fromkeys(waves))
     grid_words: dict[tuple[int, str, str], list[int]] = {}
     src_words: dict[int, list[int]] = {}
     flush_words: dict[int, list[int]] = {}
     ieee_words: dict[int, list[int]] = {}
     harness_errors: list[dict] = []
+    incomplete_result = False
+    seen_jobs: set[tuple[str, int] | tuple[str, int, str, str]] = set()
 
     for (kind, wave, op, mod, items), res in zip(meta, raw_results):
+        # Each non-grid job covers all selected ops for one wave.
+        job = (kind, wave, op, mod) if kind == "grid" else (kind, wave)
+        if job in seen_jobs:
+            harness_errors.append({"kind": kind, "wave": wave, "op": op, "mod": mod, "error": "duplicate job result"})
+            continue
+        seen_jobs.add(job)
         want_words = len(items)
         if isinstance(res, str):
+            incomplete_result = True
             harness_errors.append({"kind": kind, "wave": wave, "op": op, "mod": mod, "error": res})
             continue
         if len(res) != want_words:
+            incomplete_result = True
             harness_errors.append({
                 "kind": kind,
                 "wave": wave,
@@ -308,7 +322,7 @@ def evaluate_results(ops: list[str], waves: list[int], meta, raw_results) -> dic
         elif kind == "ieee_ctrl":
             ieee_words[wave] = words
 
-    if harness_errors:
+    if incomplete_result:
         return {
             "total_words": 0,
             "grid_words": 0,
@@ -445,7 +459,7 @@ def evaluate_results(ops: list[str], waves: list[int], meta, raw_results) -> dic
         "mismatches": mismatches,
         "wave_diffs": wave_diffs,
         "omod_diffs": omod_diffs,
-        "harness_errors": [],
+        "harness_errors": harness_errors,
         "first_mismatches": first_mismatches,
         "first_wave_diffs": first_wave_diffs,
         "first_omod_diffs": first_omod_diffs,
@@ -538,7 +552,8 @@ def main(argv=None) -> int:
     bad_waves = [w for w in wave_tokens if w not in ("32", "64")]
     if bad_ops or bad_waves or not ops or not wave_tokens:
         ap.error("unknown or empty: " + ", ".join(bad_ops + bad_waves or ["--ops/--waves"]))
-    waves = [int(w) for w in wave_tokens]
+    ops = list(dict.fromkeys(ops))
+    waves = list(dict.fromkeys(int(w) for w in wave_tokens))
     if a.json and os.path.isdir(a.json):
         ap.error(f"--json {a.json} is a folder, not a file")
 

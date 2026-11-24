@@ -14,11 +14,13 @@ ds_read_u16_d16 / ds_read_u16_d16_hi.
 
 The input is the GPU test runtime/test/shaders/cs_w32_lds_u8_d16.asm (fixture from regen_fixtures.py): it stores
 LDS dword 0 = 0x7F80FF01, presets every destination to 0xBEEF1234 and reads single bytes with a non-zero offset
-or base. It is translated for wave32 and run as one invocation (lane 0); the eight words it stores are compared
-with values derived here from the ISA text above (the same values check.py / run_gpu_tests.py expect).
+or base. It is translated for wave32 and run as the full 32-invocation workgroup; only lane 0 accesses LDS and
+stores output. The eight words are compared with values derived here from the ISA text above (the same values
+check.py / run_gpu_tests.py expect).
 """
 import struct
 import unittest
+from unittest import mock
 
 import support
 import spirv_mini_interp as si
@@ -61,7 +63,7 @@ EXPECTED = [
 def run():
     spv = support.translate_fixture("cs_w32_lds_u8_d16", fssm=FSSM)
     memory = si.run_workgroup(
-        spv, 1, 32,
+        spv, 32, 32,
         inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
         push_constants=VSHARP + [0] * 28, memory={})
     stray = sorted(a for a in memory if not 0 <= a < 32 or a % 4)
@@ -80,6 +82,32 @@ class LdsReadU8I8D16(unittest.TestCase):
         for k, (g, w) in enumerate(zip(got, EXPECTED)):
             with self.subTest(word=k):
                 self.assertEqual(g, w, f"out[{k}] = {g if g is None else hex(g)}, want {hex(w)}")
+
+    def test_only_one_lds_store_in_full_workgroup(self):
+        # The interpreter deliberately serializes racing LDS stores, so correct output alone cannot catch
+        # multiple lanes writing the same value. Observe writes to its shared Workgroup array instead.
+        writes = []
+
+        class TrackedWords(list):
+            def __setitem__(self, index, value):
+                writes.append((index, value))
+                super().__setitem__(index, value)
+
+        class TrackedWorkgroup(dict):
+            def __setitem__(self, name, box):
+                box[0] = TrackedWords(box[0])
+                super().__setitem__(name, box)
+
+        workgroup = TrackedWorkgroup()
+        invocation = si._invocation
+
+        def tracked_invocation(*args, **kwargs):
+            kwargs["workgroup"] = workgroup
+            return invocation(*args, **kwargs)
+
+        with mock.patch.object(si, "_invocation", side_effect=tracked_invocation):
+            self.assertEqual(run(), EXPECTED)
+        self.assertEqual(writes, [(0, 0x7F80FF01)])
 
 
 if __name__ == "__main__":

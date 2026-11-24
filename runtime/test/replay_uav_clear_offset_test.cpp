@@ -173,6 +173,18 @@ int main() {
     range.buffer_offset = UINT64_MAX - 2;
     expect(run({1, true, VK_FORMAT_R8_UINT, 1, 2, 1, 0, 0, 1}) == ReplayResult::invalid_clear && writes.empty(),
            "backing range overflow is rejected before scratch allocation or emission");
+    // Misaligned backing buffer_offset must be rejected for multi-byte elements (e.g., e > 4 violates
+    // VUID-vkCmdUpdateBuffer-dstOffset-00032; e == 2/4 would byte-swap/rotate elements in vkCmdFillBuffer).
+    range.buffer_offset = at + 2;
+    expect(run({1, true, VK_FORMAT_R32G32B32A32_UINT, 0, 32, 16, 0, 0, 1}) == ReplayResult::unsupported && writes.empty(),
+           "misaligned backing buffer_offset for 16-byte element clear is rejected before vkCmdUpdateBuffer");
+    expect(run({1, true, VK_FORMAT_R32_UINT, 0, 16, 4, 0, 0, 1}) == ReplayResult::unsupported && writes.empty(),
+           "misaligned backing buffer_offset for 4-byte element clear is rejected before vkCmdFillBuffer");
+    range.buffer_offset = at + 1;
+    expect(run({1, true, VK_FORMAT_R16_UINT, 0, 16, 2, 0, 0, 1}) == ReplayResult::unsupported && writes.empty(),
+           "odd backing buffer_offset for 2-byte element clear is rejected before vkCmdFillBuffer");
+    expect(run({1, true, VK_FORMAT_R8_UINT, 0, 16, 1, 0, 0, 1}) == ReplayResult::success,
+           "odd backing buffer_offset for 1-byte R8 element clear still replays");
     range.buffer_offset = at;
     vk.copy_scratch = {};
 

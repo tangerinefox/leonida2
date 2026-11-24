@@ -896,6 +896,58 @@ class TestVerifyCache(unittest.TestCase):
         with open(self.cache, encoding="utf-8") as f:
             return {os.path.basename(k) for k in json.load(f)["files"]}
 
+    def assert_manifest_cache_refused(self) -> None:
+        with open(self.manifest, "rb") as f:
+            before = f.read()
+        with patch.object(mv, "sha256_file", wraps=mv.sha256_file) as hashing:
+            with self.assertRaisesRegex(mv.ManifestError, "cache must not overwrite the manifest"):
+                self.verify()
+            hashing.assert_not_called()
+        with open(self.manifest, "rb") as f:
+            self.assertEqual(f.read(), before)
+        with open(self.cache, "rb") as f:
+            self.assertEqual(f.read(), before)
+        self.assertFalse(os.path.exists(self.cache + ".tmp"))
+
+    def test_cache_refuses_another_spelling_of_manifest(self) -> None:
+        self.cache = os.path.join(self.game, "..", "manifest.json")
+        self.assert_manifest_cache_refused()
+
+    def test_cache_refuses_manifest_hard_link(self) -> None:
+        try:
+            os.link(self.manifest, self.cache)
+        except OSError as err:
+            self.skipTest(f"hard links unavailable: {err}")
+        self.assert_manifest_cache_refused()
+
+    def test_cache_refuses_manifest_symlink(self) -> None:
+        try:
+            os.symlink(self.manifest, self.cache)
+        except OSError as err:
+            self.skipTest(f"symlinks unavailable: {err}")
+        self.assert_manifest_cache_refused()
+
+    def test_cache_refuses_manifest_case_alias_on_folding_volume(self) -> None:
+        self.cache = os.path.join(self.tmp.name, "MANIFEST.JSON")
+        if not os.path.exists(self.cache):
+            self.skipTest("volume is case-sensitive")
+        self.assert_manifest_cache_refused()
+
+    def test_cli_cache_equal_to_manifest_preserves_input(self) -> None:
+        with open(self.manifest, "rb") as f:
+            before = f.read()
+        result = subprocess.run(
+            [sys.executable, "-I", TOOL, self.game, "--manifest", self.manifest,
+             "--cache", self.manifest, "--json"],
+            capture_output=True, text=True, timeout=15,
+        )
+        with open(self.manifest, "rb") as f:
+            self.assertEqual(f.read(), before)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("cache must not overwrite the manifest", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(result.stdout, "")
+
     def test_second_run_hashes_nothing(self) -> None:
         for jobs in (1, 4):
             with self.subTest(jobs=jobs):
@@ -953,6 +1005,61 @@ class TestVerifyCache(unittest.TestCase):
                     f.write(text)
                 report = self.verify()
                 self.assertEqual((report.passed, report.cached), (True, 0))
+
+    def assert_input_cache_refused(self) -> None:
+        with patch.object(mv, "sha256_file", wraps=mv.sha256_file) as hashing:
+            with self.assertRaisesRegex(mv.ManifestError, "cache must not overwrite a listed input"):
+                self.verify()
+            hashing.assert_not_called()
+        for rel, data in self.data.items():
+            with open(os.path.join(self.game, rel), "rb") as f:
+                self.assertEqual(f.read(), data)
+
+    def test_cache_refuses_normalized_input_path(self) -> None:
+        self.cache = os.path.join(self.game, "..", "game", "a.bin")
+        self.assert_input_cache_refused()
+
+    def test_cache_refuses_input_case_alias_on_folding_volume(self) -> None:
+        self.cache = os.path.join(self.game, "A.BIN")
+        if not os.path.exists(self.cache):
+            self.skipTest("volume is case-sensitive")
+        self.assert_input_cache_refused()
+
+    def test_cache_refuses_input_hard_link(self) -> None:
+        try:
+            os.link(os.path.join(self.game, "a.bin"), self.cache)
+        except OSError as err:
+            self.skipTest(f"hard links unavailable: {err}")
+        self.assert_input_cache_refused()
+
+    def test_cache_refuses_input_symlink(self) -> None:
+        try:
+            os.symlink(os.path.join(self.game, "a.bin"), self.cache)
+        except OSError as err:
+            self.skipTest(f"symlinks unavailable: {err}")
+        self.assert_input_cache_refused()
+
+    def test_cache_does_not_create_a_missing_listed_input(self) -> None:
+        self.cache = os.path.join(self.game, "a.bin")
+        os.unlink(self.cache)
+        with self.assertRaisesRegex(mv.ManifestError, "cache must not overwrite a listed input"):
+            self.verify()
+        self.assertFalse(os.path.exists(self.cache))
+
+    def test_cli_cache_equal_to_input_preserves_data(self) -> None:
+        self.cache = os.path.join(self.game, "a.bin")
+        result = subprocess.run(
+            [sys.executable, "-I", TOOL, self.game, "--manifest", self.manifest,
+             "--cache", self.cache, "--json"],
+            capture_output=True, text=True, timeout=15,
+        )
+        for rel, data in self.data.items():
+            with open(os.path.join(self.game, rel), "rb") as f:
+                self.assertEqual(f.read(), data)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("cache must not overwrite a listed input", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(result.stdout, "")
 
     def test_cache_inside_target_and_strict(self) -> None:
         self.cache = os.path.join(self.game, "cache.json")

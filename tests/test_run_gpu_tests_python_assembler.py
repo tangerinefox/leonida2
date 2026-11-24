@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import struct
+import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -40,6 +41,44 @@ class PythonAssemblerTests(unittest.TestCase):
                 data = out.read_bytes()
                 self.assertGreaterEqual(len(data), 20)
                 self.assertEqual(struct.unpack("<I", data[:4])[0], 0x07230203)
+
+    def test_spirv_as_missing_on_path_is_a_readable_runtime_error(self) -> None:
+        # An empty PATH: spirv-as cannot be found, and the caller must get the RuntimeError it handles for a failed
+        # assembly, not a raw FileNotFoundError traceback (RUN-GPU-SPIRVAS-MISSING).
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"PATH": ""}):
+            with self.assertRaises(RuntimeError) as ctx:
+                run_gpu_tests.spirv_as("OpCapability Shader\n", str(Path(tmp) / "out.spv"), assembler="spirv-as")
+        self.assertIn("spirv-as not found on PATH", str(ctx.exception))
+        self.assertNotIsInstance(ctx.exception, FileNotFoundError)
+        self.assertIsNone(ctx.exception.__cause__)
+        self.assertTrue(ctx.exception.__suppress_context__)
+
+    def test_spirv_as_other_oserror_is_a_readable_runtime_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(run_gpu_tests.subprocess, "run",
+                          side_effect=PermissionError(13, "Permission denied")):
+            with self.assertRaises(RuntimeError) as ctx:
+                run_gpu_tests.spirv_as("", str(Path(tmp) / "out.spv"), assembler="spirv-as")
+        self.assertIn("spirv-as could not be started: Permission denied", str(ctx.exception))
+
+    def test_spirv_as_present_and_succeeding_runs_spirv_as(self) -> None:
+        # Stubbed success: spirv-as is invoked with the same arguments and a zero exit code is not an error.
+        done = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(run_gpu_tests.subprocess, "run", return_value=done) as run:
+            run_gpu_tests.spirv_as("asm", str(Path(tmp) / "out.spv"), assembler="spirv-as")
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[0],
+                         ["spirv-as", "--target-env", "vulkan1.2", "-o", str(Path(tmp) / "out.spv"), "-"])
+        self.assertEqual(run.call_args.kwargs["input"], "asm")
+
+    def test_spirv_as_nonzero_exit_reports_stderr(self) -> None:
+        bad = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="error: bad opcode")
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(run_gpu_tests.subprocess, "run", return_value=bad):
+            with self.assertRaises(RuntimeError) as ctx:
+                run_gpu_tests.spirv_as("", str(Path(tmp) / "out.spv"), assembler="spirv-as")
+        self.assertIn("error: bad opcode", str(ctx.exception))
 
     def test_rdna2spirv_assemble_spirv_no_validate_skips_spirv_val(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -49,10 +49,17 @@ def pack_layout(sig, stage=None):
     """
     if stage is not None and stage not in STAGE_BASE:
         return [], f"no console base for stage {stage!r}"
+    if not isinstance(sig, dict):
+        return [], "root signature must be a JSON object"
+    raw_params = sig.get("params", [])
+    if not isinstance(raw_params, list):
+        return [], "'params' must be a list"
+    if any(not isinstance(p, dict) for p in raw_params):
+        return [], "each root parameter must be a JSON object"
     base = STAGE_BASE[stage] if stage is not None else 0
     dwords = [{"param": None, "sub": 0, "ptype": "driver"} for _ in range(base)]
     cost = 0
-    params = [dict(p) for p in sig.get("params", [])]  # normalized copy; input untouched
+    params = [dict(p) for p in raw_params]  # normalized copy; input untouched
     if len(params) > 64:
         return [], "more than 64 root parameters"
     for index, p in enumerate(params):
@@ -150,7 +157,7 @@ def reconcile(shader_reads, dwords):
                     f"{slot['param']} ({slot['ptype']})")
             elif kind in ("ptr32_lo", "ptr64_lo") and slot["sub"] != 0:
                 issues.append(f"s{sgpr} ({kind}) reads the high half of the address")
-            if kind == "ptr64_hi":
+            elif kind == "ptr64_hi":
                 lo = dwords[sgpr - 1] if sgpr > 0 else None
                 if slot["sub"] != 1 or lo is None or lo["param"] != slot["param"] \
                         or lo["sub"] != 0:
@@ -176,12 +183,12 @@ def _load_json(path):
     try:
         with open(path, encoding="utf-8") as f:
             return json.load(f)
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, RecursionError) as e:
         reason = getattr(e, "strerror", None) or e
         raise ValueError(f"cannot read {path}: {reason}") from None
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description="Root-signature vs shader-reads reconciler.")
     ap.add_argument("index", nargs="?", help="spirv/index.json")
     ap.add_argument("--rootsig", default=None, help="hand-written root-signature JSON")
@@ -190,7 +197,7 @@ def main():
     ap.add_argument("--model", choices=("s0", "console"), default="s0",
                     help="s0: rt::rootsig::pack (default); console: rt::rootsig::pack_stage with each shader's "
                          "own stage base, one dword per table (D3D-448)")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     if a.example:
         print(json.dumps({"version": "1.1", "flags": 0, "params": [
             {"type": "constants", "count": 4, "visibility": "all"},

@@ -358,6 +358,8 @@ class ManifestTest(unittest.TestCase):
     def test_read_only_manifest_is_refused_without_staging_a_file(self):
         # The writer opens the destination for writing first, to keep the direct writer's permission check. A
         # read-only manifest raises there, before anything is staged, so the directory stays as it was.
+        if os.name != "nt" and os.geteuid() == 0:
+            self.skipTest("root bypasses read-only file mode")
         out = os.path.join(self.tmp.name, "manifest.json")
         previous = '{"previous": true}\n'
         with open(out, "w", encoding="utf-8") as f:

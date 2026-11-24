@@ -10,11 +10,14 @@ method, scope and caveats. No game data is included.
 |---|---|
 | [design.md](design.md) | Overall project design, asset status, translator contract and open blockers. |
 | [related_projects.md](related_projects.md) | Prior art we may read and the licence boundaries on it. |
+| [boot_leads.md](boot_leads.md) | Open leads that may move the retail boot further (TLS at module index 0, feature level at device creation, command-list replay, descriptor words, shader corpus count, frame pacing), each with where it lands, how to implement it and how to test it. Hypotheses, not measurements. |
 | [rpf.md](rpf.md) | RPF9 archive layout, the carve tools and the unreadable encrypted TOC. |
 | [linux.md](linux.md) | Linux in one page: what runs natively and what runs under Wine or Proton, the Ubuntu packages, `Build.sh`, the runtime cross-build, and why there is no native Linux `gta6rt`. |
 | [testing.md](testing.md) | Running the GPU tests on your own GPU: setup per OS, wave64 emulation, running without a GPU on Mesa llvmpipe, and known problems. |
+| [gpu_test_results.md](gpu_test_results.md) | Published GPU test results by hardware, driver and commit, with pass, skip and failure counts. |
 | [modding.md](modding.md) | The mod format: `mods/<folder>/mod.json`, checked and loaded in name order by `gta6rt`; a swap takes effect once the game's archetype lookup is hooked (needs the executable, RT-5). A mod names game models and holds no game data. |
 | [progress_dashboard.md](progress_dashboard.md) | A local page of what works, what changed since it last passed and what blocks next: unit and runtime tests, the translator contract by confirmation method, measured imports, corpus counts and, with `--github`, CI and the D3D- items (`tools/progress_dashboard.py`). |
+| [dev-tools.md](dev-tools.md) | The development CLI `scripts/dev.py`: `discover` (text or `--json`, schema version 1) lists the boot-trace analyzer and the guest-scene runner with their help commands and prerequisites, without running them; live attach, pause, step and screenshots are not available through it. |
 
 ## Archives and assets
 
@@ -78,6 +81,7 @@ method, scope and caveats. No game data is included.
 | [runtime_imports.md](runtime_imports.md) | The 16 shipped modules' measured imports and shim/host/unimplemented split. |
 | [xmem_exe_calls.md](xmem_exe_calls.md) | How the retail executable calls `xmem.dll`: call sites and constant arguments per import (`tools/import_call_sites.py`), the 23 `XMemVirtualAlloc` calls that all pass an attribute word, and the inferred shape of the physical-page family. |
 | [audio_hal_exe_calls.md](audio_hal_exe_calls.md) | How the retail executable calls the 22 audio coprocessor, texture layout and DirectStorage imports that have no shim: call sites, constant arguments, and the four calls with a negative-result branch. |
+| [directstorage.md](directstorage.md) | Console DirectStorage: the DLL and ABI the title is expected to use (`DStorageGetFactory`, `dstorage_xs`, `XCRDAPI`), how sure that is and the evidence for it, and what `runtime/shims/dstorage.cpp` serves on the PC. The executable's own imports are unmeasured. |
 | [xcl_compare.md](xcl_compare.md) | XCL's synthetic test title under `gta6rt --run` and under XCL (`tools/xcl_compare.py`): 5 of 50 checks pass here, both hangs are the documented manual-queue terminate deadlock, and each other difference mapped to an open item or a lead. |
 | [gameinput.md](gameinput.md) | The GameInput shim on SDL3: `GameInputCreate` and the v0 `IGameInput`/`IGameInputDevice`/`IGameInputReading`/`IGameInputDispatcher` surface on any SDL gamepad, DualSense adaptive-trigger approximation and lightbar, force-feedback motors and trigger haptics through SDL's haptic API; 261 checks on virtual joysticks and a fake haptic backend; by hand on an Xbox Series X pad (Bluetooth) and a DualSense (USB). 261 checks on virtual joysticks and a fake haptic backend, not yet tried on a real pad. |
 | [saves.md](saves.md) | Save containers: `JSAV` (index + JSON story save, byte-exact rebuild), `ASAV` header, `SLAYER1` packed copy (not decoded); `tools/saves.py` and import into the offline `XGameSave` folder; key hashes are case-sensitive joaat (`tools/save_keys.py`). |
@@ -85,6 +89,7 @@ method, scope and caveats. No game data is included.
 | [multi_gpu_validation.md](multi_gpu_validation.md) | Running disjoint shards on eight identical RDNA1/RADV GPUs: PCI-BDF pinning, base controls, per-card logs, the V540 farm's aggregate results and its known driver limitations. |
 | [shader_validation.md](shader_validation.md) | Differential CPU/GPU validation design and the current CPU interpreter prototype. |
 | [isa_coverage.md](isa_coverage.md) | RDNA2 ISA coverage of the translator against AMD's machine-readable XML: which of its 1,153 instructions have a rule, and which matched names are not RDNA2. |
+| [cpu_features.md](cpu_features.md) | CPU instructions in `game_scarlett_master.exe` that a host lacking the feature or privilege level faults on (SSE4a, CLZERO, MONITORX and others): counts per feature and how many sites lie inside `.pdata` function ranges, measured with `tools/cpu_feature_scan.py` on 1.0.2.1. Counts only. |
 | [buffer_bounds.md](buffer_bounds.md) | V# `OOB_SELECT` bounds measured natively: RDNA2 (gfx1036) follows Mesa's GFX11 column (729/732 cases), not GFX10; raw mode also counts `soffset`. |
 | [buffer_formats.md](buffer_formats.md) | Every GFX10 buffer data format a V# or MTBUF can name, loaded and stored, measured on a Radeon 880M (RDNA3.5, not RDNA2): 1.33 million validated elements, 0 mismatches; SCALED stores convert as NORM, float stores round toward zero. |
 | [fssm_crosscheck.md](fssm_crosscheck.md) | FSSM/RDNA2 facts cross-checked against SCARAB; code starts at `code_off + 0x28`. |

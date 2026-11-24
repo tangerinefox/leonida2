@@ -134,6 +134,25 @@ def ieee_nan(r, *operands):
     return r
 
 
+def rsqrt_f64(x):
+    """1 / sqrt(x) for a finite binary64 x > 0, rounded once to nearest even (the result is always normal).
+
+    1.0 / math.sqrt(x) rounds the root and then the quotient, which can miss by one ulp. Here n = floor(r * 2^p),
+    with p chosen so n has about 64 bits, comes from an integer square root of the exact rational 4^p / x; the
+    remainder decides the rounding of n down to 53 bits."""
+    f = Fraction(x)
+    p = 64 - math.frexp(1.0 / math.sqrt(x))[1]
+    scaled = Fraction(4) ** p / f                    # (r * 2^p)^2, exactly
+    n = math.isqrt(scaled.numerator // scaled.denominator)
+    inexact = n * n != scaled
+    shift = n.bit_length() - 53
+    q, rem = divmod(n, 1 << shift)
+    half = 1 << (shift - 1)
+    if rem > half or (rem == half and (inexact or q & 1)):
+        q += 1
+    return math.ldexp(q, shift - p)
+
+
 class _F32(float):
     """A binary32 value that came from a bit pattern (OpBitcast) and still carries that exact pattern.
 
@@ -1088,9 +1107,15 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
         elif op in ("OpFAdd", "OpFSub", "OpFMul", "OpFDiv"):
             x, y = val(a[1]), val(a[2])
             if types.t[a[0]] == ("float", 64):
-                if op != "OpFMul":
-                    raise UnsupportedConstruct(f"{op} on binary64")
-                values[res] = x * y
+                # Python floats are binary64 with round to nearest even: the result needs no rounding of its own.
+                if op == "OpFMul":
+                    values[res] = x * y
+                elif op == "OpFDiv" and y == 0.0:
+                    raise UnsupportedConstruct("OpFDiv by zero (undefined in SPIR-V)")   # as for binary32
+                else:
+                    r = x + y if op == "OpFAdd" else x - y if op == "OpFSub" else (
+                        math.nan if math.isinf(x) and math.isinf(y) else x / y)
+                    values[res] = ieee_nan(r, x, y)
                 continue
 
             def _fdiv(p, q):
@@ -1260,6 +1285,10 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
                     values[res] = {"Log2": math.inf, "Sqrt": math.inf, "InverseSqrt": 0.0}[name]
                 elif name == "Log2":
                     values[res] = f32(math.log2(x))
+                elif types.t[a[0]] == ("float", 64):
+                    # A double result stays binary64: math.sqrt is correctly rounded, and 1.0 / math.sqrt(x)
+                    # would round twice, so the inverse root is rounded once from the exact value.
+                    values[res] = math.sqrt(x) if name == "Sqrt" else rsqrt_f64(x)
                 elif name == "Sqrt":
                     values[res] = f32(math.sqrt(x))         # sqrt(-0.0) is -0.0
                 else:

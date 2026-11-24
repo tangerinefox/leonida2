@@ -2,10 +2,13 @@
 
     python -I tests/test_leonida_tui.py
 """
+import ctypes
 import os
 import sys
 import tempfile
 import unittest
+from collections import deque
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -49,6 +52,40 @@ class JobsBoundsTest(unittest.TestCase):
                 # Re-import path: _read_key imports msvcrt inside the nt branch.
                 self.assertIsNone(leonida_tui._read_key(0.0))
         self.assertEqual(calls["hit"], 1)
+
+    def test_windows_console_mouse_move_does_not_reset_input_timeout(self):
+        events = deque([(90, leonida_tui._MOUSE_EVENT), (150, leonida_tui._KEY_EVENT)])
+        now_ms = 0
+
+        def wait(handle, timeout_ms):
+            nonlocal now_ms
+            limit = now_ms + timeout_ms
+            if events and events[0][0] <= limit:
+                now_ms = max(now_ms, events[0][0])
+                return 0  # WAIT_OBJECT_0
+            now_ms = limit
+            return 258  # WAIT_TIMEOUT
+
+        def read(handle, record_ptr, count, read_count):
+            _, kind = events.popleft()
+            record = record_ptr._obj
+            record.EventType = kind
+            if kind == leonida_tui._KEY_EVENT:
+                record.Event.KeyEvent.bKeyDown = True
+                record.Event.KeyEvent.wRepeatCount = 1
+                record.Event.KeyEvent.UnicodeChar = "x"
+            read_count._obj.value = 1
+            return True
+
+        kernel = SimpleNamespace(WaitForSingleObject=wait, ReadConsoleInputW=read)
+        with (mock.patch.object(ctypes, "windll", SimpleNamespace(kernel32=kernel), create=True),
+              mock.patch.object(leonida_tui, "_nt_mouse_armed", (1, 0)),
+              mock.patch.object(leonida_tui, "_nt_key_queue", deque()),
+              mock.patch.object(leonida_tui.time, "monotonic", side_effect=lambda: now_ms / 1000)):
+            self.assertIsNone(leonida_tui._nt_read_console_key(0.1))
+            self.assertLessEqual(now_ms, 101)  # Win32 timeouts are whole milliseconds.
+            now_ms = 150
+            self.assertEqual(leonida_tui._nt_read_console_key(0), "x")
 
     def test_nt_arrow_scan_codes(self):
         seq = iter(["\xe0", "H", "\xe0", "P", "\xe0", "K", "\xe0", "M",

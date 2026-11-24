@@ -3,14 +3,18 @@ puts it, the rows tell the two hypotheses apart, and the kernel builds.
 
     python -I tests/test_vcmp16_opsel_probe.py
 """
+import contextlib
+import io
 import os
 import sys
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 sys.path.insert(0, os.path.join(ROOT, "tools", "hw_oracle"))
 
+import runner  # noqa: E402
 import vcmp16_opsel_probe as p  # noqa: E402
 
 
@@ -64,6 +68,119 @@ class RowsTest(unittest.TestCase):
         self.assertEqual(sum(ln.startswith(".long 0xd4") for ln in lines), len(rows))
         self.assertEqual(sum(ln.startswith(".long 0xd703") for ln in lines), len(p.control_rows()))
         self.assertEqual("\n".join(lines).count("global_store_b32"), len(rows) + len(p.control_rows()))
+
+
+class MainAndOracleLifecycleTest(unittest.TestCase):
+    def test_main_rule_mode(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = p.main(["--oracle", "rule"])
+        self.assertEqual(rc, 0)
+        self.assertIn("op_sel honoured", buf.getvalue())
+
+    def _expected_words(self):
+        rows = p.rows()
+        controls = p.control_rows()
+        return [p.answer(r, False) for r in rows] + [p.control_answer(opsel, True) for _, opsel in controls]
+
+    class FakeOracle:
+        def __init__(self, run_fn=None):
+            self.device = "fake-device"
+            self.closed = False
+            self.run_fn = run_fn
+
+        def run(self, kernels):
+            if self.run_fn:
+                return self.run_fn(kernels)
+            return []
+
+        def close(self):
+            self.closed = True
+
+    def test_main_hw_success_closes_oracle(self):
+        exp = self._expected_words()
+        fake = self.FakeOracle(lambda k: [list(exp)])
+        buf = io.StringIO()
+        with (
+            mock.patch.object(runner, "open_oracle", return_value=fake),
+            contextlib.redirect_stdout(buf),
+        ):
+            rc = p.main(["--oracle", "hw"])
+        self.assertEqual(rc, 0)
+        self.assertTrue(fake.closed)
+        self.assertIn("device: fake-device", buf.getvalue())
+        self.assertNotIn("DIFFERS", buf.getvalue())
+
+    def test_main_hw_mismatch_closes_oracle(self):
+        exp = self._expected_words()
+        # Flip answers to cause mismatch
+        fake = self.FakeOracle(lambda k: [[1 - x for x in exp]])
+        buf = io.StringIO()
+        with (
+            mock.patch.object(runner, "open_oracle", return_value=fake),
+            contextlib.redirect_stdout(buf),
+        ):
+            rc = p.main(["--oracle", "hw"])
+        self.assertTrue(fake.closed)
+        self.assertIn(rc, (1, 2))
+
+    def test_main_hw_kernel_rejected_closes_oracle(self):
+        fake = self.FakeOracle(lambda k: ["unsupported mnemonic"])
+        buf = io.StringIO()
+        with (
+            mock.patch.object(runner, "open_oracle", return_value=fake),
+            contextlib.redirect_stdout(buf),
+        ):
+            rc = p.main(["--oracle", "hw"])
+        self.assertEqual(rc, 2)
+        self.assertTrue(fake.closed)
+        self.assertIn("kernel rejected", buf.getvalue())
+
+    def test_main_hw_empty_result_closes_oracle(self):
+        fake = self.FakeOracle(lambda k: [])
+        buf = io.StringIO()
+        with (
+            mock.patch.object(runner, "open_oracle", return_value=fake),
+            contextlib.redirect_stdout(buf),
+        ):
+            rc = p.main(["--oracle", "hw"])
+        self.assertEqual(rc, 2)
+        self.assertTrue(fake.closed)
+        self.assertIn("harness error", buf.getvalue())
+
+    def test_main_hw_none_result_closes_oracle(self):
+        fake = self.FakeOracle(lambda k: [None])
+        buf = io.StringIO()
+        with (
+            mock.patch.object(runner, "open_oracle", return_value=fake),
+            contextlib.redirect_stdout(buf),
+        ):
+            rc = p.main(["--oracle", "hw"])
+        self.assertEqual(rc, 2)
+        self.assertTrue(fake.closed)
+        self.assertIn("harness error", buf.getvalue())
+
+    def test_main_hw_short_result_closes_oracle(self):
+        fake = self.FakeOracle(lambda k: [[0, 1]])
+        buf = io.StringIO()
+        with (
+            mock.patch.object(runner, "open_oracle", return_value=fake),
+            contextlib.redirect_stdout(buf),
+        ):
+            rc = p.main(["--oracle", "hw"])
+        self.assertEqual(rc, 2)
+        self.assertTrue(fake.closed)
+        self.assertIn("harness error", buf.getvalue())
+
+    def test_main_hw_unavailable_exits_77(self):
+        buf = io.StringIO()
+        with (
+            mock.patch.object(runner, "open_oracle", side_effect=runner.Unavailable("device unavailable")),
+            contextlib.redirect_stdout(buf),
+        ):
+            rc = p.main(["--oracle", "hw"])
+        self.assertEqual(rc, 77)
+        self.assertIn("hardware oracle unavailable", buf.getvalue())
 
 
 if __name__ == "__main__":

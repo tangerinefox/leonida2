@@ -15,8 +15,8 @@ instead of writing something else:
                  its attribute count has a value in its content, which would decode as an attribute
     descriptor   a descriptor index outside the table, or a first use out of order
     length       a string or text no longer has its recorded byte length
-    value        a value the record cannot hold (an integer out of range, a float that overflows the layout, an
-                 unknown type, more attribute records than the element's attribute count)
+    value        a value the record cannot hold (a non-string name, an integer out of range, a float that overflows
+                 the layout, an unknown type, more attribute records than the element's attribute count)
 
 Usage:
     python -I rbf0_encode.py --check <carve-dir | resource> [--limit N]
@@ -53,6 +53,15 @@ class EncodeError(ValueError):
         self.reason = reason
 
 
+def _name_bytes(index, name):
+    if not isinstance(name, str):
+        raise EncodeError("value", f"descriptor {index} name must be a string, got {type(name).__name__}")
+    try:
+        return name.encode("utf-8")
+    except UnicodeEncodeError:
+        raise EncodeError("utf8", f"descriptor {index} name contains an unpaired Unicode surrogate") from None
+
+
 class _Writer:
     def __init__(self, doc):
         self.wide = doc.get("layout") == "wide-64"
@@ -72,18 +81,19 @@ class _Writer:
         if index == self.emitted:
             if index in self.bad_names:
                 raise EncodeError("utf8", f"descriptor {index} name had invalid UTF-8")
+            raw = _name_bytes(index, name)
             if index < len(self.names) and self.names[index] not in (None, name):
                 raise EncodeError("descriptor", f"descriptor {index} is named both {self.names[index]!r} and {name!r}")
             if index == len(self.names):
                 self.names.append(name)
             else:
                 self.names[index] = name
-            raw = name.encode("utf-8")
             if len(raw) > 0xFFFF:
                 raise EncodeError("length", f"descriptor {index} name is {len(raw)} bytes")
             self.out += struct.pack("<H", len(raw)) + raw
             self.emitted += 1
         elif index < len(self.names) and self.names[index] not in (None, name):
+            _name_bytes(index, name)
             raise EncodeError("descriptor", f"descriptor {index} is named both {self.names[index]!r} and {name!r}")
 
     def float_bits(self, value, special):
@@ -194,6 +204,9 @@ def encode(doc):
     if not isinstance(tree, dict) or tree.get("kind") != "element":
         raise EncodeError("status", "no root element")
     w = _Writer(doc)
+    for index, descriptor in enumerate(doc.get("descriptors") or []):
+        if "name" in descriptor:
+            _name_bytes(index, descriptor["name"])
     try:
         w.element(tree)
     except UnicodeEncodeError:

@@ -209,11 +209,17 @@ class Oracle:
         except ValueError as e:   # a GPU the kernels have no spellings for is a skip, like a missing tool
             raise Unavailable(f"{e} (set LEONIDA_HW_ARCH)") from None
         self.chunk = chunk
+        owned = not workdir   # a temporary directory made here is removed if the constructor fails
         self.workdir = workdir or tempfile.mkdtemp(prefix="leonida-hw-oracle-")
-        self.exe = self._build_launcher()
-        self.device = self._probe()
-        self.true16 = self._needs_true16()
-        self._probe_waves()
+        try:
+            self.exe = self._build_launcher()
+            self.device = self._probe()
+            self.true16 = self._needs_true16()
+            self._probe_waves()
+        except BaseException:   # close() never runs for an object that was not built: remove the directory here
+            if owned:
+                shutil.rmtree(self.workdir, ignore_errors=True)
+            raise
 
     def _build_launcher(self):
         src = os.path.join(HERE, "hw_oracle.c")

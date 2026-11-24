@@ -33,6 +33,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from report_paths import path_key, same_report_path  # noqa: E402
 from shader_ir import HDR, parse_file  # noqa: E402
 from replace_retry import replace as replace_retry  # noqa: E402
+from file_mode import published_mode  # noqa: E402
 import cfg_structure  # noqa: E402
 import fssm_header  # noqa: E402
 import fssm_unpack  # noqa: E402
@@ -1228,7 +1229,8 @@ class Gen:
 
     def emit_fma64(self, r, x, y, z):
         """r = x * y + z on doubles with ONE rounding, as RDNA2's f64 multiply-adds do. GLSL.std.450 Fma may round
-        twice here as for f32, and NVIDIA's driver does (RTX 4090, 621.24: the fma(a, a, c) cancellation probe with
+        twice here as for f32, and NVIDIA's driver does when it folds an all-constant Fma at pipeline compile time
+        (run-time operands are fused there) (RTX 4090, 621.24: the fma(a, a, c) cancellation probe with
         a = 1 + 2^-30 gives 0, not 2^-60). With --fma khr it is OpFmaKHR on doubles, which needs VK_KHR_shader_fma +
         shaderFmaFloat64 (feature shaderFmaFloat64 in the index). --fma exact has no f64 form and keeps Fma."""
         if FMA_KHR:
@@ -6592,8 +6594,13 @@ class Gen:
                     self.emit(f"{g} = OpFMul %float {v} {c}")
                     v = g
         if "clamp" in mods:
-            g = self.tmp()
-            self.emit(f"{g} = OpExtInst %float %glsl FClamp {v} %f0 %f1")
+            # The game's MODE has DX10_CLAMP=1, so the clamp bit turns a NaN result into +0
+            # (docs/shader_validation.md). GLSL.std.450 FClamp leaves a NaN operand undefined,
+            # so select +0 for a NaN first, as the div_fixup and cvt_pknorm clamps do.
+            nan, safe, g = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{nan} = OpIsNan %bool {v}")
+            self.emit(f"{safe} = OpSelect %float {nan} %f0 {v}")
+            self.emit(f"{g} = OpExtInst %float %glsl FClamp {safe} %f0 %f1")
             return g
         return v
 
@@ -12435,7 +12442,9 @@ class Gen:
             (n == 2 and d["k"] == "special" and d["t"] == "vcc")
         slist_dst = d["k"] == "slist" and len(d["r"]) == n
         base_slots = (list(range(base["r"], base["r"] + base.get("n", 1))) if base["k"] == "sgpr"
-                      else list(base["r"]) if base["k"] == "slist" else None)
+                      else list(base["r"]) if base["k"] == "slist"
+                      else ["vcc_lo", "vcc_hi"] if (base["k"] == "special" and base["t"] == "vcc")
+                      else None)
         if (d["k"] != "sgpr" and not single_special and not slist_dst) or base_slots is None:
             raise Unsupported(f"{op} operands {d.get('t', d['k'])} {base.get('t', base['k'])}")
 
@@ -16655,14 +16664,28 @@ def sdwa_reads_dst(op: str, mods: list[str]) -> bool:
             and any(m.startswith(("dst_sel:BYTE_", "dst_sel:WORD_")) for m in mods))
 
 
+# Ops whose VGPR destination is also a source operand (the accumulating forms, and v_swap_b32, which reads both).
+DST_ALSO_READ = ("v_swap_b32", "v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32", "v_fmac_f16", "v_dot4c_i32_i8", "v_pk_fmac_f16",
+                 "v_dot2c_f32_f16", "v_dot2c_i32_i16", "v_dot2c_u32_u16", "v_dot4c_u32_u8", "v_dot8c_i32_i4",
+                 "v_dot8c_u32_u4")
+
+
 # All VGPR operands of these instructions are sources, including store address and data ranges.
 VGPR_READ_ONLY_PREFIXES = ("exp", "buffer_store", "tbuffer_store", "image_store", "v_cmp", "ds_write",
                            "global_store", "flat_store", "scratch_store")
 
 
 def read_before_write_vgprs(insns):
-    """VGPRs a shader reads before writing them: for a fetch-calling VS these are the fetched attributes."""
-    written, first = set(), []
+    """VGPRs a shader reads before writing them: for a fetch-calling VS these are the fetched attributes.
+
+    v_writelane_b32 writes one lane and keeps the others (SHADER-768), so its destination is not written by it: the
+    kept lanes still hold what the register held at entry. They are *carried*, and become a read only when something
+    other than v_readlane_b32 reads the register before a full write (shdann's two cases on #4297: a PS whose first
+    touch of v0 is a writelane, then a v_mov of v0, reads the barycentric in the other lanes; a VS that spills an
+    SGPR into one lane of v40 around the fetch call and reads it back with v_readlane never uses the entry value,
+    so v40 is not a fetched attribute). The approximation: a v_readlane of a lane the writelane didn't write would
+    read the entry value, and is not counted."""
+    written, first, carried = set(), [], set()
     for ins in insns:
         a, op = ins["args"], ins["op"]
         if not a:
@@ -16675,17 +16698,22 @@ def read_before_write_vgprs(insns):
                 regs += range(x["r"], x["r"] + x.get("n", 1))
             elif x["k"] == "vlist":
                 regs += x["r"]
-        if (base_op(op) in ("v_swap_b32", "v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32", "v_fmac_f16", "v_dot4c_i32_i8", "v_pk_fmac_f16",
-                            "v_dot2c_f32_f16", "v_dot2c_i32_i16", "v_dot2c_u32_u16", "v_dot4c_u32_u8",
-                            "v_dot8c_i32_i4", "v_dot8c_u32_u4") or
+        if (base_op(op) in DST_ALSO_READ or
                 (op.startswith(("global_load_", "buffer_load_")) and "_d16" in op and "format" not in op)) and \
                 a[0]["k"] == "vgpr":   # d16 keeps a half
             regs.append(a[0]["r"])
+        lane_read = base_op(op) == "v_readlane_b32"
         for r in regs:
-            if r not in written and r not in first:
-                first.append(r)
-        if not reads_all and a[0]["k"] == "vgpr":
-            written.update(vgpr_dest_registers(ins))
+            if r in written or r in first or (r in carried and lane_read):
+                continue
+            first.append(r)
+        if base_op(op) == "v_writelane_b32" and a[0]["k"] == "vgpr":
+            if a[0]["r"] not in written:
+                carried.add(a[0]["r"])
+        elif not reads_all and a[0]["k"] == "vgpr":
+            dst = vgpr_dest_registers(ins)
+            written.update(dst)
+            carried.difference_update(dst)
     return set(first)
 
 def interp_ij_analysis(insns, g):
@@ -16936,9 +16964,8 @@ def reg_reads_writes(insns):
                 regs += range(x["r"], x["r"] + x.get("n", 1))
             elif x["k"] == "vlist":
                 regs += x["r"]
-        if base_op(op) in ("v_swap_b32", "v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32", "v_fmac_f16", "v_dot4c_i32_i8", "v_pk_fmac_f16",
-                           "v_dot2c_f32_f16", "v_dot2c_i32_i16", "v_dot2c_u32_u16", "v_dot4c_u32_u8",
-                           "v_dot8c_i32_i4", "v_dot8c_u32_u4") and a[0]["k"] == "vgpr":
+        if (base_op(op) in DST_ALSO_READ or base_op(op) == "v_writelane_b32") and a[0]["k"] == "vgpr":
+            # v_writelane_b32 keeps the other lanes: over a slice that is a read of the destination
             regs.append(a[0]["r"])
         rr.update(regs)
         if not reads_all and a[0]["k"] == "vgpr":
@@ -17089,6 +17116,25 @@ def restore_mix_literal(ins, raw, literal):
 MIX_INLINE_F16 = {**{0x80 + n: n for n in range(65)}, **{0xC0 + n: -n & 0xFFFF for n in range(1, 17)},
                   0xF0: 0x3800, 0xF1: 0xB800, 0xF2: 0x3C00, 0xF3: 0xBC00, 0xF4: 0x4000, 0xF5: 0xC000,
                   0xF6: 0x4400, 0xF7: 0xC400, 0xF8: 0x3118}
+
+
+def sdwa_inline_float(raw, printed, op):
+    """LLVM 19 can print an integer-to-half SDWA conversion's inline float as an extra literal dword."""
+    if op not in ("v_cvt_f16_u16_sdwa", "v_cvt_f16_i16_sdwa") or len(printed) != 12 or len(raw) < 8:
+        return False
+    # Keep only the native VOP1 opcode and source marker when checking the first dword.
+    word = int.from_bytes(raw[:4], "little") & 0xfe01ffff
+    opcode = 0x7e00a0f9 if op == "v_cvt_f16_u16_sdwa" else 0x7e00a2f9
+    return (word == opcode and 0xf0 <= raw[4] <= 0xf8 and raw[6] & 0x80 and printed[4] == 0xff
+            and raw[:4] == printed[:4] and raw[5:8] == printed[5:8]
+            and int.from_bytes(printed[8:], "little") == MIX_INLINE_F16[raw[4]])
+
+
+def restore_sdwa_source(ins, raw):
+    import rdna2_decode
+    source, = rdna2_decode.decode_bytes(raw[:8])["insns"]
+    ins["args"][1] = source["args"][1]
+    ins["enc"] = raw[:8].hex()
 
 
 def mix_inline_literal(raw, printed, op):
@@ -17297,7 +17343,7 @@ def check_printed_encodings(path, info):
     blob = native_blob(path, info["name"])
     if int(m.group(3), 16) > len(blob):
         return
-    shift = 0        # bytes the decoder read past the printed encodings so far (mix_inline_literal)
+    shift = 0        # actual bytes consumed minus printed bytes consumed so far
     for ins in info["insns"]:
         ins["pc"] += shift
         if not ins.get("enc"):
@@ -17305,6 +17351,10 @@ def check_printed_encodings(path, info):
         enc = bytes.fromhex(ins["enc"])
         raw = blob[ins["pc"]:ins["pc"] + len(enc)]
         if not same_encoding(raw, enc, ins["op"], len(ins["args"])):
+            if sdwa_inline_float(raw, enc, ins["op"]):
+                restore_sdwa_source(ins, raw)
+                shift -= 4
+                continue
             literal = mix_literal(raw, enc, base_op(ins["op"]))
             if literal is not None:
                 restore_mix_literal(ins, raw, literal)
@@ -17370,6 +17420,11 @@ def translate(path):
                 literal = mix_literal(blob[at:at + len(enc)], enc, base_op(op))
                 if literal is not None:
                     restore_mix_literal(ins, blob[at:at + len(enc)], literal)
+                    break
+                raw8 = blob[at:at + 8]
+                if sdwa_inline_float(raw8, enc, op):
+                    restore_sdwa_source(ins, raw8)
+                    enc = raw8
                     break
                 literal = mix_inline_literal(blob[at:at + 12], enc, base_op(op))
                 if literal is not None:
@@ -18634,12 +18689,27 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
 def write_index(path, index):
     """Write an index under another name and rename it into place, so a run stopped part-way never leaves half of
     one: make_game.py takes these files as proof that a shard, or the whole translation, finished."""
-    tmp = path + ".tmp"     # must not end in .json: --merge globs index.part*.json
-    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-        _json.dump(index, f, indent=0, sort_keys=True)
-        f.flush()
-        os.fsync(f.fileno())    # on disk before the rename, or a power cut could leave the name with no data
-    replace_retry(tmp, path)    # a scanner or sync client on Windows may hold the new file open for a moment
+    tmp = None
+    try:
+        # Unique per writer, and not a .json file: --merge globs index.part*.json.
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", newline="\n", dir=os.path.dirname(os.path.abspath(path)),
+            prefix=".index-", suffix=".tmp", delete=False,
+        ) as f:
+            tmp = f.name
+            _json.dump(index, f, indent=0, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())    # on disk before the rename, or a power cut could leave the name with no data
+        if os.name != "nt":
+            os.chmod(tmp, published_mode(path))  # do not publish NamedTemporaryFile's private 0600 mode
+        replace_retry(tmp, path)    # a scanner or sync client on Windows may hold the new file open for a moment
+    except BaseException:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        raise
 
 
 class ShardSetError(Exception):

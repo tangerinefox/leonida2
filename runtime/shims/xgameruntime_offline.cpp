@@ -1,5 +1,5 @@
-// xgameruntime: XGameEventImpl, XGameUiImpl, XGameStreamingImpl, XDisplayImpl, XUserDeviceImpl, XAccessibilityImpl and
-// XLauncherImpl, offline: small classes a title calls early.
+// xgameruntime: XGameEventImpl, XGameUiImpl, XGameStreamingImpl, XDisplayImpl, XUserDeviceImpl, XAccessibilityImpl
+// and XLauncherImpl, offline: small classes a title calls early.
 //
 // Each XGameEvent*, XGameUi* and XGameStreaming* function in xgameruntime.lib asks QueryApiImpl for its class and
 // calls one slot with its own arguments after `this`. The class and interface ids and the method order are
@@ -18,17 +18,19 @@
 //   XUserDeviceImpl     every device belongs to the offline user; associations and audio endpoints never change, so
 //                       their change registrations are kept until unregistered and never called back; the user has
 //                       no audio endpoint of its own; finding a controller shows no UI (as on desktop).
-//   XAccessibilityImpl  high contrast is Off, closed captions can't be configured, no voice is installed (enumerating
-//                       calls back zero times), XSpeechSynthesizerCreate fails (E_FAIL) with a null handle, the other
-//                       speech calls refuse the handle they were never given (E_INVALIDARG), speech-to-text display
-//                       calls fail (E_FAIL).
-//   XLauncherImpl       XLaunchUri and the display timeout deferral calls fail (E_FAIL); nothing is launched.
+//   XAccessibilityImpl  high contrast is Off, closed captions can't be configured, one silent voice is installed
+//                       (enumerating calls back once), XSpeechSynthesizerCreate hands out a synthesizer whose
+//                       text/SSML streams return a valid 44-byte empty 16 kHz mono 16-bit PCM WAVE header so titles
+//                       that play narration continue cleanly; speech-to-text display calls fail (E_FAIL).
+//   XLauncherImpl       XLaunchUri fails offline (E_FAIL); XDisplayAcquireTimeoutDeferral / Close acquire and clear a
+//                       real Win32 PowerRequestDisplayRequired handle so the host display stays awake.
 //
 // Slots whose signature the public pages don't give answer with a value that is safe whichever way the caller reads
 // it: see `client_not_connected` (XGameStreaming) and `offline_failure`.
 #include <windows.h>
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -604,38 +606,94 @@ HRESULT STDMETHODCALLTYPE accessibility_high_contrast(void*, uint32_t* mode) {
 // 4: HRESULT XClosedCaptionSetEnabled(bool enabled): there are no captions to show; accepted and dropped.
 HRESULT STDMETHODCALLTYPE accessibility_captions_set_enabled(void*, bool) { return S_OK; }
 
-// 8: HRESULT XSpeechSynthesizerEnumerateInstalledVoices(callback, void* context): no voice is installed, so the
-// callback runs zero times. ASSUMPTION: the argument order (GDK reference), only the count (2) was measured.
-HRESULT STDMETHODCALLTYPE speech_enumerate_voices(void*, void* callback, void*) {
-    return callback ? S_OK : E_INVALIDARG;
+// XSpeechSynthesizerVoiceInformation and its callback, in the GDK reference's member order (the gender is
+// XSpeechSynthesizerVoiceGender, a uint32_t enum: Female 0, Male 1).
+struct SpeechVoiceInformation {
+    const char* description;
+    const char* display_name;
+    uint32_t gender;
+    const char* voice_id;
+    const char* language;
+};
+static_assert(offsetof(SpeechVoiceInformation, voice_id) == 24 && sizeof(SpeechVoiceInformation) == 40, "x64 layout");
+using InstalledVoicesCallback = bool(CALLBACK*)(const SpeechVoiceInformation* information, void* context);
+constexpr SpeechVoiceInformation kSilentVoice = {"Leonida silent voice - English (United States)",
+                                                 "Leonida silent voice", 0, "leonida-silent", "en-US"};
+
+// 8: HRESULT XSpeechSynthesizerEnumerateInstalledVoices(void* context, callback): one voice, the silent one every
+// synthesizer below speaks with. ASSUMPTION: the argument order (GDK reference), only the count (2) was measured.
+HRESULT STDMETHODCALLTYPE speech_enumerate_voices(void*, void* context, InstalledVoicesCallback callback) {
+    if (!callback) return E_INVALIDARG;
+    callback(&kSilentVoice, context);
+    return S_OK;
 }
 
-// 9: HRESULT XSpeechSynthesizerCreate(XSpeechSynthesizerHandle* handle): no synthesizer offline.
-HRESULT STDMETHODCALLTYPE speech_create(void* self, void** handle) {
-    if (handle) *handle = nullptr;
-    return offline_failure<kAccessibilityName, 9>(self);
+// Valid 44-byte RIFF/WAVE header for 16 kHz, 16-bit mono PCM with 0 data bytes (silent speech stream).
+constexpr uint8_t kSilentWave[44] = {
+    'R', 'I', 'F', 'F', 0x24, 0x00, 0x00, 0x00, 'W', 'A', 'V', 'E', 'f', 'm', 't', ' ',
+    0x10, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x80, 0x3e, 0x00, 0x00, 0x00, 0x7d, 0x00, 0x00,
+    0x02, 0x00, 0x10, 0x00, 'd', 'a', 't', 'a', 0x00, 0x00, 0x00, 0x00,
+};
+
+uint8_t g_speech_synth_handle = 0;
+uint8_t g_speech_stream_handle = 0;
+
+// 9: HRESULT XSpeechSynthesizerCreate(XSpeechSynthesizerHandle* handle): silent synthesizer handle.
+HRESULT STDMETHODCALLTYPE speech_create(void*, void** handle) {
+    if (!handle) return E_POINTER;
+    *handle = &g_speech_synth_handle;
+    return S_OK;
 }
 
-// 10-12, 14: a synthesizer or stream handle is the first argument, and none was ever handed out: E_INVALIDARG.
-HRESULT STDMETHODCALLTYPE speech_bad_handle(void*) { return E_INVALIDARG; }
+// 10: HRESULT XSpeechSynthesizerCloseHandle(XSpeechSynthesizerHandle handle)
+HRESULT STDMETHODCALLTYPE speech_close_synth(void*, void* handle) {
+    return handle == &g_speech_synth_handle ? S_OK : E_INVALIDARG;
+}
+
+// 11: HRESULT XSpeechSynthesizerSetDefaultVoice(XSpeechSynthesizerHandle handle)
+HRESULT STDMETHODCALLTYPE speech_set_default_voice(void*, void* handle) {
+    return handle == &g_speech_synth_handle ? S_OK : E_INVALIDARG;
+}
+
+// 12: HRESULT XSpeechSynthesizerSetCustomVoice(XSpeechSynthesizerHandle handle, const char* voiceId): only the
+// enumerated voice is installed.
+HRESULT STDMETHODCALLTYPE speech_set_custom_voice(void*, void* handle, const char* voice_id) {
+    if (handle != &g_speech_synth_handle || !voice_id) return E_INVALIDARG;
+    return std::strcmp(voice_id, kSilentVoice.voice_id) == 0 ? S_OK : E_INVALIDARG;
+}
 
 // 13, 21: HRESULT XSpeechSynthesizerCreateStreamFromText/Ssml(synthesizer, const char* text,
 //                                                             XSpeechSynthesizerStreamHandle* stream)
-HRESULT STDMETHODCALLTYPE speech_create_stream(void*, void*, const char*, void** stream) {
+HRESULT STDMETHODCALLTYPE speech_create_stream(void*, void* synth, const char*, void** stream) {
     if (stream) *stream = nullptr;
-    return E_INVALIDARG;
+    if (synth != &g_speech_synth_handle) return E_INVALIDARG;
+    if (!stream) return E_POINTER;
+    *stream = &g_speech_stream_handle;
+    return S_OK;
+}
+
+// 14: HRESULT XSpeechSynthesizerCloseStreamHandle(XSpeechSynthesizerStreamHandle stream)
+HRESULT STDMETHODCALLTYPE speech_close_stream(void*, void* stream) {
+    return stream == &g_speech_stream_handle ? S_OK : E_INVALIDARG;
 }
 
 // 15: HRESULT XSpeechSynthesizerGetStreamDataSize(stream, size_t* size)
-HRESULT STDMETHODCALLTYPE speech_stream_size(void*, void*, size_t* size) {
+HRESULT STDMETHODCALLTYPE speech_stream_size(void*, void* stream, size_t* size) {
     if (size) *size = 0;
-    return E_INVALIDARG;
+    if (stream != &g_speech_stream_handle) return E_INVALIDARG;
+    if (!size) return E_POINTER;
+    *size = sizeof(kSilentWave);
+    return S_OK;
 }
 
 // 16: HRESULT XSpeechSynthesizerGetStreamData(stream, size_t size, void* buffer, size_t* used)
-HRESULT STDMETHODCALLTYPE speech_stream_data(void*, void*, size_t, void*, size_t* used) {
+HRESULT STDMETHODCALLTYPE speech_stream_data(void*, void* stream, size_t size, void* buffer, size_t* used) {
     if (used) *used = 0;
-    return E_INVALIDARG;
+    if (stream != &g_speech_stream_handle) return E_INVALIDARG;
+    if (!buffer || size < sizeof(kSilentWave)) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    std::memcpy(buffer, kSilentWave, sizeof(kSilentWave));
+    if (used) *used = sizeof(kSilentWave);
+    return S_OK;
 }
 
 // The slots with no offline counterpart whose arguments the layout doesn't give: the caption properties (3) and
@@ -654,11 +712,11 @@ const void* const kAccessibilityVtable[] = {
     FN(accessibility_offline<7>),            // 7  XSpeechToTextSendString
     FN(speech_enumerate_voices),             // 8  XSpeechSynthesizerEnumerateInstalledVoices
     FN(speech_create),                       // 9  XSpeechSynthesizerCreate
-    FN(speech_bad_handle),                   // 10 XSpeechSynthesizerCloseHandle
-    FN(speech_bad_handle),                   // 11 XSpeechSynthesizerSetDefaultVoice
-    FN(speech_bad_handle),                   // 12 XSpeechSynthesizerSetCustomVoice
+    FN(speech_close_synth),                  // 10 XSpeechSynthesizerCloseHandle
+    FN(speech_set_default_voice),            // 11 XSpeechSynthesizerSetDefaultVoice
+    FN(speech_set_custom_voice),             // 12 XSpeechSynthesizerSetCustomVoice
     FN(speech_create_stream),                // 13 XSpeechSynthesizerCreateStreamFromText
-    FN(speech_bad_handle),                   // 14 XSpeechSynthesizerCloseStreamHandle
+    FN(speech_close_stream),                 // 14 XSpeechSynthesizerCloseStreamHandle
     FN(speech_stream_size),                  // 15 XSpeechSynthesizerGetStreamDataSize
     FN(speech_stream_data),                  // 16 XSpeechSynthesizerGetStreamData
     FN(accessibility_offline<17>),           // 17 XSpeechToTextBeginHypothesisString
@@ -680,11 +738,31 @@ constexpr char kLauncherName[] = "XLauncherImpl";
 constexpr GUID kLauncherClass = {0x1b339674, 0x328d, 0x4283, {0xa2, 0x00, 0x31, 0x71, 0xf1, 0x8d, 0x36, 0x39}};
 
 // 3: HRESULT XLaunchUri(XUserHandle user, const char* uri): nothing is launched; E_FAIL.
-// 4: HRESULT XDisplayAcquireTimeoutDeferral(XDisplayTimeoutDeferralHandle* handle): none is handed out.
-// 5: XDisplayCloseTimeoutDeferralHandle(handle): no handle exists; E_FAIL, which a void caller ignores.
-HRESULT STDMETHODCALLTYPE launcher_acquire_deferral(void* self, void** handle) {
-    if (handle) *handle = nullptr;
-    return offline_failure<kLauncherName, 4>(self);
+// 4: HRESULT XDisplayAcquireTimeoutDeferral(XDisplayTimeoutDeferralHandle* handle): Win32 display power request.
+// 5: void XDisplayCloseTimeoutDeferralHandle(XDisplayTimeoutDeferralHandle handle): clears and closes the request.
+HRESULT STDMETHODCALLTYPE launcher_acquire_deferral(void*, void** handle) {
+    if (!handle) return E_POINTER;
+    *handle = nullptr;
+    wchar_t reason[] = L"Title display timeout deferral";
+    REASON_CONTEXT ctx{};
+    ctx.Version = POWER_REQUEST_CONTEXT_VERSION;
+    ctx.Flags = POWER_REQUEST_CONTEXT_SIMPLE_STRING;
+    ctx.Reason.SimpleReasonString = reason;
+    const HANDLE req = PowerCreateRequest(&ctx);
+    if (req == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(GetLastError());
+    if (!PowerSetRequest(req, PowerRequestDisplayRequired)) {
+        const DWORD err = GetLastError();
+        CloseHandle(req);
+        return HRESULT_FROM_WIN32(err);
+    }
+    *handle = req;
+    return S_OK;
+}
+
+void STDMETHODCALLTYPE launcher_close_deferral(void*, void* handle) {
+    if (!handle) return;
+    PowerClearRequest(handle, PowerRequestDisplayRequired);
+    CloseHandle(handle);
 }
 
 HRESULT STDMETHODCALLTYPE launcher_query_interface(void*, REFIID iid, void** out);
@@ -692,7 +770,7 @@ const void* const kLauncherVtable[] = {
     FN(launcher_query_interface), FN(object_add_ref), FN(object_release),   // 0-2 IUnknown
     FN((offline_failure<kLauncherName, 3>)),   // 3 XLaunchUri
     FN(launcher_acquire_deferral),             // 4 XDisplayAcquireTimeoutDeferral
-    FN((offline_failure<kLauncherName, 5>)),   // 5 XDisplayCloseTimeoutDeferralHandle
+    FN(launcher_close_deferral),               // 5 XDisplayCloseTimeoutDeferralHandle
 };
 static_assert(std::size(kLauncherVtable) == 6, "IUnknown + IXLauncherImpl's 3 methods");
 ClassObject g_launcher_object{kLauncherVtable};

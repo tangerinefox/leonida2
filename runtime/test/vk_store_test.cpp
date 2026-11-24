@@ -16,6 +16,10 @@
 // at binding 7, where 2D and 3D image atomics address their image, and at index 4 of the sampled array a 16x4 rgba8
 // image with all five mip levels (never read, only queried), behind the T# the runtime writes for such an image.
 // "signed-zero" checks three direct float stores and all remaining RGBA32 guard words (SHADER-605).
+// "cube" (cs_imgstore_cube.asm, GPU-CUBE-STORE): the shader stores to three cube images (the same three formats, T#
+// word3 TYPE = SQ_RSRC_IMG_CUBE). As the runtime binds a cube UAV (runtime/src/vulkan_bindless.h), each is a
+// cube-compatible 8x8 image of six layers whose storage view is a six-layer 2D array, at index k + 1 of the 2D-array
+// storage arrays (bindings 11 / 12 / 13 for float / uint / sint). Checks every texel of every layer (the face).
 #include "vulkan_loader.h"
 #include "vk_device_pick.h"
 #include "vk_shader_fma.h"
@@ -60,7 +64,10 @@ static void table_insert(std::vector<uint32_t>& t, const uint32_t key[8], uint32
 }
 
 int main(int argc, char** argv) {
-    if (argc < 2) { std::fprintf(stderr, "usage: vk_store_test cs.spv [load|load-d16|words|signed-zero]\n"); return 2; }
+    if (argc < 2) {
+        std::fprintf(stderr, "usage: vk_store_test cs.spv [load|load-d16|words|signed-zero|cube]\n");
+        return 2;
+    }
     gipa = load_vulkan();
     if (!gipa) return 1;
 #define LOADI(name) auto name = reinterpret_cast<PFN_##name>(gipa(inst, #name))
@@ -126,6 +133,7 @@ int main(int argc, char** argv) {
     // "words" mode: the two images filled as for "load"; the shader's results are whatever it leaves in them.
     const bool words_mode = argc > 2 && !std::strcmp(argv[2], "words");
     const bool signed_zero = argc > 2 && !std::strcmp(argv[2], "signed-zero");
+    const bool cube_mode = argc > 2 && !std::strcmp(argv[2], "cube");
     if (signed_zero) {
         LOADI(vkGetPhysicalDeviceProperties2);
         VkPhysicalDeviceFloatControlsProperties controls{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES};
@@ -224,6 +232,10 @@ int main(int argc, char** argv) {
         uint32_t t[8] = {0x1000 * (k + 1), fmts[k] << 20};
         for (int j = 2; j < 8; j++) t[j] = 0x11 * (k + 1);
         table_insert(table, t, k + 1);     // its index in the 2D arrays; 0 is the fallback, as in the runtime
+        if (cube_mode) {   // the cube T# (cs_imgstore_cube.asm): word3 also has TYPE = 0xB, index k + 1 of the 2D arrays
+            t[3] |= 0xB0000000u;
+            table_insert(table, t, k + 1);
+        }
     }
     // Index 4: a 16x4 rgba8 image with its whole mip chain (16x4, 8x2, 4x1, 2x1, 1x1) for image_get_resinfo. Its key
     // is the T# of exactly that image (gfx10_descriptors.h), which cs_resinfo.asm builds word for word.
@@ -296,6 +308,26 @@ int main(int argc, char** argv) {
         vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         CHECK(vkCreateImageView(dev, &vi, nullptr, &vol_view));
     }
+    // Cube mode: three cube-compatible 8x8 images of six layers, each seen through a six-layer 2D-array view.
+    const uint32_t FACES = 6;
+    VkImage cube[3]{}; VkImageView cube_view[3]{};
+    for (int k = 0; cube_mode && k < 3; k++) {
+        VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ii.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+        ii.imageType = VK_IMAGE_TYPE_2D; ii.format = vkf[k]; ii.extent = {W, W, 1}; ii.mipLevels = 1;
+        ii.arrayLayers = FACES; ii.samples = VK_SAMPLE_COUNT_1_BIT; ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ii.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        CHECK(vkCreateImage(dev, &ii, nullptr, &cube[k]));
+        VkMemoryRequirements mr; vkGetImageMemoryRequirements(dev, cube[k], &mr);
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.allocationSize = mr.size; mai.memoryTypeIndex = memtype(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        VkDeviceMemory m; CHECK(vkAllocateMemory(dev, &mai, nullptr, &m));
+        CHECK(vkBindImageMemory(dev, cube[k], m, 0));
+        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.image = cube[k]; vi.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY; vi.format = vkf[k];
+        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, FACES};
+        CHECK(vkCreateImageView(dev, &vi, nullptr, &cube_view[k]));
+    }
     VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     VkSampler sampler; CHECK(vkCreateSampler(dev, &sci, nullptr, &sampler));
     // Set 0: binding 0 = sampled images, 1 = samplers, 2 = hash table, 8/9/10 = float/uint/sint 2D storage image arrays.
@@ -303,23 +335,27 @@ int main(int argc, char** argv) {
     // index 4. Binding 0 holds each image's view in its own format (typed image_load reads the uint and sint ones
     // through integer aliases); every element of a storage array holds the image of its class, so all of them are
     // valid descriptors. Bindings 4 and 7 = the 2D and 3D r32ui storage images of the image atomics: the uint image
-    // and the volume, in every element.
+    // and the volume, in every element. Cube mode adds 11/12/13 = the float/uint/sint 2D-array storage arrays, which
+    // hold the cube image of their class in every element.
     constexpr uint32_t N = 5;
-    VkDescriptorSetLayoutBinding b[8]{};
+    const uint32_t bindings = cube_mode ? 11 : 8;
+    VkDescriptorSetLayoutBinding b[11]{};
     b[0] = {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, N, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     b[1] = {1, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     b[2] = {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     for (int k = 0; k < 3; k++) b[3 + k] = {uint32_t(8 + k), VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, N, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     b[6] = {4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, N, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     b[7] = {7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, N, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    for (int k = 0; k < 3; k++)
+        b[8 + k] = {uint32_t(11 + k), VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, N, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dli.bindingCount = 8; dli.pBindings = b;
+    dli.bindingCount = bindings; dli.pBindings = b;
     VkDescriptorSetLayout dsl; CHECK(vkCreateDescriptorSetLayout(dev, &dli, nullptr, &dsl));
     VkDescriptorPoolSize ps[4] = {
         {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, N},
         {VK_DESCRIPTOR_TYPE_SAMPLER, 1},
         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1},
-        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 5 * N},
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, (bindings - 3) * N},
     };
     VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpi.maxSets = 1; dpi.poolSizeCount = 4; dpi.pPoolSizes = ps;
@@ -335,8 +371,8 @@ int main(int argc, char** argv) {
                                     {VK_NULL_HANDLE, wide_view, VK_IMAGE_LAYOUT_GENERAL}};
     VkDescriptorImageInfo smpi{sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
     VkDescriptorImageInfo dii[3][N];
-    VkDescriptorImageInfo r32ui[N], r32ui_3d[N];
-    VkWriteDescriptorSet wr[8]{};
+    VkDescriptorImageInfo r32ui[N], r32ui_3d[N], cube_ii[3][N];
+    VkWriteDescriptorSet wr[11]{};
     for (auto& w : wr) { w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w.dstSet = ds; w.descriptorCount = 1; }
     wr[0].dstBinding = 0; wr[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; wr[0].pImageInfo = sii;
     wr[0].descriptorCount = N;
@@ -353,7 +389,12 @@ int main(int argc, char** argv) {
     for (uint32_t e = 0; e < N; e++) r32ui_3d[e] = {VK_NULL_HANDLE, vol_view, VK_IMAGE_LAYOUT_GENERAL};
     wr[7].dstBinding = 7; wr[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     wr[7].pImageInfo = r32ui_3d; wr[7].descriptorCount = N;
-    vkUpdateDescriptorSets(dev, 8, wr, 0, nullptr);
+    for (int k = 0; cube_mode && k < 3; k++) {
+        for (uint32_t e = 0; e < N; e++) cube_ii[k][e] = {VK_NULL_HANDLE, cube_view[k], VK_IMAGE_LAYOUT_GENERAL};
+        wr[8 + k].dstBinding = 11 + k; wr[8 + k].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        wr[8 + k].pImageInfo = cube_ii[k]; wr[8 + k].descriptorCount = N;
+    }
+    vkUpdateDescriptorSets(dev, bindings, wr, 0, nullptr);
 
     VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     smi.codeSize = code.size(); smi.pCode = reinterpret_cast<const uint32_t*>(code.data());
@@ -383,6 +424,11 @@ int main(int argc, char** argv) {
     const uint32_t image_words = W * W * (signed_zero ? 4 : 1);
     VkBuffer rb[3]; void* rbp[3];
     for (int k = 0; k < 3; k++) CHECK(make_buffer(image_words * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &rb[k], &rbp[k]));
+    // Cube mode: each cube image's six layers read back one after another, texel (x, y) of face f at 64f + 8y + x.
+    const uint32_t cube_words = W * W * FACES;
+    VkBuffer cube_rb[3]{}; void* cube_rbp[3]{};
+    for (int k = 0; cube_mode && k < 3; k++)
+        CHECK(make_buffer(cube_words * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &cube_rb[k], &cube_rbp[k]));
     // Load and words modes: what the uint and sint images hold before the dispatch, texel (x, y) at i = 8y + x.
     // The last row of the D16 fixture ("load-d16" only) exercises both sides of each 16-bit boundary.
     struct PackedLoad { uint32_t u; int32_t s, sum; };
@@ -471,6 +517,17 @@ int main(int argc, char** argv) {
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0,
                              nullptr, 0, nullptr, 3 - first_fill, ib + first_fill);
     }
+    VkImageMemoryBarrier cube_ib[3]{};
+    for (int k = 0; cube_mode && k < 3; k++) {
+        cube_ib[k] = ib[0];
+        cube_ib[k].image = cube[k]; cube_ib[k].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        cube_ib[k].newLayout = VK_IMAGE_LAYOUT_GENERAL; cube_ib[k].srcAccessMask = 0;
+        cube_ib[k].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        cube_ib[k].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, FACES};
+    }
+    if (cube_mode)
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr,
+                             0, nullptr, 3, cube_ib);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &ds, 0, nullptr);
     uint32_t pc[36] = {};
@@ -493,6 +550,19 @@ int main(int argc, char** argv) {
         bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; bic.imageExtent = {W, W, 1};
         vkCmdCopyImageToBuffer(cmd, img[k], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb[k], 1, &bic);
     }
+    if (cube_mode) {
+        for (int k = 0; k < 3; k++) {
+            cube_ib[k].oldLayout = VK_IMAGE_LAYOUT_GENERAL; cube_ib[k].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            cube_ib[k].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; cube_ib[k].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        }
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                             nullptr, 3, cube_ib);
+        for (int k = 0; k < 3; k++) {
+            VkBufferImageCopy bic{};   // all six layers, tightly packed one after another
+            bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, FACES}; bic.imageExtent = {W, W, 1};
+            vkCmdCopyImageToBuffer(cmd, cube[k], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, cube_rb[k], 1, &bic);
+        }
+    }
     if (words_mode) {
         vol_ib.oldLayout = VK_IMAGE_LAYOUT_GENERAL; vol_ib.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
         vol_ib.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
@@ -514,6 +584,30 @@ int main(int argc, char** argv) {
     CHECK(vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE));
     CHECK(vkQueueWaitIdle(q));
 
+    if (cube_mode) {   // every texel of every face, against what cs_imgstore_cube.asm writes there
+        uint32_t bad[3] = {};
+        for (uint32_t face = 0; face < FACES; face++)
+            for (uint32_t y = 0; y < W; y++)
+                for (uint32_t x = 0; x < W; x++) {
+                    const uint32_t i = y * W + x, at = face * W * W + i;
+                    const uint8_t* c = static_cast<const uint8_t*>(cube_rbp[0]) + 4 * at;
+                    const int er = int(std::lround(x / 7.0 * 255)), eg = int(std::lround(y / 7.0 * 255));
+                    const int eb = int(std::lround(face / 5.0 * 255));
+                    if (std::abs(c[0] - er) > 1 || std::abs(c[1] - eg) > 1 || std::abs(c[2] - eb) > 1 || c[3] != 255)
+                        bad[0]++;
+                    if (static_cast<const uint32_t*>(cube_rbp[1])[at] != 100 + 1000 * face + i) bad[1]++;
+                    if (static_cast<const int32_t*>(cube_rbp[2])[at] != -int32_t(1000 * face + i)) bad[2]++;
+                }
+        const uint32_t at = 4 * W * W + 3 * W + 5;   // texel (5, 3) of face 4
+        const uint8_t* c = static_cast<const uint8_t*>(cube_rbp[0]) + 4 * at;
+        std::printf("rgba8 unorm cube (float view): %u bad, face 4 texel(5,3) = %u %u %u %u\n", bad[0], c[0], c[1],
+                    c[2], c[3]);
+        std::printf("r32 uint cube (uint view): %u bad, face 4 texel(5,3) = %u\n", bad[1],
+                    static_cast<const uint32_t*>(cube_rbp[1])[at]);
+        std::printf("r32 sint cube (sint view): %u bad, face 4 texel(5,3) = %d\n", bad[2],
+                    static_cast<const int32_t*>(cube_rbp[2])[at]);
+        return (bad[0] || bad[1] || bad[2]) ? 1 : 0;
+    }
     if (signed_zero) {
         constexpr uint32_t neg = 0x80000000;
         constexpr uint32_t stores[] = {neg, 0, 0, 0, neg, 0x3f800000, 0, 0, neg, neg, 0, 0};

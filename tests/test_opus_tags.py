@@ -371,7 +371,7 @@ class TestFolder(unittest.TestCase):
         path = Path(self.names)
         for header, code in (("", 2), ("wave,text_en", 2), ("bank,stream_id,name", 0)):
             with self.subTest(header=header):
-                path.write_text(header + "\n" if header else "", encoding="utf-8")
+                path.write_text(header + "\n" if header else "", encoding="utf-8", newline="\n")
                 r = subprocess.run([sys.executable, "-I", TOOL, self.opus, "--names", self.names],
                                    capture_output=True, text=True)
                 self.assertEqual(r.returncode, code, r.stderr)
@@ -413,6 +413,73 @@ class TestFolder(unittest.TestCase):
         self.assertEqual(len(r.stderr.strip().splitlines()), 1)
         self.assertIn("line 2", r.stderr)
         self.assertEqual(self.tags("story", "bank_02", "1FFFFFFF.ogg"), [])
+
+    def assert_duplicate_headers_refused(self, option, contents, duplicates, *extra):
+        path = os.path.join(self.tmp.name, "duplicate.csv")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(contents)
+        ogg = Path(os.path.join(self.opus, "story", "bank_02", "1FFFFFFF.ogg"))
+        make_ogg(ogg, stream_id=0x1FFFFFFF)
+        os.utime(ogg, (1000000000, 1000000000))
+        original = ogg.read_bytes()
+        mtime = ogg.stat().st_mtime_ns
+        inputs = {"--names": self.names, "--dialogue": self.dialogue, option: path}
+        args = [arg for pair in inputs.items() for arg in pair]
+        result = subprocess.run([sys.executable, "-I", TOOL, self.opus, *args, *extra],
+                                capture_output=True, text=True)
+        self.assertTrue(ogg.read_bytes() == original, "tagging changed the Ogg file")
+        self.assertEqual(ogg.stat().st_mtime_ns, mtime)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr.splitlines(), [
+            f"opus_tags: error: cannot read a CSV: {path}: duplicate CSV column headers: "
+            + ", ".join(map(repr, duplicates)),
+        ])
+
+    def test_cli_rejects_duplicate_names_headers_before_tagging(self):
+        for contents, duplicates, extra in [
+            ("bank,stream_id,name,name\nbank_02,1fffffff,first,second\n", ("name",), ()),
+            ("\ufeffbank,bank,stream_id,name\nother,bank_02,1fffffff,second\n", ("bank",), ()),
+            ("bank,stream_id,stream_id,name\nbank_02,123,1fffffff,second\n", ("stream_id",), ()),
+            ("source,source,bank,stream_id,name\nother,story,bank_02,1fffffff,second\n",
+             ("source",), ("--source", "story")),
+            ("bank,stream_id,name,name,bank,source,source,notes,notes\n", ("bank", "name", "source"), ()),
+        ]:
+            with self.subTest(duplicates=duplicates, extra=extra):
+                self.assert_duplicate_headers_refused("--names", contents, duplicates, *extra)
+
+    def test_cli_rejects_duplicate_dialogue_headers_before_tagging(self):
+        for field in ("wave", "label", "speaker", "text_en", "text_zz"):
+            with self.subTest(field=field):
+                contents = (f"wave,label,speaker,text_en,text_zz,{field}\n"
+                            "heistau_abcd_01,LINE,VOICE,Hello.,Invented text.,other\n")
+                self.assert_duplicate_headers_refused("--dialogue", contents, (field,))
+
+    def test_cli_ignores_extra_headers_without_changing_tags(self):
+        args = [sys.executable, "-I", TOOL, self.opus, "--names", self.names, "--source", "story",
+                "--dialogue", self.dialogue]
+        streams = list(Path(self.opus).rglob("*.ogg"))
+        originals = [path.read_bytes() for path in streams]
+        baseline = subprocess.run(args, capture_output=True, text=True)
+        self.assertEqual(baseline.returncode, 0, baseline.stderr)
+        expected = [path.read_bytes() for path in streams]
+        self.assertNotEqual(expected, originals)
+        for path, original in zip(streams, originals):
+            path.write_bytes(original)
+
+        for path, extra in [(self.names, ["notes", "notes", "Name", " name"]),
+                            (self.dialogue, ["key", "Notes", " wave"])]:
+            with open(path, encoding="utf-8", newline="") as f:
+                rows = list(csv.reader(f))
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                writer = csv.writer(f, lineterminator="\n")
+                writer.writerow(rows[0] + extra)
+                writer.writerows(row + ["ignored"] * len(extra) for row in rows[1:])
+
+        result = subprocess.run(args, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, baseline.stdout)
+        self.assertEqual([path.read_bytes() for path in streams], expected)
 
 
 if __name__ == "__main__":

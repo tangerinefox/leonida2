@@ -132,6 +132,24 @@ using ConsoleDescriptorHeapHandler = HRESULT (*)(ID3D12Device* real, const D3D12
                                                 REFIID riid, void** out);
 void set_console_descriptor_heap_handler(ConsoleDescriptorHeapHandler handler);
 
+// Presentation wiring: connects device frame-event slots (78/79/80/81: SetFrameIntervalX, ScheduleFrameEventX,
+// WaitFrameEventX, GetFrameStatisticsX; 81 is LEONIDA_XS_FRAME_STATISTICS_SLOT) and queue presentation slots (PresentX
+// at 30, or LEONIDA_XS_PRESENT_X_SLOT; SuspendX and ResumeX are routed only when LEONIDA_XS_SUSPEND_X_SLOT /
+// LEONIDA_XS_RESUME_X_SLOT are set) to an external presenter such as rt::d3d12::XboxPresentation without coupling
+// d3d12_xs_device to Vulkan headers. Passing nullptr detaches the handler and restores the default mock/fallback
+// behavior.
+struct PresentationHandler {
+    void* context = nullptr;
+    HRESULT (*set_frame_interval)(void* context, IUnknown* output, UINT interval_us, UINT latency, UINT flags) = nullptr;
+    HRESULT (*schedule_frame_event)(void* context, UINT event, UINT offset_us, UINT flags) = nullptr;
+    HRESULT (*wait_frame_event)(void* context, UINT event, DWORD timeout_ms, UINT flags, std::uint64_t* token) = nullptr;
+    HRESULT (*get_frame_statistics)(void* context, std::uint64_t token, UINT type_mask, UINT* count, void* out) = nullptr;
+    HRESULT (*present_x)(void* context, UINT plane_count, const void* planes, const void* params) = nullptr;
+    HRESULT (*suspend_x)(void* context, UINT flags) = nullptr;
+    HRESULT (*resume_x)(void* context) = nullptr;
+};
+bool set_presentation_handler(void* device, const PresentationHandler* handler);
+
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
 // proxies), 9 (allocator proxies), 14, 26 (the console's struct-return form),
 // 31/34/35/45/46/50 (proxies unwrapped), 32 and 36 (fence proxies), 48/73 and

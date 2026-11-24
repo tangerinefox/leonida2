@@ -310,6 +310,103 @@ int main() {
         dst_buf = saved_dst;
     }
 
+    // 6. tile_footprint unaligned staging honors format alignment (8B, 16B, BC1) and 3D slice layout.
+    {
+        const auto saved_src = src_buf, saved_dst = dst_buf;
+        VkDeviceSize scratch_req = 0;
+        vk.copy_scratch = [&](std::uint64_t bytes, VkBuffer& buf, VkDeviceSize& off) {
+            scratch_req = bytes;
+            buf = handle<VkBuffer>(0xA000);
+            off = 256;
+            return true;
+        };
+
+        ResourceBinding rgba16f_img{};
+        rgba16f_img.image = handle<VkImage>(6);
+        rgba16f_img.format = VK_FORMAT_R16G16B16A16_SFLOAT;  // 8 bytes/texel
+        rgba16f_img.aspects = VK_IMAGE_ASPECT_COLOR_BIT;
+        rgba16f_img.width = 8;
+        rgba16f_img.height = 4;
+        rgba16f_img.mip_levels = 1;
+        rgba16f_img.array_layers = 1;
+        rgba16f_img.depth = 2;
+        rgba16f_img.volume = true;
+        rgba16f_img.samples = 1;
+
+        ResourceBinding bc1_img{};
+        bc1_img.image = handle<VkImage>(7);
+        bc1_img.format = VK_FORMAT_BC1_RGBA_UNORM_BLOCK;  // 8 bytes per 4x4 block
+        bc1_img.aspects = VK_IMAGE_ASPECT_COLOR_BIT;
+        bc1_img.width = 12;
+        bc1_img.height = 8;
+        bc1_img.mip_levels = 1;
+        bc1_img.array_layers = 1;
+        bc1_img.depth = 1;
+        bc1_img.samples = 1;
+
+        const auto resolve_tile = [&](ResourceId id) -> const ResourceBinding* {
+            if (id == 6) return &rgba16f_img;
+            if (id == 7) return &bc1_img;
+            return resolve(id);
+        };
+
+        // 6a. 8-byte 3D texture with bufferOffset = 4 (4-byte aligned, NOT 8-byte aligned): must stage both slices.
+        src_buf.buffer_offset = 0;
+        src_buf.size = 4096;
+        {
+            const CopyLocation tex{6, false, 0, 0, 0, 0, 0, 0};
+            // footprint: width=8, height=4, depth=2, row_pitch=256 (32 texels/row, slice_pitch=1024), offset=4
+            const CopyLocation fp{1, true, 0, 4, 8, 4, 2, 256};
+            CopyTexture copy{tex, 0, 0, 0, fp, true, {0, 0, 0, 4, 2, 2}};  // 4x2x2 texels -> 32B/row, 2 rows, 2 slices = 128B
+            copy.tile_footprint = true;
+            CommandList list;
+            expect(list.copy_texture(copy) && list.close(), "record 8B 3D tile_footprint upload");
+            buffer_copies.clear();
+            b2i_copies.clear();
+            scratch_req = 0;
+            expect(replay(list, VK_NULL_HANDLE, resolve_tile, vk) == ReplayResult::success,
+                   "8B 3D tile_footprint upload with offset=4 replays");
+            expect(scratch_req == 128, "8B 3D tile_footprint allocates 4*8 * 2 * 2 = 128 bytes of scratch");
+            expect(buffer_copies.size() == 4, "8B 3D tile_footprint stages 2 rows x 2 slices");
+            expect(buffer_copies.size() == 4 &&
+                       buffer_copies[0].srcOffset == 4 && buffer_copies[0].dstOffset == 256 && buffer_copies[0].size == 32 &&
+                       buffer_copies[1].srcOffset == 260 && buffer_copies[1].dstOffset == 288 && buffer_copies[1].size == 32 &&
+                       buffer_copies[2].srcOffset == 1028 && buffer_copies[2].dstOffset == 320 && buffer_copies[2].size == 32 &&
+                       buffer_copies[3].srcOffset == 1284 && buffer_copies[3].dstOffset == 352 && buffer_copies[3].size == 32,
+                   "8B 3D tile_footprint row/slice strides match 256B row_pitch and 1024B slice_pitch");
+            expect(b2i_copies.size() == 1 && b2i_copies[0].bufferOffset == 256 &&
+                       b2i_copies[0].bufferRowLength == 0 && b2i_copies[0].bufferImageHeight == 0,
+                   "8B 3D tile_footprint emits aligned scratch offset and clears row/image height");
+        }
+
+        // 6b. BC1 (8B per 4x4 block) with bufferOffset = 4: must stage 2x2 blocks = 32B, not texels*4.
+        {
+            const CopyLocation tex{7, false, 0, 0, 0, 0, 0, 0};
+            // footprint: width=12 (3 blocks), height=8 (2 blocks), row_pitch=256 (32*8B), offset=4
+            const CopyLocation fp{1, true, 0, 4, 12, 8, 1, 256};
+            CopyTexture copy{tex, 0, 0, 0, fp, true, {0, 0, 0, 8, 8, 1}};  // 2x2 blocks: 16B/row, 2 rows = 32B
+            copy.tile_footprint = true;
+            CommandList list;
+            expect(list.copy_texture(copy) && list.close(), "record BC1 tile_footprint upload");
+            buffer_copies.clear();
+            b2i_copies.clear();
+            scratch_req = 0;
+            expect(replay(list, VK_NULL_HANDLE, resolve_tile, vk) == ReplayResult::success,
+                   "BC1 tile_footprint upload with offset=4 replays");
+            expect(scratch_req == 32, "BC1 tile_footprint allocates 2*8 * 2 = 32 bytes of scratch");
+            expect(buffer_copies.size() == 2 &&
+                       buffer_copies[0].srcOffset == 4 && buffer_copies[0].dstOffset == 256 && buffer_copies[0].size == 16 &&
+                       buffer_copies[1].srcOffset == 260 && buffer_copies[1].dstOffset == 272 && buffer_copies[1].size == 16,
+                   "BC1 tile_footprint copies 16B block rows at 256B pitch");
+            expect(b2i_copies.size() == 1 && b2i_copies[0].bufferOffset == 256 && b2i_copies[0].bufferRowLength == 0,
+                   "BC1 tile_footprint emits aligned scratch offset");
+        }
+
+        vk.copy_scratch = {};
+        src_buf = saved_src;
+        dst_buf = saved_dst;
+    }
+
     if (failures) return 1;
     std::printf("replay_copy_offset: CopyResource and CopyTexture apply ResourceBinding::buffer_offset\n");
     return 0;

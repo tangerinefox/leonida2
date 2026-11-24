@@ -133,7 +133,13 @@ public:
     // update ignores `pair`.
     bool record_blas(VkCommandBuffer cb, const XdxrLayout& layout, const std::vector<XdxrTriangles>& geometries,
                      std::uint64_t dst, std::uint64_t scratch, std::uint64_t update_from = 0, bool pair = false) {
-        if (!loaded_ || layout.tlas) return false;
+        if (!loaded_ || layout.tlas || !layout.size || !dst || !scratch) return false;
+        std::uint64_t total = 0;
+        for (const auto& geo : geometries) {
+            total += geo.triangle_count;
+            if (total > layout.elements) return false;
+        }
+        if (total != layout.elements) return false;
         Push p = base(layout, dst, scratch);
         if (pair && !update_from) p.flags |= flag_pair;
         if (update_from) refit_begin(cb, layout, p, update_from); else begin(cb, layout, p);
@@ -155,7 +161,6 @@ public:
             dispatch(cb, t, t.count);
             first += geo.triangle_count;
         }
-        if (first != layout.elements) return false;
         if (update_from) refit_finish(cb, layout, p); else finish(cb, layout, p);
         return true;
     }
@@ -164,7 +169,8 @@ public:
     // `update_from`: as for record_blas; the instances may move, and name other BLASes.
     bool record_tlas(VkCommandBuffer cb, const XdxrLayout& layout, std::uint64_t instances, std::uint64_t dst,
                      std::uint64_t scratch, std::uint64_t bias = 0, std::uint64_t update_from = 0) {
-        if (!loaded_ || !layout.tlas) return false;
+        if (!loaded_ || !layout.tlas || !layout.size || !dst || !scratch || (layout.elements && !instances))
+            return false;
         Push p = base(layout, dst, scratch);
         p.bias = split(bias);
         if (update_from) refit_begin(cb, layout, p, update_from); else begin(cb, layout, p);
@@ -341,7 +347,7 @@ private:
     // dependency on its results to the caller's barrier (the application's UAV or AS barrier).
     void dispatch(VkCommandBuffer cb, const Push& p, std::uint32_t threads, bool barrier = true) {
         vk_.vkCmdPushConstants(cb, layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Push), &p);
-        vk_.vkCmdDispatch(cb, (threads + 63) / 64, 1, 1);
+        vk_.vkCmdDispatch(cb, std::uint32_t((std::uint64_t(threads) + 63u) / 64u), 1, 1);
         if (!barrier) return;
         VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         b.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;

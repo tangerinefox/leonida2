@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -570,6 +571,10 @@ int main() {
     broken.resize(100);  // truncated
     CHECK(!zlib_inflate(broken, out));
     CHECK(!zlib_inflate(dynamic, out, 599));  // larger than the limit
+    const auto max_limit = (std::numeric_limits<std::size_t>::max)();
+    CHECK(zlib_inflate(stored, out, max_limit) && out.size() == 40);
+    CHECK(zlib_inflate(fixed, out, max_limit) && out == bytes("hello hello hello leonida"));
+    CHECK(zlib_inflate(dynamic, out, max_limit) && out == skewed(600));
     CHECK(!zlib_inflate(bytes("not zlib"), out));
 
     Json json;
@@ -642,7 +647,9 @@ int main() {
                  "{\"semantic\": \"TEXCOORD\", \"semantic_index\": 3, \"register\": -1, \"system_value\": 0, "
                  "\"component_type\": \"float\"}]},\n"
                  " \"ps_out\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << hash << "\", \"inputs\": [0, 1, 28, 29], "
-                 "\"outputs\": [0, 2], \"f16_halves\": {\"0\": [28, 29], \"bad\": [1], \"7\": [20, 21]}},\n"
+                 "\"outputs\": [0, 2], \"f16_halves\": {\"0\": [28, 29], \"bad\": [1], \"-1\": [1, 2], "
+                 "\"+2\": [3, 4], \" 3\": [5, 6], \"4294967296\": [9, 10], \"99999999999999999999\": [11, 12], "
+                 "\"7\": [20, 21]}},\n"
                  " \"ps_native\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << hash2 << "\", \"wave64\": true, "
                  "\"subgroup_size\": 64},\n"
                  " \"cs_emulated\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << hash2 << "\", \"wave64\": true, "

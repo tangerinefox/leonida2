@@ -72,6 +72,7 @@ def parse_startup(path: str, limit: int = 10) -> dict:
         "int3_skipped": [],
         "exceptions": [],
         "exception_count": 0,
+        "xmem_physical_pages": [],
         "exit": None,
         "error": None,
     }
@@ -165,6 +166,30 @@ def parse_startup(path: str, limit: int = 10) -> dict:
                     trace["exceptions"].append(detail)
                 else:
                     trace["exceptions"][-1] = detail
+            elif kind == "xmem_physical_pages":
+                samples = trace["xmem_physical_pages"]
+                if len(samples) < limit:
+                    attributes = event.get("attributes")
+                    pages = event.get("pages")
+                    record = {
+                        "attributes": (
+                            attributes
+                            if isinstance(attributes, str) and re.fullmatch(r"0x[0-9a-fA-F]{1,16}", attributes)
+                            else None
+                        ),
+                        "pages": pages if type(pages) is int and 0 <= pages < (1 << 64) else None,
+                    }
+                    for key in ("api", "caller"):
+                        value = event.get(key)
+                        record[key] = (
+                            value
+                            if isinstance(value, str)
+                            and bool(value.strip())
+                            and not any(ord(ch) < 0x20 or 0x7F <= ord(ch) <= 0x9F or ch in ("\u2028", "\u2029")
+                                        for ch in value)
+                            else None
+                        )
+                    samples.append(record)
             elif kind == "exit":
                 trace["exit"] = event.get("code")
             elif kind == "error":
@@ -262,8 +287,10 @@ def counts_only(summary: dict) -> dict:
 
 
 def _tail(items, limit: int) -> str:
-    shown = ", ".join(str(x) for x in items[:limit])
-    return shown + (f", ... {len(items) - limit} more" if len(items) > limit else "")
+    shown = [str(x) for x in items[:limit]]
+    if len(items) > limit:
+        shown.append(f"... {len(items) - limit} more")
+    return ", ".join(shown)
 
 
 def format_text(summary: dict, limit: int) -> str:
@@ -278,7 +305,8 @@ def format_text(summary: dict, limit: int) -> str:
             kinds = ", ".join(f"{k} {v}" for k, v in sorted(startup["kinds"].items()))
             out.append(f"  kinds: {kinds}")
         if startup["modules"]:
-            names = [m["module"] for m in startup["modules"]]
+            # A relocated module is marked: triage step 1 asks whether the executable sits at its preferred base.
+            names = [m["module"] + (" (relocated)" if m.get("relocated") else "") for m in startup["modules"]]
             out.append(f"  modules ({len(names)}): {_tail(names, limit)}")
         out.append(f"  tls callbacks: {startup['tls_callbacks']}")
         if callback := startup.get("last_tls_callback"):
@@ -331,6 +359,17 @@ def format_text(summary: dict, limit: int) -> str:
                 out.append(f"    code {exc['code']} at {exc['at']}{detail}")
                 if exc.get("stack"):
                     out.append(f"      stack: {_tail(exc['stack'], limit)}")
+        if count := startup["kinds"].get("xmem_physical_pages"):
+            out.append(f"  XMem physical page observations: {count}")
+            shown = startup.get("xmem_physical_pages", [])[:limit]
+            for item in shown:
+                pages = item["pages"] if item["pages"] is not None else "?"
+                out.append(
+                    f"    {item['api'] or '?'} attributes {item['attributes'] or '?'}"
+                    f" requested {pages} pages from {item['caller'] or '?'}"
+                )
+            if len(shown) < count:
+                out.append(f"    ... {count - len(shown)} more")
         if startup["error"]:
             out.append(f"  error: {startup['error']}")
         if startup["exit"] is not None:
@@ -385,14 +424,14 @@ def main(argv=None) -> int:
     ap.add_argument("--json", action="store_true", help="print the summary as JSON")
     ap.add_argument("--counts-only", action="store_true", help="print aggregate JSON without paths or event details")
     ap.add_argument(
-        "--limit", type=int, default=10, help="items listed per section (default 10)"
+        "--limit", type=int, default=10, help="items listed per section (default 10; 0 omits XMem observation lists)"
     )
     a = ap.parse_args(argv)
     if not a.startup and not a.d3d12:
         print("error: give the startup trace, --d3d12, or both", file=sys.stderr)
         return 2
-    if a.limit < 1:
-        print("error: --limit must be at least 1", file=sys.stderr)
+    if a.limit < 0:
+        print("error: --limit must be non-negative", file=sys.stderr)
         return 2
     summary = summarize(None, None)
     exit_code = 0

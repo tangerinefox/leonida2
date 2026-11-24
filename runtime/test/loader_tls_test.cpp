@@ -790,7 +790,8 @@ void test_ga_tls_existing_thread(const fs::path& exe) {
     {
         rt::Loader loader(exe.parent_path());
         rt::Module& m = loader.load(exe);
-        check(m.tls_index != 0, "the /GA fixture gets a module TLS index other than the process EXE's 0");
+        check(m.tls_index != rt::kNoTlsIndex && m.tls_index != 0,
+              "the /GA fixture gets a valid module TLS index other than the process EXE's 0");
         check(m.tls_ga_slot != rt::kNoTlsIndex, "load() rewrites the /GA fixture's index-0 TLS reads");
         get = find_export<int(__cdecl*)()>(m, "ga_tls_get");
         set = find_export<void(__cdecl*)(int)>(m, "ga_tls_set");

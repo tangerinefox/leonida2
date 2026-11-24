@@ -404,7 +404,7 @@ def check_iid_order():
 
 
 def find_sdk_include():
-    """Return (um_dir, shared_dir) for the newest installed Windows SDK, or (None, None)."""
+    """Return (um_dir, shared_dir) for the newest installed Windows SDK with the D3D headers, or (None, None)."""
     env = os.environ.get("WINDOWS_SDK_INCLUDE") or os.environ.get("SDK_INCLUDE")
     if env:
         candidates = [env]
@@ -420,7 +420,9 @@ def find_sdk_include():
         path = os.path.normpath(path)                 # "...\um\" has an empty basename
         um = path if os.path.basename(path).lower() == "um" else os.path.join(path, "um")
         shared = os.path.join(os.path.dirname(um), "shared")
-        if os.path.isdir(um):
+        # A Windows Driver Kit installs its own version folder (10.0.26100.0 beside an SDK's 10.0.19041.0, say) that
+        # holds only driver headers; take the newest folder that has the D3D headers, not the newest one there is.
+        if os.path.isdir(um) and (env or os.path.isfile(os.path.join(um, "d3d12.h"))):
             name = os.path.basename(os.path.dirname(um))
             try:
                 key = (1, tuple(map(int, name.split("."))))

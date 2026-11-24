@@ -152,6 +152,56 @@ class OracleLifecycleTest(unittest.TestCase):
         self.assertEqual(rc, 77)
         self.assertIn("no device", buf.getvalue())
 
+    def test_hw_poison_returns_2_and_closes(self):
+        import struct
+        import tsharp
+
+        for poisoned_wave in (32, 64):
+            class FakeOracle:
+                device = "fake-gpu"
+                arch = "gfx1036"
+                closed = False
+
+                def run(self, kernels):
+                    k = kernels[0]
+                    if k.wave == poisoned_wave:
+                        return [[tsharp.POISON] * k.words]
+                    text = "\n".join(k.lines)
+                    dim = "2d" if "SQ_RSRC_IMG_2D" in text else "3d"
+                    rows = [r for r in p.ROWS if r[1] == dim]
+                    return [[struct.unpack("<I", struct.pack("<f", p.expected(dim, s, o)))[0]
+                             for _n, _d, s, o in rows]]
+
+                def close(self):
+                    self.closed = True
+
+            fake = FakeOracle()
+            with self.subTest(poisoned_wave=poisoned_wave):
+                rc, out = self._run_hw(fake)
+                self.assertEqual(rc, 2)
+                self.assertTrue(fake.closed)
+                self.assertIn("POISON", out)
+                self.assertNotIn("DIFFERS", out)
+
+    def test_hw_unsupported_arch_returns_2_and_closes(self):
+        class FakeOracle:
+            device = "fake-rdna4"
+            arch = "gfx1200"
+            closed = False
+
+            def run(self, kernels):
+                raise AssertionError("run() should not be called for an unsupported arch")
+
+            def close(self):
+                self.closed = True
+
+        fake = FakeOracle()
+        rc, out = self._run_hw(fake)
+        self.assertEqual(rc, 2)
+        self.assertTrue(fake.closed)
+        self.assertIn("cannot build", out)
+        self.assertIn("gfx1200", out)
+
 
 if __name__ == "__main__":
     unittest.main()

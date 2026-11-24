@@ -50,6 +50,8 @@
 	buffer_load_dword v8, v20, s[0:3], 0 offen glc
 	v_mov_b32_e32 v20, 0x44
 	buffer_load_dword v9, v20, s[0:3], 0 offen glc
+	v_mov_b32_e32 v20, 0x48
+	buffer_load_dword v6, v20, s[0:3], 0 offen glc
 	s_waitcnt vmcnt(0)
 	v_mov_b32_e32 v20, 0
 	buffer_store_dword v14, v20, s[0:3], 0 offen

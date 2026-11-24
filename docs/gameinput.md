@@ -16,6 +16,14 @@ a pad attached. The test skips only where Windows cannot load `GameInput.dll`; w
 so whether it imports GameInput this way, and under which
 module, is unverified (see [VERIFY](#verify)).
 
+### Diagnosing a native host failure
+
+If `gameinput_host` binds to the host DLL but `GameInputCreate` fails, call `GameInputCreate` directly from the absolute
+`%WINDIR%\System32\GameInput.dll` path, outside the mapped path. A matching failure shows that the call can fail
+without Leonida's loader, but does not identify the underlying cause or rule out every concurrent loader issue. A
+failed call alone is not evidence that the GameInput service is absent or stopped. Once Windows loads the DLL, keep
+the host test failure visible; do not skip it.
+
 ## Building
 
 The shim is optional, and the build downloads nothing unless asked. SDL3 is zlib-licensed. CMake builds the shim when

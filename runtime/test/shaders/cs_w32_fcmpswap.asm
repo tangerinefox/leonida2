@@ -8,7 +8,8 @@
 ;   out[4] = buffer_atomic_fcmpswap glc old value (M -0 at byte 0x40, DATA 3.0, CMP +0)   = 0x80000000
 ;   out[5] = the word at byte 0x40 after it: -0 == +0                                     = 0x40400000
 ;   out[6] = the word at byte 0x44 after fcmpswap (M 1.0, DATA 2.0, CMP 0x3F800001)       = 0x3F800000
-;   out[7] = buffer_atomic_fcmpswap glc old value (M NaN at byte 0x48, DATA 1.0, CMP NaN) = 0x7FC00000
+;   out[7] = the word at byte 0x48 after fcmpswap (M NaN, DATA 1.0, CMP the same NaN)     = 0x7FC00000
+; The NaN case reads memory after the atomic: its returned old value is NaN whether or not the comparison matched.
 ; The atomic words are seeded with buffer_store_dword first. EXEC is cut to lane 0 before any memory op (one address
 ; per op, #1850).
 ; group: 32,1,1
@@ -65,6 +66,8 @@ v_mov_b32_e32 v20, 0x40
 buffer_load_dword v8, v20, s[0:3], 0 offen glc
 v_mov_b32_e32 v20, 0x44
 buffer_load_dword v9, v20, s[0:3], 0 offen glc
+v_mov_b32_e32 v20, 0x48
+buffer_load_dword v6, v20, s[0:3], 0 offen glc
 s_waitcnt vmcnt(0)
 v_mov_b32_e32 v20, 0
 buffer_store_dword v14, v20, s[0:3], 0 offen

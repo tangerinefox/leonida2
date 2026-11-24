@@ -494,7 +494,8 @@ void* find(const std::string& dll_lower, const std::string& name) {
 
 bool owns_dll(const std::string& dll_lower) {
     static const char* const host[] = {"kernel32.dll", "kernelbase.dll", "msvcrt.dll", "ucrtbase.dll", "ucrtbased.dll",
-                                       "vulkan-1.dll", "ntdll.dll", "user32.dll"};
+                                       "vulkan-1.dll", "ntdll.dll", "user32.dll", "ws2_32.dll",
+                                       "wsock32.dll"};
     if (starts_with(dll_lower, "api-ms-") || starts_with(dll_lower, "ext-ms-")) return false;
     for (const char* h : host)
         if (dll_lower == h) return false;

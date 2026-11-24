@@ -35,6 +35,11 @@ function Find-BuildTool([string]$Preferred, [string]$CommandName, [scriptblock]$
 }
 
 $root = Split-Path $PSScriptRoot -Parent
+# A % in the checkout path cannot build: cmd.exe expands %...% in _build.cmd, and cl.exe rejects a % in the
+# path-valued /D definitions of the test targets (D8038) however it is quoted. Say so before anything starts.
+if ($root.Contains('%')) {
+    throw "The checkout path '$root' contains '%', and the runtime can't be built from there (cmd.exe and cl.exe treat % specially). Move or clone the checkout to a folder without % in its path (docs/testing.md, Known problems)."
+}
 $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer"
 $vs = & "$installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
 if (-not $vs) { throw "Visual Studio with the C++ x64 tools wasn't found." }
@@ -78,10 +83,10 @@ $build || exit /b 1
 } else {
     # Keep this list in step with runtime\CMakeLists.txt. Optional parts that need a dependency are left out here:
     # the GameInput shim (SDL3), so controllers go through the host's GameInput.dll, if any, as without the shim.
-    Write-Warning "CMake and Ninja weren't found (neither VS C++ CMake tools nor native PATH tools): building with cl.exe directly, without the GameInput shim (SDL3). Install CMake + Ninja or VS's CMake tools component to get it."
+    Write-Warning "CMake and Ninja weren't found (neither VS C++ CMake tools nor native PATH tools): building with cl.exe directly, without the GameInput shim (SDL3) and without the Rust XMA2 decoder (XMA voices are silent). Install CMake + Ninja or VS's CMake tools component to get it."
     $xtaskqueueDir = Join-Path $root "third_party\xtaskqueue"
     $xtaskqueueFiles = "Source\Task\TaskQueue.cpp", "Source\Task\AsyncLib.cpp", "Source\Task\ThreadPool_win32.cpp", "Source\Task\WaitTimer_win32.cpp" | ForEach-Object { "`"$xtaskqueueDir\$_`"" }
-    $files = "src\main.cpp", "src\host_cpu.cpp", "src\pe_loader.cpp", "shims\registry.cpp", "shims\file_system.cpp", "shims\xmem.cpp", "shims\xg_xs.cpp", "shims\acphal.cpp", "shims\d3d12_xs.cpp", "shims\d3d12_xs_device.cpp", "shims\d3d12_xs_rootsig.cpp", "shims\xgameruntime.cpp", "shims\xgameruntime_user.cpp", "shims\xgameruntime_gamesave.cpp", "shims\xgameruntime_store.cpp", "shims\xgameruntime_offline.cpp", "shims\winhttp_offline.cpp", "shims\library_loader.cpp", "shims\process.cpp", "shims\com_shim.cpp", "shims\bcrypt_rng.cpp", "shims\xapu_chad.cpp", "shims\dstorage.cpp" | ForEach-Object { "`"$src\$_`"" }
+    $files = "src\main.cpp", "src\host_cpu.cpp", "src\pe_loader.cpp", "shims\registry.cpp", "shims\file_system.cpp", "shims\xmem.cpp", "shims\xg_xs.cpp", "shims\acphal.cpp", "shims\d3d12_xs.cpp", "shims\d3d12_xs_device.cpp", "shims\d3d12_xs_rootsig.cpp", "shims\xgameruntime.cpp", "shims\xgameruntime_user.cpp", "shims\xgameruntime_gamesave.cpp", "shims\xgameruntime_store.cpp", "shims\xgameruntime_offline.cpp", "shims\winhttp_offline.cpp", "shims\ws2_offline.cpp", "shims\library_loader.cpp", "shims\process.cpp", "shims\com_shim.cpp", "shims\bcrypt_rng.cpp", "shims\xapu_chad.cpp", "shims\dstorage.cpp" | ForEach-Object { "`"$src\$_`"" }
     $includes = "/I `"$src\src`" /I `"$src\shims`" /I `"$src\shims\xtaskqueue`" /I `"$xtaskqueueDir\Include`" /I `"$xtaskqueueDir\Source\Task`" /I `"$xtaskqueueDir\Source\Common`""
     $opt = if ($Debug) { "/Od /MDd" } else { "/O2 /MD" }
     $body = @"

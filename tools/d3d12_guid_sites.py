@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import math
 import os
 import re
 import struct
@@ -198,11 +199,25 @@ class Image:
         return slots
 
 
+def _looks_like_float4(blob: bytes) -> bool:
+    """True when 16 bytes decode as four finite small/zero IEEE-754 float32 lanes (SIMD constant)."""
+    nonzero = 0
+    for u, f in zip(struct.unpack_from("<4I", blob), struct.unpack_from("<4f", blob)):
+        if u in (0, 0x80000000):
+            continue
+        if not math.isfinite(f) or not (1e-4 <= abs(f) <= 1e5):
+            return False
+        nonzero += 1
+    return nonzero >= 2
+
+
 def guid_shaped(blob: bytes) -> bool:
     """A plausible RFC-4122 GUID: version nibble 1-5, variant 10xx, and not all-zero/constant."""
     if len(blob) < 16 or blob[:4] == b"\0\0\0\0":
         return False
     if blob[:4] == b"DXBC":  # an embedded shader container, whose header hashes parse as GUID-shaped
+        return False
+    if _looks_like_float4(blob):  # SIMD float4 constants (e.g. 1.0f/1.5f) share version-3/4 nibbles
         return False
     version = blob[7] >> 4
     variant = blob[8] >> 6

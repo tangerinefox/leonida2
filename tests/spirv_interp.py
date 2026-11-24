@@ -205,7 +205,11 @@ def run(spvasm):
         "OpIEqual": lambda a, b: a == b, "OpINotEqual": lambda a, b: a != b,
     }
 
-    F64 = {"OpFAdd": lambda a, b: a + b, "OpFSub": lambda a, b: a - b, "OpFMul": lambda a, b: a * b}
+    # Without an entry here a binary64 op falls through to ARITH and is rounded to binary32: until OpFDiv was added,
+    # the translated v_rcp_f64 of 3.0 gave 0x3fd5555560000000 (1/3 as a binary32) and of 1e300 gave 0.
+    F64 = {"OpFAdd": lambda a, b: a + b, "OpFSub": lambda a, b: a - b, "OpFMul": lambda a, b: a * b,
+           "OpFDiv": lambda a, b: a / b if b else
+           math.copysign(math.inf, math.copysign(1.0, a) * math.copysign(1.0, b)) if a and not math.isnan(a) else math.nan}
 
     def float_bits(rt):
         t = types.get(rt)
@@ -330,6 +334,11 @@ def run(spvasm):
             val[res] = x if float_bits(args[0]) == 64 else f32(x)
         elif op == "OpConvertSToF":
             x = float(s32(get(args[1])))
+            val[res] = x if float_bits(args[0]) == 64 else f32(x)
+        elif op == "OpFConvert":
+            # binary64 -> binary32 rounds to nearest even (past the binary32 range: infinity); binary32 -> binary64 is
+            # exact. v_cvt_f32_f64 and v_cvt_f64_f32 are this.
+            x = float(get(args[1]))
             val[res] = x if float_bits(args[0]) == 64 else f32(x)
         elif op == "OpConvertFToU":
             x = get(args[1]); val[res] = 0 if math.isnan(x) or x <= 0 else M32 if x >= 2**32 else int(x)

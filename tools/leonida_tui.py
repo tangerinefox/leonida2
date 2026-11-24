@@ -5,6 +5,7 @@ No third-party TUI libraries. When stdin/stdout are not TTYs, callers skip this 
 from __future__ import annotations
 
 import contextvars
+import math
 import os
 import shutil
 import subprocess
@@ -328,19 +329,20 @@ def _nt_read_console_key(timeout_s: float) -> str | None:
         _fields_ = [("EventType", wintypes.WORD), ("Event", INPUT_UNION)]
 
     kernel32 = ctypes.windll.kernel32
-    timeout_ms = 0 if timeout_s <= 0 else max(1, int(timeout_s * 1000))
-    deadline = time.monotonic() + max(0.0, timeout_s)
+    deadline = time.monotonic() + timeout_s if timeout_s > 0 else None
 
     while True:
         if _nt_key_queue:
             return _nt_key_queue.popleft()
-        wait = kernel32.WaitForSingleObject(handle, timeout_ms if timeout_s > 0 else 0)
-        if wait != 0:  # WAIT_OBJECT_0 == 0
-            if timeout_s <= 0 or time.monotonic() >= deadline:
-                return None
+        timeout_ms = 0
+        if deadline is not None:
+            # Discarded records count against the same wait budget.
             remaining = deadline - time.monotonic()
-            timeout_ms = max(1, int(remaining * 1000))
-            continue
+            if remaining <= 0:
+                return None
+            timeout_ms = math.ceil(remaining * 1000)
+        if kernel32.WaitForSingleObject(handle, timeout_ms) != 0:  # WAIT_OBJECT_0 == 0
+            return None
         rec = INPUT_RECORD()
         nread = wintypes.DWORD()
         if not kernel32.ReadConsoleInputW(handle, ctypes.byref(rec), 1, ctypes.byref(nread)):
@@ -369,14 +371,6 @@ def _nt_read_console_key(timeout_s: float) -> str | None:
             for _ in range(max(0, int(ke.wRepeatCount) - 1)):
                 _nt_key_queue.append(mapped)
             return mapped
-        if timeout_s <= 0:
-            # Non-blocking: keep draining until a useful event or empty.
-            wait = kernel32.WaitForSingleObject(handle, 0)
-            if wait != 0:
-                return None
-            continue
-        if time.monotonic() >= deadline:
-            return None
 
 
 def _parse_sgr_mouse(params: str, trail: str) -> str | None:

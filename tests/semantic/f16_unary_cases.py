@@ -162,15 +162,15 @@ class UnaryF16:
     def test_output_modifiers_and_clamp(self):
         for a in self.MOD_INPUTS:
             base = self.ref(a)
-            # `clamp` of a NaN result is not modelled (the translator emits FClamp; docs/design.md, float min/max/med3 with
-            # NaN), so a NaN result is only checked with the output multipliers.
+            # `clamp` of a NaN result gives +0 (DX10_CLAMP 1 in the game's MODE; Gen.clamp_mods selects +0 for a NaN
+            # before FClamp, docs/design.md, float min/max/med3 with NaN).
             # #4542, measured on gfx1036: an f16 destination ignores omod (mul:2/mul:4/div:2) under the game's MODE
             # (IEEE=0, f16 denormals kept) and keeps clamp (docs/design.md, f16 output modifiers).
             for suffix, want in ((" mul:2", base), (" mul:4", base),
                                  (" div:2", base), (" clamp", clamp01(base)),
                                  (" mul:2 clamp", clamp01(base))):
                 if is_nan(base) and "clamp" in suffix:
-                    continue
+                    want = 0
                 with self.subTest(a=hex(a), mod=suffix):
                     got = run(self.line("_e64") + suffix, {"v1": a})
                     self.assertEqual(got >> 16, OLD >> 16)

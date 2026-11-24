@@ -130,6 +130,7 @@ def main(argv=None):
         return 0
     import asm
     import runner
+    import tsharp
     try:
         oracle = runner.open_oracle()
     except runner.Unavailable as e:
@@ -142,10 +143,18 @@ def main(argv=None):
             rows = [r for r in ROWS if r[1] == dim]
             got = {}
             for wave in (32, 64):
-                res = oracle.run([asm.Kernel(kernel(oracle.arch, dim, rows), wave=wave, threads=1, words=len(rows),
-                                             raw=True, vgprs=16, sgprs=24)])[0]
+                try:
+                    k = asm.Kernel(kernel(oracle.arch, dim, rows), wave=wave, threads=1, words=len(rows),
+                                   raw=True, vgprs=16, sgprs=24)
+                except ValueError as e:
+                    print(f"{dim} wave{wave}: cannot build the kernel: {e}")
+                    return 2
+                res = oracle.run([k])[0]
                 if isinstance(res, str):
                     print(f"{dim} wave{wave}: kernel rejected: {res}")
+                    return 2
+                if any(w == tsharp.POISON for w in res):
+                    print(f"{dim} wave{wave}: the texture did not land 256-byte aligned (POISON)")
                     return 2
                 got[wave] = [struct.unpack("<f", struct.pack("<I", w))[0] for w in res]
             for i, (name, _d, start, off) in enumerate(rows):

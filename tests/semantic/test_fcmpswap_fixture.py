@@ -45,8 +45,16 @@ EXPECTED = [
     cmpst(ONE, TWO, THREE)[1],                              # ds_cmpst_f32, no match
     cmpst(NZ, PZ, THREE)[0], cmpst(NZ, PZ, THREE)[1],       # buffer_atomic_fcmpswap glc: old, then memory
     cmpst(ONE, 0x3F800001, TWO)[1],                         # one ulp off: no match
-    cmpst(NAN, NAN, ONE)[0],                                # glc old value of the NaN case
+    cmpst(NAN, NAN, ONE)[1],                                # memory after the NaN case: unchanged
 ]
+
+
+def run_words(spv):
+    mem = {4 * k: FILL for k in range(64)}
+    si.run_workgroup(spv, 32, 32, inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0),
+                                                         "%sg_lane": i},
+                     push_constants=VSHARP + [0] * 28, memory=mem)
+    return [mem[4 * k] for k in range(8)]
 
 
 class FcmpswapFixture(unittest.TestCase):
@@ -56,13 +64,23 @@ class FcmpswapFixture(unittest.TestCase):
 
     def test_translated_shader(self):
         spv = support.translate_fixture("cs_w32_fcmpswap", fssm=FSSM)
-        mem = {4 * k: FILL for k in range(64)}
-        si.run_workgroup(spv, 32, 32, inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0),
-                                                             "%sg_lane": i},
-                         push_constants=VSHARP + [0] * 28, memory=mem)
+        words = run_words(spv)
         for k, want in enumerate(EXPECTED):
             with self.subTest(word=k):
-                self.assertEqual(mem[4 * k], want)
+                self.assertEqual(words[k], want)
+
+    def test_nan_case_detects_integer_comparison(self):
+        # Integer comparison matches identical NaN bits and stores ONE. Both atomics return the old NaN, so this
+        # negative control catches a fixture that observes only that return instead of memory after the atomic.
+        with open(os.path.join(support.FIXTURE_DIR, "cs_w32_fcmpswap.s"), "rb") as f:
+            listing = f.read()
+        nan_op = b"buffer_atomic_fcmpswap v[6:7], v20, s[0:3], 0 offen glc"
+        self.assertEqual(listing.count(nan_op), 1)
+        listing = listing.replace(nan_op, nan_op.replace(b"fcmpswap", b"cmpswap"))
+        words = run_words(support.translate_listing("cs_w32_fcmpswap", listing, fssm=FSSM))
+        self.assertEqual(words[:-1], EXPECTED[:-1])
+        self.assertEqual(words[-1], ONE)
+        self.assertNotEqual(words, EXPECTED)
 
     def test_gpu_runners_expect_the_same_words(self):
         for rel in (("runtime", "test", "shaders", "check.py"), ("scripts", "run_gpu_tests.py")):

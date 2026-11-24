@@ -10,11 +10,11 @@ disassembled, so this is a byte pattern: a stray `E8` or `E9` inside another ins
 thunk would be counted too, which is rare, and a call that goes through a register (`call rax` after a load of the
 slot) is not seen. Read the counts as a lower bound for indirect uses and an upper bound for direct ones.
 
-With no `--import` and no `--dll`, every import is listed. An import named `#N` is an ordinal import. A `--import` value must
-carry both halves of `DLL!NAME` and a `--dll` value only a DLL name, and both must name an import of the image: a value
-that can match no import is refused instead of being answered with a count of zero. Output is counts and RVAs only, no
-instruction bytes (docs/runtime_imports.md, "The
-retail executable (RT-5)").
+With no `--import` and no `--dll`, ordinary and delay-loaded imports are listed. An import named `#N` is an ordinal
+import. Slots with the same `DLL!NAME` spelling contribute to one row. If both tables claim the same slot RVA, the
+ordinary import takes precedence. An `--import` value must carry both halves of `DLL!NAME` and a `--dll` value only
+a DLL name. Each selector must match an import in the image. Output is counts and RVAs only, no instruction bytes
+(docs/runtime_imports.md, "The retail executable (RT-5)").
 """
 import argparse
 import json
@@ -39,11 +39,9 @@ def import_slots(img):
 
 def import_entries(img):
     """{IAT slot RVA: (dll, name)}: the two parts kept apart, since a DLL name may itself contain '!'."""
-    rva, size = img.directory(1)
+    rva, size = img.directory(pe_inspect.DIR_IMPORT)
     slots = {}
-    if not rva or not size:
-        return slots
-    for i in range(size // 20):
+    for i in range(size // 20 if rva else 0):
         at = img.offset(rva + i * 20, 20)
         if at is None:
             break
@@ -56,6 +54,22 @@ def import_entries(img):
             continue
         for j, name in enumerate(img.thunk_names(lookup)):
             slots[iat_rva + j * 8] = (dll, name)
+
+    for dll_rva, iat_rva, lookup, va_entries in img.import_descriptors(pe_inspect.DIR_DELAY_IMPORT, delay=True):
+        # Delay IAT slots hold resolver addresses before binding, so require a positive mapped INT
+        # and reject a legacy DLL-name VA that normalizes to RVA 0 (the DOS header).
+        if dll_rva <= 0 or iat_rva <= 0 or lookup <= 0:
+            continue
+        if img.offset(iat_rva, 8) is None or img.offset(lookup, 8) is None:
+            continue
+        dll = img.string_at(dll_rva)
+        if dll is None:
+            continue
+        for j, name in enumerate(img.thunk_names(lookup, va_entries=va_entries)):
+            slot = iat_rva + j * 8
+            if img.offset(slot, 8) is None:
+                break
+            slots.setdefault(slot, (dll, name))
     return slots
 
 
@@ -128,9 +142,9 @@ def unmatched_selectors(data: bytes, wanted, dlls) -> list:
     """The well-formed selectors that name nothing this image imports: a misspelled half of `DLL!NAME`, or a DLL the
     image does not import. They answered "0 import(s), 0 call site(s)", which reads as "the image never calls it".
     `call_sites()` keeps answering `{}` for a caller that selects nothing on purpose."""
-    keys = import_slots(pe_inspect.PeImage(data))
-    names = {key.lower() for key in keys.values()}
-    libs = {key.partition("!")[0].lower() for key in keys.values()}
+    entries = import_entries(pe_inspect.PeImage(data))
+    names = {f"{dll}!{name}".lower() for dll, name in entries.values()}
+    libs = {dll.lower() for dll, _ in entries.values()}
     return [f"--import {w}" for w in wanted if w.lower() not in names] + \
            [f"--dll {d}" for d in dlls if d.lower() not in libs]
 

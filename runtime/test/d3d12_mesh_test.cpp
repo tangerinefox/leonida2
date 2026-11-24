@@ -138,6 +138,7 @@ int main() {
         info.buffer_device_address = true;
         info.shader_dir = library.string();
         info.mesh_shader = mesh;
+        info.mesh_shader_queries = mesh && d.mesh_shader_queries;
         info.pipeline_statistics_query = d.pipeline_statistics_query;
         return info;
     };
@@ -405,8 +406,15 @@ int main() {
         // query 2 the two vertex draws alone. A mesh draw has no input assembly or vertex shader, so those fields
         // count only the two full-screen triangles (3 vertices, 1 primitive each). How many clipping and pixel
         // shader invocations a draw makes is the driver's (RADV's PSInvocations is not the pixel count), so query
-        // 0 is checked against query 2: more of both is the mesh segment's share. Under LEONIDA_VK_VALIDATION=1 the
-        // run must stay free of VUID-vkCmdDrawMeshTasksEXT-pipelineStatistics-07076.
+        // 0 is checked against query 2: more pixel shader invocations is the mesh segment's share. A mesh segment
+        // runs in a pool that counts the fragment and compute invocations only, because
+        // VUID-vkCmdDrawMeshTasksEXT-pipelineStatistics-07076 leaves the clipping counters out of a pool that is
+        // active during a mesh draw; D3D12 counts the clipping invocations and primitives of a mesh pipeline, so
+        // those two fields read 0 here. Under LEONIDA_VK_VALIDATION=1 the run must stay free of the VUID.
+        // Where the device has the meshShaderQueries feature, the clipping invocations of a mesh segment come
+        // from a mesh-primitives query instead (D3D-MESH-CLIPPING-COUNTER): the number of primitives the mesh
+        // shader emitted that reached the fragment shader. How many that is depends on the driver, so the counts
+        // are compared with each other and not written down.
         if (d.pipeline_statistics_query) {
             const D3D12_QUERY_HEAP_DESC statistics_desc{D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS, 3, 0};
             Ref<ID3D12QueryHeap> statistics;
@@ -472,11 +480,26 @@ int main() {
             EXPECT(vertex_only.IAVertices == 6 && vertex_only.IAPrimitives == 2);
             EXPECT(mixed.GSInvocations == 0 && mixed.GSPrimitives == 0 && mixed.HSInvocations == 0 &&
                    mixed.DSInvocations == 0 && mixed.CSInvocations == 0);
-            EXPECT(mixed.CInvocations > vertex_only.CInvocations && mixed.PSInvocations > vertex_only.PSInvocations);
+            // The clipping invocations of the mesh segments (D3D-MESH-CLIPPING-COUNTER). Without the feature they
+            // read 0; with it they are the mesh-primitives count of those segments.
+            const auto mesh_clipping = mixed.CInvocations - vertex_only.CInvocations;
+            if (d.mesh_shader_queries) {
+                // The count has to be wired up, not merely self-consistent. A layer that reported the feature but
+                // never created the third pool would leave both counts at 0, and 0 >= 0 would still hold. How many
+                // primitives the mesh shader emits is the driver's, so ask for a positive count and not for a
+                // number: the mesh draw above fills the top-left quadrant, so it emits at least one.
+                EXPECT(mesh_clipping >= mesh_only.CInvocations);
+                EXPECT(mesh_only.CInvocations > 0);
+            } else {
+                EXPECT(mesh_clipping == 0);
+            }
+            EXPECT(mixed.PSInvocations > vertex_only.PSInvocations);
             EXPECT(mesh_only.IAVertices == 0 && mesh_only.IAPrimitives == 0 && mesh_only.VSInvocations == 0 &&
                    mesh_only.GSInvocations == 0 && mesh_only.GSPrimitives == 0 && mesh_only.HSInvocations == 0 &&
                    mesh_only.DSInvocations == 0 && mesh_only.CSInvocations == 0);
-            EXPECT(mesh_only.CInvocations > 0 && mesh_only.PSInvocations > 0);
+            // Vulkan has no clipped-primitive counter, so the clipping primitives of a mesh segment stay 0.
+            EXPECT(mesh_only.CPrimitives == 0 && mesh_only.PSInvocations > 0);
+            if (!d.mesh_shader_queries) EXPECT(mesh_only.CInvocations == 0);
         } else {
             std::printf("pipelineStatisticsQuery not available: the D3D-291 statistics check is skipped\n");
         }

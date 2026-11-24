@@ -84,17 +84,76 @@ class NativeFolder(unittest.TestCase):
         with patch.object(run_gpu_tests.os, "name", "posix"):
             self.assertEqual(run_gpu_tests.native_folder("/tmp/work-" + MARK), "/tmp/work-" + MARK)
 
+    def test_a_utf8_code_page_keeps_non_ascii_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = os.path.join(tmp, "leonida_gpu_work_" + MARK)
+            os.makedirs(work)
+            self.assertEqual(run_gpu_tests.native_folder(work, ansi="utf-8"), work)
+
     @unittest.skipUnless(os.name == "nt", "8.3 short names are a Windows thing")
     def test_a_folder_outside_the_code_page_gets_its_short_name_or_none(self):
         with tempfile.TemporaryDirectory() as tmp:
             work = os.path.join(tmp, "leonida_gpu_work_" + MARK)
             os.makedirs(work)
-            native = run_gpu_tests.native_folder(work)
+            native = run_gpu_tests.native_folder(work, ansi="cp1252")
             if native is None:
                 self.skipTest("this volume keeps no 8.3 short names (the error path is tested below)")
-            native.encode("mbcs")  # raises if the short name still has a character the code page lacks
+            native.encode("cp1252")  # raises if the short name still has a character the code page lacks
             self.assertNotIn(MARK, native)
             self.assertTrue(os.path.samefile(native, work))
+
+
+@unittest.skipUnless(os.name == "nt", "8.3 short names are a Windows thing")
+class NativeFolderLookup(unittest.TestCase):
+    def test_a_failed_lookup_rejects_the_buffer_contents(self):
+        work, short = "C:\\work-" + MARK, r"C:\WORK~1"
+
+        def get_short_path(path, buf, size):
+            self.assertEqual(path, work)
+            buf.value = short
+            return 0
+
+        with patch("ctypes.windll.kernel32.GetShortPathNameW", side_effect=get_short_path) as lookup:
+            self.assertIsNone(run_gpu_tests.native_folder(work, ansi="ascii"))
+        lookup.assert_called_once()
+
+    def test_an_insufficient_buffer_rejects_the_buffer_contents(self):
+        work, short = "C:\\work-" + MARK, r"C:\WORK~1"
+        for extra in (0, 1):
+            with self.subTest(required_length_extra=extra):
+                def get_short_path(path, buf, size):
+                    self.assertEqual(path, work)
+                    self.assertEqual(size, len(buf))
+                    buf.value = short
+                    return size + extra
+
+                with patch("ctypes.windll.kernel32.GetShortPathNameW", side_effect=get_short_path) as lookup:
+                    self.assertIsNone(run_gpu_tests.native_folder(work, ansi="ascii"))
+                lookup.assert_called_once()
+
+    def test_a_short_name_outside_the_code_page_is_rejected(self):
+        work = "C:\\work-" + MARK
+
+        def get_short_path(path, buf, size):
+            self.assertEqual(path, work)
+            buf.value = work
+            return len(work)
+
+        with patch("ctypes.windll.kernel32.GetShortPathNameW", side_effect=get_short_path) as lookup:
+            self.assertIsNone(run_gpu_tests.native_folder(work, ansi="ascii"))
+        lookup.assert_called_once()
+
+    def test_a_successful_short_name_lookup_is_kept(self):
+        work, short = "C:\\work-" + MARK, r"C:\WORK~1"
+
+        def get_short_path(path, buf, size):
+            self.assertEqual(path, work)
+            buf.value = short
+            return len(short)
+
+        with patch("ctypes.windll.kernel32.GetShortPathNameW", side_effect=get_short_path) as lookup:
+            self.assertEqual(run_gpu_tests.native_folder(work, ansi="ascii"), short)
+        lookup.assert_called_once()
 
 
 class MainUsesTheNativeFolder(unittest.TestCase):

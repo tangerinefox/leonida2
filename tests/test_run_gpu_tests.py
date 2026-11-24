@@ -248,6 +248,20 @@ class StoreHelperUnsupported(unittest.TestCase):
         self.assertIn("FAILED: texel 3 is 0x0", out)
         self.assertNotIn("skipped", out)
 
+    def test_store_verdict_survives_the_trailing_device_line(self):
+        for rc, verdict in ((0, "r32 sint (sint view): 0 bad, texel(5,3) = 71"),
+                            (1, "r32 sint (sint view): 64 bad, texel(5,3) = 2071")):
+            with self.subTest(rc=rc):
+                # Captured stdout is followed by stderr, which contains the device banner.
+                status, out = self.run_store("cs_imgload_tfe", rc, f"{verdict}\ndevice: X")
+                self.assertEqual(status, rc, out)
+                self.assertIn(verdict, out)
+
+    def test_store_crash_keeps_the_device_line_when_it_is_the_only_output(self):
+        rc, out = self.run_store("cs_imgload_tfe", 1, "device: X")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("exit 1: device: X", out)
+
 
 INT64 = "unsupported: m.spv declares Int64 and the device has no shaderInt64\n"
 INT64_SKIP = "SKIP (unsupported: m.spv declares Int64 and the device has no shaderInt64)"

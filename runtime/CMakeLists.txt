@@ -106,6 +106,46 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
   )
 
+  # Rust XMA2 decoder (runtime/xma_decoder), built at configure time when cargo is on PATH.
+  # Without it (or if that build fails) the runtime still builds and XMA voices output silence.
+  option(LEONIDA_REQUIRE_XMA2_DECODER "Fail configure if the Rust XMA2 decoder is unavailable" OFF)
+  find_program(LEONIDA_CARGO cargo)
+  if(LEONIDA_CARGO)
+    # Cargo's host (or configured default target) can differ from the runtime's MSVC ABI.
+    set(_xma_target x86_64-pc-windows-msvc)
+    set(_xma_target_dir ${CMAKE_BINARY_DIR}/xma_decoder)
+    set(_xma_lib ${_xma_target_dir}/${_xma_target}/release/leonida_xma2_decoder.lib)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+      ${CMAKE_CURRENT_SOURCE_DIR}/xma_decoder/Cargo.toml
+      ${CMAKE_CURRENT_SOURCE_DIR}/xma_decoder/Cargo.lock
+      ${CMAKE_CURRENT_SOURCE_DIR}/xma_decoder/src/lib.rs)
+    execute_process(
+      COMMAND ${LEONIDA_CARGO} build --release --locked --target ${_xma_target}
+              --manifest-path ${CMAKE_CURRENT_SOURCE_DIR}/xma_decoder/Cargo.toml
+              --target-dir ${_xma_target_dir}
+      TIMEOUT 120
+      RESULT_VARIABLE _xma_result)
+    if(_xma_result STREQUAL "0" AND EXISTS ${_xma_lib})
+      add_library(leonida_xma2_decoder STATIC IMPORTED)
+      # Link Rust's Windows SDK dependencies. CMake's C++ target selects its own CRT
+      # (/MD or /MDd); the C ABI keeps allocation and deallocation on the same side.
+      # synchronization: Rust's std imports WaitOnAddress and WakeByAddress*, which MSVC's
+      # default libraries cover but clang-cl with an xwin SDK does not (lld-link: undefined symbol).
+      set_target_properties(leonida_xma2_decoder PROPERTIES
+        IMPORTED_LOCATION ${_xma_lib}
+        INTERFACE_INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/xma_decoder
+        INTERFACE_COMPILE_DEFINITIONS LEONIDA_HAVE_XMA2_DECODER=1
+        INTERFACE_LINK_LIBRARIES "kernel32;ntdll;userenv;ws2_32;dbghelp;synchronization")
+    else()
+      message(WARNING "cargo build of runtime/xma_decoder failed: XMA voices will be silent")
+    endif()
+  else()
+    message(STATUS "cargo not found: runtime/xma_decoder not built, XMA voices will be silent")
+  endif()
+  if(LEONIDA_REQUIRE_XMA2_DECODER AND NOT TARGET leonida_xma2_decoder)
+    message(FATAL_ERROR "LEONIDA_REQUIRE_XMA2_DECODER is enabled, but the Rust XMA2 decoder is unavailable")
+  endif()
+
   add_executable(gta6rt
     src/main.cpp
     src/host_cpu.cpp
@@ -113,6 +153,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/registry.cpp
     shims/file_system.cpp
     shims/winhttp_offline.cpp
+    shims/ws2_offline.cpp
     shims/xmem.cpp
     shims/xg_xs.cpp
     shims/acphal.cpp
@@ -250,6 +291,11 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_options(acphal_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(acphal_test PRIVATE /OPT:NOREF)
 
+  if(TARGET leonida_xma2_decoder)
+    target_link_libraries(gta6rt PRIVATE leonida_xma2_decoder)
+    target_link_libraries(acphal_test PRIVATE leonida_xma2_decoder)
+  endif()
+
   # The Zen 2 instructions a desktop CPU may lack (src/cpu_emulation.h): decoded, emulated on a CONTEXT, and run for
   # real with the #UD handler installed, so an Intel host takes the emulated path and an AMD one the native path.
   add_executable(cpu_emulation_test test/cpu_emulation_test.cpp)
@@ -325,6 +371,18 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_definitions(winhttp_offline_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(winhttp_offline_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(winhttp_offline_test PRIVATE /OPT:NOREF)
+
+  # Offline Winsock2 for mapped images (ws2_32.dll restricted to loopback); no external network is touched.
+  add_executable(ws2_offline_test
+    test/ws2_offline_test.cpp
+    shims/ws2_offline.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(ws2_offline_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(ws2_offline_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(ws2_offline_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(ws2_offline_test PRIVATE /OPT:NOREF)
+  target_link_libraries(ws2_offline_test PRIVATE ws2_32)
 
   # COM lifecycle and helper shims for api-ms-win-core-com-l1-1-*.dll.
   add_executable(com_shim_test
@@ -577,6 +635,10 @@ if(BUILD_TESTING)
     target_link_options(loader_test PRIVATE /OPT:NOREF ${GTA6RT_HOST_BASE})
     add_dependencies(loader_test gta6rt_tls_host)
     add_test(NAME loader COMMAND loader_test)
+    # It takes about 10 s under Wine and under a minute on a desktop with a virus scanner. Before #239 it waited on
+    # a "Bad Image" box on the Windows runner until the job's own timeout cancelled the whole job (every Windows
+    # run from 24 Nov 00:37 to 03:32 UTC); a hang like that now fails this test instead.
+    set_tests_properties(loader PROPERTIES TIMEOUT 180)
     # PE loader tests use two locally built fixtures: a DLL with exports, imports and relocations, and an EXE that
     # imports it so Loader::load exercises recursive module loading. They contain no game data.
     set(TINY_FIXTURE_DIR "${CMAKE_CURRENT_BINARY_DIR}/fixtures/$<CONFIG>")
@@ -610,6 +672,8 @@ if(BUILD_TESTING)
     add_executable(tiny_ga_tls test/fixtures/tiny_ga_tls.cpp)
     target_compile_definitions(tiny_ga_tls PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(tiny_ga_tls PRIVATE /W4 /permissive- /utf-8 /GS- /GA)
+    # /GA can remove the _tls_index reference that pulls in the CRT TLS directory.
+    target_link_options(tiny_ga_tls PRIVATE /INCLUDE:_tls_used)
     set_target_properties(tiny_ga_tls PROPERTIES
       OUTPUT_NAME tiny_ga_tls
       RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
@@ -1162,6 +1226,7 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET acphal_test)
     add_test(NAME acphal COMMAND acphal_test)
+    add_test(NAME acphal_noncached_only COMMAND acphal_test --noncached-only)
   endif()
   if(WIN32 AND TARGET cpu_emulation_test)
     add_test(NAME cpu_emulation COMMAND cpu_emulation_test)
@@ -1180,6 +1245,9 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET winhttp_offline_test)
     add_test(NAME winhttp_offline COMMAND winhttp_offline_test)
+  endif()
+  if(WIN32 AND TARGET ws2_offline_test)
+    add_test(NAME ws2_offline COMMAND ws2_offline_test)
   endif()
   if(WIN32 AND TARGET com_shim_test)
     add_test(NAME com_shim COMMAND com_shim_test)
@@ -1411,6 +1479,11 @@ if(TARGET Vulkan::Headers)
   add_executable(vk_shader_fma_test test/vk_shader_fma_test.cpp)
   target_link_libraries(vk_shader_fma_test PRIVATE Vulkan::Headers)
   add_test(NAME vk_shader_fma COMMAND vk_shader_fma_test)
+  add_executable(xdxr_builder_validation_test test/xdxr_builder_validation_test.cpp)
+  target_link_libraries(xdxr_builder_validation_test PRIVATE Vulkan::Headers)
+  if(BUILD_TESTING)
+    add_test(NAME xdxr_builder_validation COMMAND xdxr_builder_validation_test)
+  endif()
   # LEONIDA_VK_DEVICE names the GPU in every harness (docs/testing.md, "Choosing the GPU"): a filter that matches no
   # device fails the run in vk_descriptor_bench and vk_sandbox too, instead of testing another GPU (TEST-1141).
   find_package(Python3 COMPONENTS Interpreter QUIET)
@@ -1610,6 +1683,18 @@ if(TARGET Vulkan::Headers)
   endif()
   if(BUILD_TESTING)
     add_test(NAME vk_buffer_registration_oom COMMAND vk_buffer_registration_oom_test)
+  endif()
+  # VulkanContext::replay_.host_at resolves aliasing placed upload buffers across the full requested byte range.
+  add_executable(vk_host_at_aliasing_test test/vk_host_at_aliasing_test.cpp)
+  target_link_libraries(vk_host_at_aliasing_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+  if(WIN32)
+    target_compile_definitions(vk_host_at_aliasing_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    if(MSVC)
+      target_compile_options(vk_host_at_aliasing_test PRIVATE /W4 /permissive- /EHsc /utf-8)
+    endif()
+  endif()
+  if(BUILD_TESTING)
+    add_test(NAME vk_host_at_aliasing COMMAND vk_host_at_aliasing_test)
   endif()
   # CPU-only: ScratchBuffers chunk alignment, retire/collect/forget, and spare cap (runtime/src/vulkan_scratch.h).
   add_executable(vulkan_scratch_test test/vulkan_scratch_test.cpp)

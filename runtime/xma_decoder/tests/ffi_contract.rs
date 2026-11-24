@@ -52,6 +52,28 @@ fn make_decoder(rate: u32, channels: u32) -> *mut LeonidaXma2Decoder {
 }
 
 #[test]
+fn hardware_mode_keeps_all_samples_of_the_first_stereo_frame() {
+    let mut packet = synthetic_silent_packet(2);
+    packet[..4].copy_from_slice(&[4, 0, 1, 0]); // One frame, no continuation from a previous packet.
+    let mut decoder = ptr::null_mut();
+    let mut block = ptr::null_mut();
+    unsafe {
+        assert_eq!(
+            leonida_xma2_decoder_create_hardware(48_000, 2, &mut decoder),
+            LEONIDA_XMA2_OK
+        );
+        assert_eq!(
+            leonida_xma2_decode_buffer(decoder, packet.as_ptr(), packet.len(), &mut block),
+            LEONIDA_XMA2_OK
+        );
+        let count = leonida_xma2_pcm_sample_count(block);
+        leonida_xma2_pcm_destroy(block);
+        leonida_xma2_decoder_destroy(decoder);
+        assert_eq!(count, 512 * 2);
+    }
+}
+
+#[test]
 fn creation_rejects_invalid_outputs_and_formats() {
     assert_eq!(
         unsafe { leonida_xma2_decoder_create(48_000, 2, ptr::null_mut()) },

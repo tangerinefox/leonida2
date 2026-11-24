@@ -1997,7 +1997,7 @@ the two wave sizes agree on every word. `tools/fma_mix_probe.py --oracle hw` (th
 `tests/semantic/spirv_mini_interp.py`, then compared with the hardware under the MODE the translator assumes for the
 game (IEEE 0, DX10_CLAMP 1, f32 denormals flushed, f16 denormals kept). It gives the same word for the float
 constants in every `op_sel`/`op_sel_hi` combination, for the integer constants as f16 halves, for clamp on values that
-are not NaN, and for the f16 denormals. It differs in five ways, none fixed here:
+are not NaN, and for the f16 denormals. It differs in five ways; item 2 is fixed since 2026-11-24:
 
 1. **f16 omod.** The translator applies `mul:2`/`mul:4`/`div:2` to every f16 result. The hardware ignores them in this
    MODE (24 words: `v_add/mul/fma/fmac/exp/rcp_f16`). `v_cvt_f16_f32` drops its omod and clamp today, so its omod
@@ -2007,6 +2007,7 @@ are not NaN, and for the f16 denormals. It differs in five ways, none fixed here
    when "output denormals" are off, the `SIFoldOperands.cpp` comment quoted above). That count needs the game files.
 2. **clamp of a NaN.** The interpreter refuses `FClamp` with a NaN operand, which GLSL.std.450 leaves undefined. The
    hardware gives +0 with DX10_CLAMP 1, for `v_fmac_f16`, `v_fma_mixlo_f16` and `v_fma_mix_f32` alike (SHADER-186).
+   **Fixed since 2026-11-24:** `Gen.clamp_mods` selects +0 for a NaN before `FClamp` (`tests/semantic/test_vop3_clamp_nan.py`).
 3. **Mix-op rounding.** The hardware rounds once (the section above).
 4. **f32 denormal operands of the mix ops.** They are not flushed with `denorm_mode_32 = 0`: `0x00000001`, `0x807fffff`
    and the integer constants `1` and `64` used as f32 give the denormal, where the hardware gives a zero of its sign

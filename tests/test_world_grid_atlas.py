@@ -197,7 +197,14 @@ def bgra_dds(rgba):
     return dds(rgba.shape[1], rgba.shape[0], 87, rgba[..., [2, 1, 0, 3]].astype(np.uint8).tobytes(), 4)
 
 
-def grid_xml(name, suffix, fallback):
+def shoreline_tile():
+    tile = np.zeros((2, 2, 4))
+    tile[..., 3] = 255
+    tile[0, 0, :3] = (255, 128, 64)
+    return tile
+
+
+def grid_xml(name, suffix, fallback, *, width=4096, height=6144):
     return (f'<?xml version="1.0" encoding="UTF-8"?>\n<GridAtlasInfo>\n'
             f'\t<type>GS_TYPE_2D_TEXTURE_ATLAS</type>\n\t<clientSystemName>{name}</clientSystemName>\n'
             f'\t<tileTextureNamePrefix>{name}-</tileTextureNamePrefix>\n'
@@ -205,7 +212,7 @@ def grid_xml(name, suffix, fallback):
             f'\t<hasOwnGlobalFallback value="true"/>\n'
             f'\t<globalFallbackTextureName>{fallback}</globalFallbackTextureName>\n'
             f'\t<useGlobalFallback value="true" />\n\t<origin x="0.0" y="0.0" z="0.0" />\n'
-            f'\t<width value="4096" />\n\t<height value="6144" />\n\t<tileSize value="512" />\n'
+            f'\t<width value="{width}" />\n\t<height value="{height}" />\n\t<tileSize value="512" />\n'
             f'\t<streamRadius value="512.0" />\n\t<zInflation value="1000.0" />\n'
             f'\t<sectorOverrides>\n\t\t<Item>\n\t\t\t<sectorName>mapswap_test</sectorName>\n'
             f'\t\t\t<sectorOverrideGlobalFallbackName>{fallback}_tblux</sectorOverrideGlobalFallbackName>\n'
@@ -257,7 +264,7 @@ class WriteJsonTest(unittest.TestCase):
 
     def test_failed_replace_keeps_the_old_file_and_no_temp(self):
         out = os.path.join(self.root, "grid.json")
-        with open(out, "w", encoding="utf-8") as f:
+        with open(out, "w", encoding="utf-8", newline="\n") as f:
             f.write("old")
         with mock.patch.object(wga.os, "replace", side_effect=OSError("replace denied")):
             with self.assertRaises(OSError):
@@ -269,7 +276,7 @@ class WriteJsonTest(unittest.TestCase):
     @unittest.skipIf(os.name == "nt", "POSIX permission bits")
     def test_keeps_the_replaced_file_mode(self):
         out = os.path.join(self.root, "grid.json")
-        with open(out, "w", encoding="utf-8") as f:
+        with open(out, "w", encoding="utf-8", newline="\n") as f:
             f.write("old")
         os.chmod(out, 0o640)
         wga.write_json(out, [1, 2])
@@ -320,9 +327,10 @@ class ForwardCheckTest(unittest.TestCase):
             with open(path, "wb") as f:
                 f.write(data)
         for archive, items in self.items.items():
-            with open(os.path.join(self.work, "assets", archive, "textures", "manifest.json"), "w") as f:
+            manifest = os.path.join(self.work, "assets", archive, "textures", "manifest.json")
+            with open(manifest, "w", encoding="utf-8", newline="\n") as f:
                 json.dump({"src": archive, "Count": len(items), "Scan": {}, "Items": items}, f)
-        with open(os.path.join(self.carve, "index.json"), "w", encoding="utf-8") as f:
+        with open(os.path.join(self.carve, "index.json"), "w", encoding="utf-8", newline="\n") as f:
             json.dump({"summary": {"archive": "synthetic", "files": len(self.rows)}, "files": self.rows}, f)
 
     def run_tool(self, *extra):
@@ -421,6 +429,44 @@ class ForwardCheckTest(unittest.TestCase):
         return [it["Offset"] for it in self.items[archive] if it["Textures"][0]["Name"] == name]
 
     # -- tests --
+    def test_match_mask_requires_two_cells(self):
+        tile = shoreline_tile()
+        for rows, columns in ((1, 1), (0, 1), (1, 0)):
+            with self.subTest(rows=rows, columns=columns):
+                geom = {"rows": rows, "columns": columns}
+                fallback = tile[:2 * rows, :2 * columns].copy()
+                with self.assertRaisesRegex(ValueError, "^a grid needs at least two cells to rank a match$"):
+                    wga.match_mask([tile], fallback, geom)
+
+    def test_match_mask_places_tile_in_a_two_cell_grid(self):
+        tile = shoreline_tile()
+        blank = tile.copy()
+        blank[..., :3] = 0
+        fallback = np.concatenate((blank, tile), axis=1)
+        geom = wga.geometry({**DOC, "width": 1024, "height": 512})
+        self.assertEqual(wga.match_mask([tile], fallback, geom), {
+            "background": [0, 0, 0, 255],
+            "clear": {0: 1},
+            "placed": {0: 1},
+            "featureless_tiles": 0,
+            "unplaced_with_features": 0,
+            "anchors_moved_by_alignment": 0,
+            "feature_cells": 1,
+            "overlap_median": 1.0,
+        })
+
+    def test_cli_reports_a_one_cell_shoreline_grid_in_one_line(self):
+        image = bgra_dds(shoreline_tile())
+        self.add_dict("levels", [("shore", "B8G8R8A8_UNORM", image, 2, 2)])
+        self.add_dict("levels", [("shore_gfb", "B8G8R8A8_UNORM", image, 2, 2)])
+        self.add_stream(grid_xml("shoreline", "shore", "shore_gfb", width=512, height=512))
+        self.finish()
+
+        p, _ = self.run_tool()
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertEqual(p.stdout, "")
+        self.assertEqual(p.stderr, "world_grid_atlas: a grid needs at least two cells to rank a match\n")
+
     def test_every_tile_returns_to_its_cell(self):
         truth = self.build()
         p, data = self.run_tool()
@@ -548,7 +594,7 @@ class ForwardCheckTest(unittest.TestCase):
     def test_reports_bad_inputs_in_one_line(self):
         self.build()
         blocker = os.path.join(self.root, "file")
-        with open(blocker, "w") as f:
+        with open(blocker, "w", encoding="utf-8", newline="\n") as f:
             f.write("x")
         cases = [
             [os.path.join(self.root, "nowork"), "--carve", self.carve],

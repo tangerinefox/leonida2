@@ -109,6 +109,14 @@ def retag(data: bytes, packet: bytes) -> bytes:
     return data[:tags_at] + ogg_page(serial, 1, 0, [packet], 0x00) + data[tags_end:]
 
 
+def reject_duplicate_headers(path, fields, used):
+    """Refuse repeated keys that DictReader would silently overwrite."""
+    duplicates = sorted(field for field, count in collections.Counter(fields).items() if count > 1 and field in used)
+    if duplicates:
+        columns = ", ".join(map(repr, duplicates))
+        raise ValueError(f"{path}: duplicate CSV column headers: {columns}")
+
+
 def load_names(path, source=None):
     """({bank label: {29-bit stream id: name}}, {bank label: {ids a second name claims}}) from an awc_names.py CSV.
 
@@ -125,6 +133,7 @@ def load_names(path, source=None):
         missing = [name for name in ("bank", "stream_id", "name") if name not in fields]
         if missing:
             raise ValueError(f"{path}: missing columns in names CSV header: {', '.join(missing)}")
+        reject_duplicate_headers(path, fields, {"bank", "stream_id", "name", "source"})
         for row in reader:
             if source and row.get("source") != source:
                 continue
@@ -147,7 +156,10 @@ def load_dialogue(path):
     """{wave: row} and language codes; refuse repeated waves whose rendered tags disagree."""
     with open(path, encoding="utf-8-sig", newline="") as fh:
         reader = csv.DictReader(fh)
-        langs = [f[5:] for f in reader.fieldnames or [] if f.startswith("text_")]
+        fields = reader.fieldnames or ()
+        text_fields = [field for field in fields if field.startswith("text_")]
+        reject_duplicate_headers(path, fields, {"wave", "label", "speaker", *text_fields})
+        langs = [field[5:] for field in text_fields]
         out = {}
         for row in reader:
             if row["wave"] is None:

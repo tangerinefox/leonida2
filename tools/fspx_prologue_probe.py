@@ -254,17 +254,17 @@ def run_hw(waves=(32, 64), arch=None):
     """Run all positive prologue checks and negative controls on the AMD GPU."""
     try:
         oracle = runner.open_oracle(arch=arch)
+        try:
+            positives, negatives = build_probe_plan(waves=waves)
+            all_kernels = [k for _, k, _ in positives] + [k for _, k, _, _ in negatives]
+            raw_results = oracle.run(all_kernels, words=64)
+            device = oracle.device
+        finally:
+            oracle.close()
     except runner.Unavailable as e:
-        print(f"hardware oracle unavailable: {e}", file=sys.stderr)
+        reason = " ".join(str(e).splitlines())
+        print(f"hardware oracle unavailable: {reason}", file=sys.stderr)
         return 77
-
-    positives, negatives = build_probe_plan(waves=waves)
-    all_kernels = [k for _, k, _ in positives] + [k for _, k, _, _ in negatives]
-    try:
-        raw_results = oracle.run(all_kernels, words=64)
-        device = oracle.device
-    finally:
-        oracle.close()
 
     pos_results = raw_results[:len(positives)]
     neg_results = raw_results[len(positives):]

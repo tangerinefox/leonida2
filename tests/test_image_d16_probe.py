@@ -64,7 +64,7 @@ class Descriptors(unittest.TestCase):
         text, _, _ = asm.module_text(kernels, "gfx1036", wave=32)
         with tempfile.TemporaryDirectory() as tmp:
             s = Path(tmp) / "k.s"
-            s.write_text(text, encoding="utf-8")
+            s.write_text(text, encoding="utf-8", newline="\n")
             r = subprocess.run([clang, "--target=amdgcn-amd-amdhsa", "-mcpu=gfx1036", "-c", str(s), "-o",
                                 str(Path(tmp) / "k.o")], capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr[:800])
@@ -145,6 +145,59 @@ class Compare(unittest.TestCase):
         self.assertEqual(rc, 77, out)
 
 
+class MismatchExamples(unittest.TestCase):
+    def check_packed_report(self, x, y, packed, matches, first_off):
+        fmt = "r32g32_uint"
+        count = 32
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "report.json")
+            oracle = FakeOracle()
+            with mock.patch.object(pr, "texel_values", return_value=[(x, y)] * count), \
+                 mock.patch.object(oracle, "run", return_value=[[x, packed, packed, y] * count]):
+                rc, out = run_main(oracle, "--dims", "1d", "--formats", fmt, "--json", path)
+            self.assertEqual(rc, 0, out)
+            with open(path, encoding="utf-8") as f:
+                case = json.load(f)["cases"][f"1d {fmt}"]
+        self.assertEqual(case["texels"], count)
+        self.assertEqual(case["control"], [])
+        self.assertEqual(case["forms_differ"], 0)
+        for form in ("image_load", "image_load_mip"):
+            with self.subTest(form=form):
+                self.assertEqual(case["forms"][form]["match"], matches)
+                self.assertEqual(case["forms"][form]["first_off"], first_off)
+                for rule, score in matches.items():
+                    self.assertIn(f"{rule} {score}/{count}", out)
+
+    def test_reports_x_y_and_both_packed_mismatches(self):
+        for channels, packed in (("X", 0x00020003), ("Y", 0x00030001), ("X and Y", 0x00030003)):
+            with self.subTest(mismatched=channels):
+                example = {"in": ["0x00000001", "0x00000002"], "got": f"0x{packed:08x}"}
+                self.check_packed_report(1, 2, packed, {"trunc": 0, "sat_u": 0, "sat_s": 0}, [example] * 4)
+
+    def test_matching_packed_channels_leave_first_off_empty(self):
+        self.check_packed_report(1, 2, 0x00020001, {"trunc": 32, "sat_u": 32, "sat_s": 32}, [])
+        self.check_packed_report(0x10001, 0x20002, 0xFFFFFFFF, {"trunc": 0, "sat_u": 32, "sat_s": 0}, [])
+        self.check_packed_report(0x10001, 0x20002, 0x7FFF7FFF, {"trunc": 0, "sat_u": 0, "sat_s": 32}, [])
+
+    def test_packed_channels_must_match_the_same_saturation_rule(self):
+        packed = 0x7FFFFFFF  # unsigned saturation in X, signed saturation in Y
+        example = {"in": ["0x00010001", "0x00020002"], "got": "0x7fffffff"}
+        self.check_packed_report(0x10001, 0x20002, packed, {"trunc": 0, "sat_u": 0, "sat_s": 0}, [example] * 4)
+
+    def test_truncation_alone_still_has_saturation_mismatch_examples(self):
+        example = {"in": ["0x00010001", "0x00020002"], "got": "0x00020001"}
+        self.check_packed_report(0x10001, 0x20002, 0x00020001, {"trunc": 32, "sat_u": 0, "sat_s": 0}, [example] * 4)
+
+    def test_single_channel_ignores_the_high_half_for_mismatches(self):
+        words = [1, 0x12340001, 0x12340001, pr.SEED] * 64
+        with mock.patch.object(pr, "texel_values", return_value=[(1,)] * 64):
+            case = pr.classify("1d", "r32_uint", words)
+        for form in case["forms"].values():
+            self.assertEqual(form["match"], {"trunc": 64, "sat_u": 64, "sat_s": 64})
+            self.assertEqual(form["high_half"], {"0x1234": 64})
+            self.assertEqual(form["first_off"], [])
+
+
 class Cli(unittest.TestCase):
     def test_exits_77_without_the_tools(self):
         env = dict(os.environ, LEONIDA_AMD_CLANG=str(TOOLS / "no-such-clang.exe"), LEONIDA_HW_DRM_NODE="")
@@ -164,7 +217,7 @@ class Cli(unittest.TestCase):
             existing_dir = os.path.join(tmp, "dir")
             os.mkdir(existing_dir)
             file_ancestor = os.path.join(tmp, "file_ancestor")
-            with open(file_ancestor, "w", encoding="utf-8") as f:
+            with open(file_ancestor, "w", encoding="utf-8", newline="\n") as f:
                 f.write("x")
 
             bad_paths = [

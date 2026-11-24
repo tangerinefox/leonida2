@@ -207,6 +207,40 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
         self.assertEqual(reparsed["op"], ins["op"])
         self.assertEqual(reparsed["mods"], ins["mods"])
 
+    def test_permlane16_opsel_is_the_fi_bound_ctrl_pair(self):
+        # v_permlane16_b32 v2, v0, s0, s1 is 0xD7770002 0x00040100, v_permlanex16_b32 0xD7780002; op_sel is w0 bits
+        # 11..14. llvm-mc 21.1.8 prints bits 0 and 1 as op_sel:[FI,BOUND_CTRL] and ignores bits 2 and 3, where the
+        # other VOP3 ops print [s0,s1,s2,dst]. Hand-assembled words, checked against llvm-mc -disassemble.
+        expect = {0x0: [], 0x1: ["op_sel:[1,0]"], 0x2: ["op_sel:[0,1]"], 0x3: ["op_sel:[1,1]"],
+                  0x4: [], 0x8: [], 0xC: [], 0x5: ["op_sel:[1,0]"], 0xE: ["op_sel:[0,1]"], 0xF: ["op_sel:[1,1]"]}
+        for w0, op in ((0xD7770002, "v_permlane16_b32"), (0xD7780002, "v_permlanex16_b32")):
+            for op_sel, mods in expect.items():
+                with self.subTest(op=op, op_sel=op_sel):
+                    info = rdna2_decode.decode_bytes(words(w0 | (op_sel << 11), 0x00040100))
+                    self.assertEqual(info["invalid"], 0)
+                    ins = info["insns"][0]
+                    self.assertEqual(ins["op"], op)
+                    self.assertEqual(ins["mods"], mods)
+                    reparsed = shader_ir.parse_line(rdna2_decode.format_insn(ins))
+                    self.assertEqual(reparsed["mods"], mods)
+
+    def test_exp_null_target_matches_the_parsed_line(self):
+        # exp null off, off, off, off done vm = 0xF8001890 0x00000000 (llvm-mc 21.1.8, gfx1013); mrt0 for contrast.
+        # shader_ir.parse_line gives the `null` target as the special register and every other target as a
+        # target, and decode_bytes has to hand out the same dictionaries as the line it prints, parsed back.
+        for w0, w1, kind, name in ((0xF8001890, 0x00000000, "special", "null"),
+                                   (0xF800180F, 0x09080706, "target", "mrt0")):
+            with self.subTest(target=name):
+                info = rdna2_decode.decode_bytes(words(w0, w1))
+                self.assertEqual(info["invalid"], 0)
+                ins = info["insns"][0]
+                self.assertEqual(ins["op"], "exp")
+                self.assertEqual((ins["args"][0]["k"], ins["args"][0]["t"]), (kind, name))
+                reparsed = shader_ir.parse_line(rdna2_decode.format_insn(ins))
+                self.assertEqual([(a["k"], a.get("t")) for a in reparsed["args"]],
+                                 [(a["k"], a.get("t")) for a in ins["args"]])
+                self.assertEqual(reparsed["mods"], ins["mods"])
+
     def test_smem_vcc_tuple_and_offsets(self):
         # s_buffer_load_dwordx8 [s100..s105,vcc_lo,vcc_hi], s[0:3], null (SMEM op=0x0b, sdata=100, sbase=0, soff=125)
         w0 = (0x3D << 26) | (0x0B << 18) | (100 << 6) | 0
@@ -393,11 +427,13 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
             if r.returncode != 0 or "error:" in r.stderr:
                 continue
             raw = bytearray()
+            assembled = []
             for ln in r.stdout.splitlines():
                 if "; encoding:" not in ln or ln.lstrip().startswith("."):
                     continue
                 ins = shader_ir.parse_line(ln)
                 if ins and ins["enc"]:
+                    assembled.append(ins)
                     raw.extend(bytes.fromhex(ins["enc"]))
             dcmd = [mc, "-disassemble", "-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-show-encoding"]
             if mattr:
@@ -416,7 +452,12 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
             dec = rdna2_decode.decode_bytes(bytes(raw), wave32=wave32)
             self.assertEqual(dec["invalid"], 0, path)
             self.assertEqual(len(dec["insns"]), len(llvm_insns), path)
-            for li, di in zip(llvm_insns, dec["insns"]):
+            self.assertEqual(len(assembled), len(llvm_insns), path)
+            for ai, li, di in zip(assembled, llvm_insns, dec["insns"]):
+                # LLVM 19 re-encodes this disassembly with a spurious literal. Its assembler
+                # prints the original operand, modifiers and eight bytes for the same instruction.
+                if rdna2spirv.sdwa_inline_float(bytes.fromhex(ai["enc"]), bytes.fromhex(li["enc"]), li["op"]):
+                    li = ai
                 self.assertEqual(di["enc"], li["enc"], path)
                 self.assertEqual(norm_op(di["op"]), norm_op(li["op"]), path)
                 self.assertEqual([norm_arg(x, di["op"]) for x in di["args"]],

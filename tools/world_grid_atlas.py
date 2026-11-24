@@ -332,6 +332,8 @@ def match_content(tiles: list, fallbacks: list, geom: dict) -> dict:
 def match_mask(tiles: list, fallback, geom: dict) -> dict:
     """Feature-mask IoU of each tile against each cell, then order-constrained alignment to text order."""
     import numpy as np
+    if geom["rows"] * geom["columns"] < 2:
+        raise ValueError("a grid needs at least two cells to rank a match")
     flat = fallback.reshape(-1, fallback.shape[-1])
     colours, counts = np.unique(flat, axis=0, return_counts=True)
     bg = colours[int(counts.argmax())]

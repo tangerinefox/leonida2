@@ -145,6 +145,56 @@ void test_apply() {
     check(fault.ExceptionCode == STATUS_ACCESS_VIOLATION && fault.NumberParameters == 2 &&
               fault.ExceptionInformation[0] == 1 && fault.ExceptionInformation[1] == 0,
           "clzero on an unwritable line reports a write access violation at the line");
+
+    // try_clzero_loop EFlags: first-line fault keeps incoming flags, post-prefix fault and >64 MiB batch apply CMP.
+    const uint8_t loop12[] = {0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x48, 0x39, 0xD0, 0x72, 0xF4};
+    if (auto* two_pages = static_cast<uint8_t*>(VirtualAlloc(nullptr, 8192, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE))) {
+        const uint64_t start = reinterpret_cast<uint64_t>(two_pages);
+        DWORD old = 0;
+        VirtualProtect(two_pages, 8192, PAGE_READONLY, &old);
+        c = {};
+        c.Rax = start;
+        c.Rdx = start + 8192;
+        c.Rip = rip;
+        c.EFlags = 0x202;
+        check(ce::try_clzero_loop(loop12, sizeof loop12, &c, &fault) == ce::ClzeroLoopResult::faulted &&
+                  c.Rax == start && c.Rip == rip && c.EFlags == 0x202,
+              "clzero loop fault on first line preserves entry EFlags");
+
+        VirtualProtect(two_pages, 4096, PAGE_READWRITE, &old);
+        std::memset(two_pages, 0x5A, 4096);
+        c = {};
+        c.Rax = start;
+        c.Rdx = start + 8192;
+        c.Rip = rip;
+        c.EFlags = 0x246;  // ZF=1, CF=0 on entry
+        check(ce::try_clzero_loop(loop12, sizeof loop12, &c, &fault) == ce::ClzeroLoopResult::faulted,
+              "clzero loop post-prefix fault reported");
+        bool prefix_zeroed = true;
+        for (int i = 0; i < 4096; ++i) prefix_zeroed &= two_pages[i] == 0;
+        check(prefix_zeroed && c.Rax == start + 4096 && c.Rip == rip &&
+                  fault.ExceptionCode == STATUS_ACCESS_VIOLATION && fault.ExceptionInformation[1] == start + 4096 &&
+                  (c.EFlags & 0xC1u) == 0x81u,
+              "clzero loop post-prefix fault zeroes prefix and applies CMP flags (CF=1, ZF=0, SF=1)");
+        VirtualFree(two_pages, 0, MEM_RELEASE);
+    }
+
+    constexpr size_t kLargeSpan = (size_t(64) << 20) + 4096;
+    if (auto* large = static_cast<uint8_t*>(VirtualAlloc(nullptr, kLargeSpan, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE))) {
+        const uint64_t base = reinterpret_cast<uint64_t>(large);
+        c = {};
+        c.Rax = base;
+        c.Rdx = base + kLargeSpan;
+        c.Rip = rip;
+        c.EFlags = 0x202;
+        check(ce::try_clzero_loop(loop12, sizeof loop12, &c, &fault) == ce::ClzeroLoopResult::ok &&
+                  c.Rip == rip && c.Rax == base + (uint64_t(64) << 20) && (c.EFlags & 0xC1u) == 0x81u,
+              "clzero loop >64 MiB first batch applies CMP flags (CF=1, ZF=0, SF=1)");
+        check(ce::try_clzero_loop(loop12, sizeof loop12, &c, &fault) == ce::ClzeroLoopResult::ok &&
+                  c.Rip == rip + 12 && c.Rax == base + kLargeSpan && (c.EFlags & 0xC1u) == 0x40u,
+              "clzero loop >64 MiB second batch completes with CF=0, ZF=1, SF=0");
+        VirtualFree(large, 0, MEM_RELEASE);
+    }
 }
 
 // ---- Running the real encodings ----
@@ -242,6 +292,33 @@ void test_live(const ce::Host& host) {
         std::memset(lines, 0x5A, sizeof lines);
         check(run(clz66, lines + 130, nullptr, &ex) && lines[128] == 0 && lines[191] == 0 && lines[127] == 0x5A,
               "clzero with 66 emulated");
+    }
+
+    // clzero loop fast-path: mov rax, rcx; clzero; add rax, 0x40; cmp rax, rdx; jb -12; ret
+    {
+        alignas(64) static uint8_t buf[512];
+        std::memset(buf, 0xA5, sizeof buf);
+        Code clz_loop({0x48, 0x89, 0xC8, 0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x48, 0x39, 0xD0, 0x72, 0xF4, 0xC3});
+        check(run(clz_loop, buf + 64, buf + 320, &ex), "clzero loop ran");
+        bool loop_ok = true;
+        for (int i = 0; i < 512; ++i) loop_ok &= buf[i] == ((i >= 64 && i < 320) ? 0 : 0xA5);
+        check(loop_ok, "clzero loop zeroed exact span [64, 320)");
+
+        // REX.R limit register (r8): mov rax, rcx; mov r8, rdx; clzero; add rax, 0x40; cmp rax, r8; jb -12; ret
+        std::memset(buf, 0xA5, sizeof buf);
+        Code clz_r8({0x48, 0x89, 0xC8, 0x49, 0x89, 0xD0, 0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x4C, 0x39, 0xC0,
+                     0x72, 0xF4, 0xC3});
+        check(run(clz_r8, buf + 64, buf + 320, &ex), "clzero loop (r8) ran");
+        bool r8_ok = true;
+        for (int i = 0; i < 512; ++i) r8_ok &= buf[i] == ((i >= 64 && i < 320) ? 0 : 0xA5);
+        check(r8_ok, "clzero loop (r8) zeroed exact span [64, 320)");
+
+        // Non-multiple-of-64 limit (300): rounds up to 320, matching native do-while `cmp rax, limit; jb`.
+        std::memset(buf, 0xA5, sizeof buf);
+        check(run(clz_loop, buf + 64, buf + 300, &ex), "clzero loop (unaligned limit) ran");
+        bool unaligned_ok = true;
+        for (int i = 0; i < 512; ++i) unaligned_ok &= buf[i] == ((i >= 64 && i < 320) ? 0 : 0xA5);
+        check(unaligned_ok, "clzero loop (unaligned limit 300) zeroed span [64, 320)");
     }
 
     // mov rax,rcx; xor ecx,ecx; xor edx,edx; monitorx; xor eax,eax; xor ecx,ecx; mwaitx; ret

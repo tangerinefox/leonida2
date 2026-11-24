@@ -199,5 +199,15 @@ private:
 };
 
 inline constexpr UINT xbox_frame_event_origin = leonida::frame_event_origin;
+inline constexpr UINT xbox_frame_event_vblank = leonida::frame_event_vblank;
+inline constexpr UINT xbox_frame_event_flip = leonida::frame_event_flip;
+inline constexpr UINT xbox_frame_wait_token_on_timeout = leonida::frame_wait_flag_token_on_timeout;
+
+// Seam for the presenter, not yet called by the runtime: gta6rt creates no XboxPresentation, and only
+// d3d12_boot_movie_test and xbox_present_test construct one. Wires it into a d3d12_xs device proxy's frame-event
+// slots (78–81) and queue PresentX (slot 30, or LEONIDA_XS_PRESENT_X_SLOT); SuspendX and ResumeX are routed only
+// when LEONIDA_XS_SUSPEND_X_SLOT / LEONIDA_XS_RESUME_X_SLOT are set. Passing nullptr detaches the presentation.
+bool attach_xbox_presentation(void* device_proxy, XboxPresentation* presentation);
+bool detach_xbox_presentation(void* device_proxy);
 
 }  // namespace rt::d3d12
