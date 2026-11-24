@@ -1,0 +1,70 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Merge upstream into this fork
+        shell: bash
+        env:
+          SYNC_SSH_KEY: ${{ secrets.UPSTREAM_SYNC_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$SYNC_SSH_KEY" ]]; then
+            echo '::error::Missing repository sync key UPSTREAM_SYNC_SSH_KEY.'
+            exit 1
+          fi
+
+          fork_branch=$(gh api "repos/$GITHUB_REPOSITORY" --jq '.default_branch')
+          upstream_name=$(gh api "repos/$GITHUB_REPOSITORY" --jq '.parent.full_name')
+          if [[ -z "$upstream_name" || "$upstream_name" == null ]]; then
+            echo '::error::This repository has no upstream fork relationship.'
+            exit 1
+          fi
+          upstream_branch=$(gh api "repos/$upstream_name" --jq '.default_branch')
+          upstream_url=$(gh api "repos/$upstream_name" --jq '.clone_url')
+
+          umask 077
+          ssh_dir=$(mktemp -d "$RUNNER_TEMP/leonida-sync.XXXXXX")
+          trap 'rm -f -- "$ssh_dir/key" "$ssh_dir/known_hosts"; rmdir -- "$ssh_dir"' EXIT
+          printf '%s\n' "$SYNC_SSH_KEY" > "$ssh_dir/key"
+          gh api meta --jq '.ssh_keys[] | "github.com " + .' > "$ssh_dir/known_hosts"
+          export GIT_SSH_COMMAND="ssh -i '$ssh_dir/key' -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile='$ssh_dir/known_hosts'"
+
+          work_dir="$RUNNER_TEMP/leonida-upstream-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          git clone --filter=blob:none --single-branch --branch "$fork_branch" "git@github.com:$GITHUB_REPOSITORY.git" "$work_dir"
+          cd "$work_dir"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream "$upstream_url"
+          git fetch --filter=blob:none --no-tags upstream "$upstream_branch"
+          upstream_sha=$(git rev-parse FETCH_HEAD)
+
+          if ! git merge --no-edit -m "chore: sync $upstream_name [skip ci]" "$upstream_sha"; then
+            echo '::error::Upstream has merge conflicts. Resolve them before the next sync.'
+            exit 1
+          fi
+          git push origin "HEAD:refs/heads/$fork_branch"
+          {
+            echo '## Upstream synchronization complete'
+            echo "Upstream repository: $upstream_name"
+            echo "Upstream branch: $upstream_branch"
+            echo "Upstream commit: $upstream_sha"
+            echo "Fork branch: $fork_branch"
+            echo "Fork commit: $(git rev-parse HEAD)"
+          } >> "$GITHUB_STEP_SUMMARY"
