@@ -28,6 +28,7 @@
 // Slots whose signature the public pages don't give answer with a value that is safe whichever way the caller reads
 // it: see `client_not_connected` (XGameStreaming) and `offline_failure`.
 #include <windows.h>
+#include <unknwn.h>
 
 #include <atomic>
 #include <cstddef>
@@ -595,6 +596,36 @@ const GUID kAccessibilityInterfaces[] = {
     {0xd722b373, 0x8c4d, 0x4692, {0x9e, 0x51, 0xd6, 0xad, 0x9b, 0x37, 0xaa, 0x7d}},   // IXAccessibilityImpl2
 };
 
+// LEONIDA_LOCAL_SPEECH=1 forwards speech synthesis to the locally installed Windows gaming runtime (the host's own
+// xgameruntime.dll, from System32). Off unless set: no profile sets it, and the silent voice below answers.
+struct HostSpeechProvider {
+    HMODULE module=nullptr;
+    IUnknown* base=nullptr;
+    IUnknown* extended=nullptr;
+    HostSpeechProvider() {
+        char enabled[4]{};
+        if(GetEnvironmentVariableA("LEONIDA_LOCAL_SPEECH",enabled,sizeof(enabled))!=1 || enabled[0]!='1') return;
+        module=LoadLibraryExW(L"xgameruntime.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if(!module)return;
+        using Query=HRESULT (WINAPI*)(const GUID*,REFIID,void**);
+        auto query=reinterpret_cast<Query>(GetProcAddress(module,"QueryApiImpl"));
+        if(!query)return;
+        (void)query(&kAccessibilityClass,kAccessibilityInterfaces[0],reinterpret_cast<void**>(&base));
+        (void)query(&kAccessibilityClass,kAccessibilityInterfaces[1],reinterpret_cast<void**>(&extended));
+    }
+    ~HostSpeechProvider(){if(extended)extended->Release();if(base)base->Release();if(module)FreeLibrary(module);}
+};
+HostSpeechProvider& host_speech_provider(){static HostSpeechProvider host;return host;}
+template<unsigned Slot,typename... Args>
+bool call_host_speech(HRESULT& result,Args... args) {
+    auto& host=host_speech_provider();
+    auto* obj=Slot==21?host.extended:host.base;
+    if(!obj)return false;
+    using Method=HRESULT (STDMETHODCALLTYPE*)(IUnknown*,Args...);
+    auto fn=reinterpret_cast<Method>((*reinterpret_cast<void***>(obj))[Slot]);
+    result=fn(obj,args...);
+    return true;
+}
 // 5: HRESULT XHighContrastGetMode(XHighContrastMode* mode): Off, the first enumerator. ASSUMPTION: the signature and
 // that Off is 0 (GDK reference, not re-checked for this file).
 HRESULT STDMETHODCALLTYPE accessibility_high_contrast(void*, uint32_t* mode) {
@@ -623,6 +654,8 @@ constexpr SpeechVoiceInformation kSilentVoice = {"Leonida silent voice - English
 // 8: HRESULT XSpeechSynthesizerEnumerateInstalledVoices(void* context, callback): one voice, the silent one every
 // synthesizer below speaks with. ASSUMPTION: the argument order (GDK reference), only the count (2) was measured.
 HRESULT STDMETHODCALLTYPE speech_enumerate_voices(void*, void* context, InstalledVoicesCallback callback) {
+    HRESULT host_result;
+    if (callback && call_host_speech<8>(host_result, context, callback)) return host_result;
     if (!callback) return E_INVALIDARG;
     callback(&kSilentVoice, context);
     return S_OK;
@@ -645,6 +678,8 @@ uint8_t g_speech_stream_handle = 0;
 
 // 9: HRESULT XSpeechSynthesizerCreate(XSpeechSynthesizerHandle* handle): silent synthesizer handle.
 HRESULT STDMETHODCALLTYPE speech_create(void*, void** handle) {
+    HRESULT host_result;
+    if (handle && call_host_speech<9>(host_result, handle)) return host_result;
     if (!handle) return E_POINTER;
     *handle = &g_speech_synth_handle;
     static std::atomic<bool> s_logged{false};
@@ -655,24 +690,33 @@ HRESULT STDMETHODCALLTYPE speech_create(void*, void** handle) {
 
 // 10: HRESULT XSpeechSynthesizerCloseHandle(XSpeechSynthesizerHandle handle)
 HRESULT STDMETHODCALLTYPE speech_close_synth(void*, void* handle) {
+    HRESULT host_result;
+    if (handle && handle != &g_speech_synth_handle && call_host_speech<10>(host_result, handle)) return host_result;
     return handle == &g_speech_synth_handle ? S_OK : E_INVALIDARG;
 }
 
 // 11: HRESULT XSpeechSynthesizerSetDefaultVoice(XSpeechSynthesizerHandle handle)
 HRESULT STDMETHODCALLTYPE speech_set_default_voice(void*, void* handle) {
+    HRESULT host_result;
+    if (handle && handle != &g_speech_synth_handle && call_host_speech<11>(host_result, handle)) return host_result;
     return handle == &g_speech_synth_handle ? S_OK : E_INVALIDARG;
 }
 
 // 12: HRESULT XSpeechSynthesizerSetCustomVoice(XSpeechSynthesizerHandle handle, const char* voiceId): only the
 // enumerated voice is installed.
 HRESULT STDMETHODCALLTYPE speech_set_custom_voice(void*, void* handle, const char* voice_id) {
+    HRESULT host_result;
+    if (handle && handle != &g_speech_synth_handle && voice_id && call_host_speech<12>(host_result, handle, voice_id)) return host_result;
     if (handle != &g_speech_synth_handle || !voice_id) return E_INVALIDARG;
     return std::strcmp(voice_id, kSilentVoice.voice_id) == 0 ? S_OK : E_INVALIDARG;
 }
 
 // 13, 21: HRESULT XSpeechSynthesizerCreateStreamFromText/Ssml(synthesizer, const char* text,
 //                                                             XSpeechSynthesizerStreamHandle* stream)
-HRESULT STDMETHODCALLTYPE speech_create_stream(void*, void* synth, const char*, void** stream) {
+template<unsigned Slot>
+HRESULT STDMETHODCALLTYPE speech_create_stream(void*, void* synth, const char* text, void** stream) {
+    HRESULT host_result;
+    if (synth && synth != &g_speech_synth_handle && text && stream && call_host_speech<Slot>(host_result, synth, text, stream)) return host_result;
     if (stream) *stream = nullptr;
     if (synth != &g_speech_synth_handle) return E_INVALIDARG;
     if (!stream) return E_POINTER;
@@ -682,11 +726,15 @@ HRESULT STDMETHODCALLTYPE speech_create_stream(void*, void* synth, const char*, 
 
 // 14: HRESULT XSpeechSynthesizerCloseStreamHandle(XSpeechSynthesizerStreamHandle stream)
 HRESULT STDMETHODCALLTYPE speech_close_stream(void*, void* stream) {
+    HRESULT host_result;
+    if (stream && stream != &g_speech_stream_handle && call_host_speech<14>(host_result, stream)) return host_result;
     return stream == &g_speech_stream_handle ? S_OK : E_INVALIDARG;
 }
 
 // 15: HRESULT XSpeechSynthesizerGetStreamDataSize(stream, size_t* size)
 HRESULT STDMETHODCALLTYPE speech_stream_size(void*, void* stream, size_t* size) {
+    HRESULT host_result;
+    if (stream && stream != &g_speech_stream_handle && size && call_host_speech<15>(host_result, stream, size)) return host_result;
     if (size) *size = 0;
     if (stream != &g_speech_stream_handle) return E_INVALIDARG;
     if (!size) return E_POINTER;
@@ -696,6 +744,8 @@ HRESULT STDMETHODCALLTYPE speech_stream_size(void*, void* stream, size_t* size) 
 
 // 16: HRESULT XSpeechSynthesizerGetStreamData(stream, size_t size, void* buffer, size_t* used)
 HRESULT STDMETHODCALLTYPE speech_stream_data(void*, void* stream, size_t size, void* buffer, size_t* used) {
+    HRESULT host_result;
+    if (stream && stream != &g_speech_stream_handle && buffer && used && call_host_speech<16>(host_result, stream, size, buffer, used)) return host_result;
     if (used) *used = 0;
     if (stream != &g_speech_stream_handle) return E_INVALIDARG;
     if (!buffer || size < sizeof(kSilentWave)) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
@@ -723,7 +773,7 @@ const void* const kAccessibilityVtable[] = {
     FN(speech_close_synth),                  // 10 XSpeechSynthesizerCloseHandle
     FN(speech_set_default_voice),            // 11 XSpeechSynthesizerSetDefaultVoice
     FN(speech_set_custom_voice),             // 12 XSpeechSynthesizerSetCustomVoice
-    FN(speech_create_stream),                // 13 XSpeechSynthesizerCreateStreamFromText
+    FN(speech_create_stream<13>),                // 13 XSpeechSynthesizerCreateStreamFromText
     FN(speech_close_stream),                 // 14 XSpeechSynthesizerCloseStreamHandle
     FN(speech_stream_size),                  // 15 XSpeechSynthesizerGetStreamDataSize
     FN(speech_stream_data),                  // 16 XSpeechSynthesizerGetStreamData
@@ -731,7 +781,7 @@ const void* const kAccessibilityVtable[] = {
     FN(accessibility_offline<18>),           // 18 XSpeechToTextUpdateHypothesisString
     FN(accessibility_offline<19>),           // 19 XSpeechToTextFinalizeHypothesisString
     FN(accessibility_offline<20>),           // 20 XSpeechToTextCancelHypothesisString
-    FN(speech_create_stream),                // 21 XSpeechSynthesizerCreateStreamFromSsml
+    FN(speech_create_stream<21>),                // 21 XSpeechSynthesizerCreateStreamFromSsml
 };
 static_assert(std::size(kAccessibilityVtable) == 22, "IUnknown + IXAccessibilityImpl's 19 methods");
 ClassObject g_accessibility_object{kAccessibilityVtable};

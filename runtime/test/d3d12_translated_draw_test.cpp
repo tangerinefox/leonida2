@@ -36,6 +36,9 @@
 // build. On success it prints one marker line, after every check.
 #ifndef LEONIDA_M15_GUEST
 #include "vk_test_device.h"
+#include "test_temp_dir.h"
+#include "d3d12_native_graphics_fixture.h"
+#include <optional>
 #endif
 #include "d3d12_test_shaders.h"
 #ifndef LEONIDA_M15_GUEST
@@ -80,6 +83,7 @@ std::vector<std::uint8_t> read_file(const std::filesystem::path& path) {
     return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
 }
 
+
 // One 32-byte vertex record, as vs_m15.asm reads it: position xyzw, then colour rgba.
 struct Vertex {
     float position[4];
@@ -115,7 +119,11 @@ int main(int argc, char** argv) {
     // The FSSM programs the index entries are keyed by; the shim's device finds the index through LEONIDA_SHADERS.
     const std::filesystem::path root_dir = argv[1];
 #else
-int main() {
+int main(int argc, char** argv) {
+    const bool derived_zero = argc == 2 && std::strcmp(argv[1], "--derived-zero") == 0;
+    const bool derived_restore = argc == 2 && std::strcmp(argv[1], "--derived-restore") == 0;
+    const bool native = derived_zero || derived_restore || (argc == 2 && std::strcmp(argv[1], "--native-pso") == 0);
+    EXPECT(argc == 1 || native);
     vktest::Device d;
     const auto device_status = d.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) return 77;  // no Vulkan GPU: ctest skips
@@ -134,6 +142,13 @@ int main() {
     EXPECT(library.load((root_dir / "spirv").string()));
     EXPECT(library.find("vs", leonida::sha256_hex(vs_program)) && library.find("ps", leonida::sha256_hex(ps_program)));
     EXPECT(library.find("ps", leonida::sha256_hex(ps_program))->uses_code_base);
+    std::optional<testfiles::ScratchDir> scratch;
+    if (native) {
+        scratch.emplace("leonida_native_graphics_draw");
+        std::error_code ec;
+        std::filesystem::copy(root_dir / "spirv", scratch->path() / "spirv", std::filesystem::copy_options::recursive, ec);
+        EXPECT(!ec && write_native_catalog(scratch->path(), "vs", vs_program, ps_program));
+    }
 #endif
     const auto vs_container = shader_container(vs_program), ps_container = shader_container(ps_program);
     // A program the index does not know (the VS's bytes with one word changed) must be refused by the PSO.
@@ -168,6 +183,8 @@ int main() {
         }
 #else
         rt::d3d12::VulkanDeviceInfo info{};
+        info.prepare_on_bind=d.prepare_on_bind;
+        info.cold_graphics_compile=d.cold_graphics_compile;
         info.get_instance_proc = d.instance_proc;
         info.instance = d.instance;
         info.physical = d.physical;
@@ -175,7 +192,8 @@ int main() {
         info.queue = d.queue;
         info.queue_family = d.family;
         info.buffer_device_address = true;
-        info.shader_dir = (root_dir / "spirv").string();
+        info.features = d.enabled;
+        info.shader_dir = ((native ? scratch->path() : root_dir) / "spirv").string();
         ID3D12Device* inner = nullptr;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
         Ref<ID3D12Device> device;
@@ -215,7 +233,40 @@ int main() {
         pso_desc.RTVFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
         pso_desc.SampleDesc.Count = 1;
         Ref<ID3D12PipelineState> pso, unknown;
-        EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&pso.p))));
+#ifndef LEONIDA_M15_GUEST
+        if (native) {
+            EXPECT(FAILED(create_native_pso(device.p, root.p, pso_desc.RTVFormats[0], stale_digest, &unknown.p)) && !unknown.p);
+            EXPECT(FAILED(create_native_pso(device.p, root.p, pso_desc.RTVFormats[0], np::Digest{}, &unknown.p)) && !unknown.p);
+            EXPECT(SUCCEEDED(create_native_pso(device.p, root.p, pso_desc.RTVFormats[0], producer_digest, &pso.p)) && pso.p);
+            Ref<ID3D12PipelineState> duplicate;
+            EXPECT(SUCCEEDED(create_native_pso(device.p, root.p, pso_desc.RTVFormats[0], producer_digest, &duplicate.p)));
+            EXPECT(duplicate.p && duplicate.p != pso.p);
+            EXPECT(rt::d3d12::graphics_pipeline_id(pso.p) != 0 &&
+                   rt::d3d12::graphics_pipeline_id(duplicate.p) == rt::d3d12::graphics_pipeline_id(pso.p));
+            const GUID marker{0xe79d6ba2, 0x2d8c, 0x4344, {0xa4, 0x81, 0x34, 0x19, 0x24, 0x4e, 0x2a, 0x0b}};
+            const UINT value = 17;
+            EXPECT(SUCCEEDED(pso->SetPrivateData(marker, sizeof(value), &value)));
+            UINT private_size = 0;
+            EXPECT(duplicate->GetPrivateData(marker, &private_size, nullptr) == DXGI_ERROR_NOT_FOUND);
+            if (derived_zero || derived_restore) {
+                using Derive=HRESULT(WINAPI*)(void*,ID3D12PipelineState*,UINT,const unsigned char*,const IID*,void**);
+                const auto call=reinterpret_cast<Derive>(slot(device.p,55));
+                std::array<unsigned char,0x14c> record{};
+                const UINT tag=3; std::memcpy(record.data(),&tag,4);
+                Ref<ID3D12PipelineState> masked;
+                EXPECT(SUCCEEDED(call(device.p,pso.p,1,record.data(),&__uuidof(ID3D12PipelineState),reinterpret_cast<void**>(&masked.p))) && masked.p);
+                if (derived_restore) {
+                    const UINT mask=~0u; std::memcpy(record.data()+4,&mask,4);
+                    Ref<ID3D12PipelineState> restored;
+                    EXPECT(SUCCEEDED(call(device.p,masked.p,1,record.data(),&__uuidof(ID3D12PipelineState),reinterpret_cast<void**>(&restored.p))) && restored.p);
+                    std::swap(restored.p,pso.p);
+                } else std::swap(masked.p,pso.p);
+            } else std::swap(duplicate.p,pso.p);  // The draw uses the second view after releasing the first one.
+        } else
+#endif
+        {
+            EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&pso.p))));
+        }
         pso_desc.VS = {unknown_container.data(), unknown_container.size()};
         EXPECT(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&unknown.p)) == E_INVALIDARG && !unknown.p);
 
@@ -293,7 +344,8 @@ int main() {
         list->ResourceBarrier(2, barriers);
         // The first command list already contains the vertex upload. Reuse it for subsequent frames
         // after the preceding submission's fence has completed and its readback is available.
-        const auto render_frame = [&](UINT64 frame, float x_offset, float bias) -> int {
+        const auto render_frame = [&](UINT64 frame, float x_offset, float bias,
+                                      D3D_PRIMITIVE_TOPOLOGY last_topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST) -> int {
             if (frame > 1) {
                 EXPECT(SUCCEEDED(allocator->Reset()));
                 EXPECT(SUCCEEDED(list->Reset(allocator.p, pso.p)));
@@ -323,6 +375,7 @@ int main() {
                                    {0, {1, -1, 0.125f + bias, 0}, 6},  // bottom right: same V#, other constants
                                    {1, {0, 0, 0.25f + bias, 0}, 3}};   // bottom left: the second V#
             for (const Draw& draw : draws) {
+                if (draw.slot == 1) list->IASetPrimitiveTopology(last_topology);
                 list->SetGraphicsRootDescriptorTable(0, D3D12_GPU_DESCRIPTOR_HANDLE{gpu + std::uint64_t(draw.slot) * step});
                 list->SetGraphicsRoot32BitConstants(1, 4, draw.constants, 0);
                 list->DrawInstanced(draw.vertices, 1, 0, 0);
@@ -370,6 +423,32 @@ int main() {
         }
 #endif
         EXPECT(render_frame(1, 0.0f, 0.0f) == 0);
+#ifndef LEONIDA_M15_GUEST
+        if (d.enabled.geometryShader) {
+            // The last draw covers half the lower-left quadrant as a triangle. The Xbox rectangle primitive
+            // fills the quadrant through the same PSO. The other three quadrants keep their original values.
+            const auto triangles = pixels;
+            constexpr auto rectangles = static_cast<D3D_PRIMITIVE_TOPOLOGY>(17);
+            const Pixel lower_left = {0.75f, 0.25f, 0.75f, 1.0f};
+            for (UINT64 frame : {2u, 4u}) {
+                EXPECT(render_frame(frame, 0.0f, 0.0f, rectangles) == 0);
+                for (UINT y = 0; y < target_extent; ++y) {
+                    for (UINT x = 0; x < target_extent; ++x) {
+                        const auto i = y * target_extent + x;
+                        const bool covered = !derived_zero && y >= target_extent / 2 && x < target_extent / 2;
+                        const auto& want = covered ? lower_left : triangles[i];
+                        if (pixels[i] != want) {
+                            std::fprintf(stderr, "rectangle draw mismatch at (%u, %u) in frame %llu\n", x, y,
+                                         static_cast<unsigned long long>(frame));
+                            return 1;
+                        }
+                    }
+                }
+                EXPECT(render_frame(frame + 1, 0.0f, 0.0f) == 0);
+                EXPECT(pixels == triangles);
+            }
+        }
+#endif
         for (auto* r : {&vertex_buffer, &upload, &readback, &target}) r->reset();
         pso.reset();
         root.reset();
@@ -387,6 +466,14 @@ int main() {
     const Pixel clear_color = {0.5f, 0.125f, 0.25f, 0.5f};
     const Pixel top_left = {0.125f, 1.0f, 0.75f, 1.0f}, bottom_right = {0.25f, 1.125f, 0.875f, 1.0f};
     const Pixel bottom_left = {0.75f, 0.25f, 0.75f, 1.0f};
+#ifndef LEONIDA_M15_GUEST
+    if (derived_zero) {
+        const Pixel background{0.5f,0.125f,0.25f,0.5f};
+        for (const auto& pixel:pixels) EXPECT(std::memcmp(&pixel,&background,sizeof(Pixel))==0);
+        std::printf("derived mask zero: all %zu pixels equal the clear value\n",pixels.size());
+        return 0;
+    }
+#endif
     unsigned mismatches = 0, edge = 0, edge_triangle = 0, edge_clear = 0;
     for (UINT row = 0; row < target_extent; ++row) {
         for (UINT col = 0; col < target_extent; ++col) {

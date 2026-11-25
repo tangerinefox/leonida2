@@ -37,12 +37,13 @@ struct Depth24Bias {
     int constant = 0;     // D3D12_RASTERIZER_DESC::DepthBias
     float slope = 0.0f;   // SlopeScaledDepthBias
     float clamp = 0.0f;   // DepthBiasClamp: > 0 caps the bias, < 0 floors it, 0 leaves it
+    float levels = 16777215.0f;
     bool any() const { return constant != 0 || slope != 0.0f; }
 };
 
 // D3D's constant term in float: (float)DepthBias * r, with r the float nearest 1 / (2^24 - 1).
-inline float depth24_bias_constant(int bias) {
-    return float(bias) * float(1.0 / 16777215.0);
+inline float depth24_bias_constant(int bias, float levels=16777215.0f) {
+    return float(bias) * float(1.0 / double(levels));
 }
 
 namespace spirv24 {
@@ -141,7 +142,7 @@ private:
 // The edit, on a parsed module. Globals are collected first and spliced in at their section's end.
 class Patch {
 public:
-    Patch(Module& m, std::uint32_t entry) : m_(m), entry_(entry) {
+    Patch(Module& m, std::uint32_t entry, float levels) : m_(m), entry_(entry), levels_(levels) {
         // Copies: apply() moves the module's instructions while the code at returns still looks types up.
         for (const Inst& i : m.insts()) {
             if (opcode(i) == op_function) break;
@@ -185,7 +186,7 @@ public:
     void prime_quantise() {
         t_bool();
         glsl();
-        for (float f : {16777215.0f, 0.0f}) f32(f);
+        for (float f : {levels_, 0.0f}) f32(f);
         for (std::uint32_t u : {0x3f800000u, 0xffffffu, 0x7f800000u, 0u, 23u, 1u, 80u}) u32(u);
     }
     std::uint32_t f32(float f) { return constant(t_float(), bits(f)); }
@@ -248,11 +249,11 @@ public:
     std::uint32_t quantise(std::vector<Inst>& code, std::uint32_t z) {
         const std::uint32_t tf = t_float(), tu = t_uint(), tb = t_bool();
         const std::uint32_t b = emit(code, op_bitcast, tu, {z});
-        const std::uint32_t product = emit(code, op_f_mul, tf, {z, f32(16777215.0f)});
+        const std::uint32_t product = emit(code, op_f_mul, tf, {z, f32(levels_)});
         const std::uint32_t rounded = ext(code, tf, glsl_round_even, {product});
         // Clamped before the conversion so an out-of-range float never reaches OpConvertFToU (undefined there).
         const std::uint32_t safe = ext(code, tf, glsl_fmin, {ext(code, tf, glsl_fmax, {rounded, f32(0.0f)}),
-                                                            f32(16777215.0f)});
+                                                            f32(levels_)});
         const std::uint32_t code_mid = emit(code, op_convert_f_to_u, tu, {safe});
         const std::uint32_t at_least_one = emit(code, op_u_greater_than_equal, tb, {b, u32(0x3f800000u)});
         const std::uint32_t code_hi = emit(code, op_select, tu, {at_least_one, u32(0xffffffu), code_mid});
@@ -327,6 +328,7 @@ public:
     }
 
 private:
+    float levels_;
     Module& m_;
     std::uint32_t entry_;
     std::vector<Inst> existing_;
@@ -369,7 +371,7 @@ inline std::vector<std::uint32_t> depth24_patch_fragment(const std::vector<std::
         if (opcode(i) == op_function) break;
     }
 
-    Patch p(m, entry);
+    Patch p(m, entry, bias.levels);
     const std::uint32_t tf = p.t_float();
     p.prime_quantise();
     std::uint32_t frag_depth = p.builtin_variable(builtin_frag_depth);
@@ -396,7 +398,7 @@ inline std::vector<std::uint32_t> depth24_patch_fragment(const std::vector<std::
             const std::uint32_t dy = p.ext(entry_code, tf, glsl_fabs, {p.emit(entry_code, op_dpdy, tf, {z})});
             const std::uint32_t max_slope = p.ext(entry_code, tf, glsl_fmax, {dx, dy});
             std::uint32_t amount = p.emit(entry_code, op_f_mul, tf, {p.f32(bias.slope), max_slope});
-            amount = p.emit(entry_code, op_f_add, tf, {amount, p.f32(depth24_bias_constant(bias.constant))});
+            amount = p.emit(entry_code, op_f_add, tf, {amount, p.f32(depth24_bias_constant(bias.constant,bias.levels))});
             if (bias.clamp > 0.0f) amount = p.ext(entry_code, tf, glsl_fmin, {amount, p.f32(bias.clamp)});
             if (bias.clamp < 0.0f) amount = p.ext(entry_code, tf, glsl_fmax, {amount, p.f32(bias.clamp)});
             z = p.emit(entry_code, op_f_add, tf, {z, amount});

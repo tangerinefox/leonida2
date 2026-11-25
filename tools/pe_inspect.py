@@ -233,12 +233,13 @@ class PeImage:
 
 def _imports(img: PeImage, kind: str, index: int, delay: bool = False) -> list[dict]:
     entries = []
-    for dll_rva, iat_rva, int_rva, _va_entries in img.import_descriptors(index, delay=delay):
-        dll = img.string_at(dll_rva)
+    for dll_rva, iat_rva, int_rva, va_entries in img.import_descriptors(index, delay=delay):
+        dll = img.string_at(dll_rva) if dll_rva > 0 else None
         if dll is None:
             continue
         lookup = int_rva if int_rva > 0 else iat_rva
-        entries.append({"dll": dll, "kind": kind, "functions": img.thunk_names(lookup) if lookup > 0 else []})
+        entries.append({"dll": dll, "kind": kind,
+                        "functions": img.thunk_names(lookup, va_entries=va_entries) if lookup > 0 else []})
     return entries
 
 

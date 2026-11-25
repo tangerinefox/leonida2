@@ -60,6 +60,52 @@ Three setup mistakes each give a blank or empty picture without an error: the ex
 from the library (`exe/index.json`), a build without SDL3 (no pad), and a BCPack predictor file that was never
 generated (`tools/build_dstorage_history.py`; without it the loading art and most BC7 textures stay empty).
 
+## Running the game under Wine with one command
+
+`scripts/run_game_wine.sh` makes one bounded, silent run of the retail game under Wine and prints counts only. It
+complements `scripts/run_wine_session.sh` (the runtime's unit tests under Wine) and the `systemd --user` boot
+wrappers described above: it needs no fixed paths, and its output is a summary that can go into an issue.
+
+```sh
+scripts/run_game_wine.sh --build <build folder or checkout> --exe <game executable> --game-dir <package folder> \
+    --shaders <translated library> --out <new run folder> --device 1002:744c --seconds 600
+```
+
+`--help` lists every input. Each path comes from an argument or from `LEONIDA_GAME_EXE`, `LEONIDA_GAME_DIR` and
+`LEONIDA_SHADERS`; `WINE` names another Wine (Proton's `files/bin/wine`), and `WINEPREFIX` (or `--prefix`) a prefix to
+reuse instead of a new one in the run folder.
+
+What it needs:
+
+- **Wine** (the `wine` on `PATH`, or `WINE`), `timeout`, `flock`, `setsid` and Python 3.
+- **A Vulkan driver** for the GPU (Mesa's RADV was tested). `--device VID:DID` pins it through
+  `MESA_VK_DEVICE_SELECT`; without it the script warns that Mesa picks the device.
+- **A display.** By default the run is headless: a private `kwin_wayland --virtual --xwayland` session under
+  `dbus-run-session`, with its own `XDG_RUNTIME_DIR` in the run folder, so nothing appears on the desktop. Its
+  rootless Xwayland offers DRI3, which RADV needs to present; Xvfb has none, so without `kwin_wayland` the script
+  says what is missing instead of falling back. `--visible` opens the window on the current `DISPLAY` instead.
+- **A runtime build**: a folder with `gta6rt.exe` and `gta6rt_tls_host.dll`, or a checkout, whose `runtime/` it
+  cross-builds first with clang-cl and xwin (`XWIN_DIR`, see [linux.md](linux.md#the-runtime-under-wine-or-proton)).
+
+What it does:
+
+- **Sound off:** Wine's audio drivers are disabled through `WINEDLLOVERRIDES`, PulseAudio, PipeWire and ALSA point
+  at nothing, and `LEONIDA_AUDIO=silent` makes the runtime serve its silent output endpoint
+  ([runtime_imports.md](runtime_imports.md)); the summary says whether it was served.
+- **Limits:** a hard time limit (`--seconds`, then SIGTERM and SIGKILL 10 s later), a lock so one run happens at a
+  time (`--lock`, by default in `XDG_RUNTIME_DIR`), and teardown of Wine and the whole session on exit, time-out or
+  signal.
+- **Traces:** `gta6rt --run` with `--trace` and `--trace-d3d12`, a fresh `--overlay` and save folder in the run
+  folder. Every other `LEONIDA_*` variable reaches the runtime unchanged, so `LEONIDA_INPUT_SCRIPT=a@210,a@240`
+  presses A as above. Arguments after `--` go to `gta6rt`.
+- **Summary:** `tools/game_run_summary.py` prints the run time, how it ended, exceptions by code, D3D12 calls by
+  outcome, presents, the most frequent failing calls and the `[rt]` lines by category with numbers masked. It never
+  prints a log line. `--screenshot-every S` captures the game window into the run folder (ImageMagick's `import` and
+  `xprop`).
+
+The run folder's `stderr.log`, `boot.jsonl` and screenshots can show or quote what the title prints, so they stay on
+your machine; share the summary.
+
 ## What a healthy boot looks like (Linux machine)
 
 | Time | Stage |

@@ -1,4 +1,5 @@
 #pragma once
+#include "gpu_label_memory.h"
 
 // The command-list IR (docs/d3d12_vulkan.md section 3.2): what a D3D12 command list records, kept until
 // ExecuteCommandLists replays it on Vulkan (vulkan_replay.h). This slice covers legacy and enhanced barriers and
@@ -423,6 +424,17 @@ struct DrawViewports {
     std::uint32_t scissor_count = 0;
 };
 
+// Simple DRAW or DRAW_INDEXED records. The GPU consumes the action's arguments;
+// the IR retains an ordinary record-time graphics-state snapshot alongside them.
+struct IndirectDrawArgs {
+    ResourceId argument_buffer = 0;
+    std::uint64_t argument_offset = 0;
+    std::uint32_t stride = 0;
+    std::uint32_t max_count = 1;
+    ResourceId count_buffer = 0;  // zero: fixed draw count; otherwise, a GPU-written uint32
+    std::uint64_t count_offset = 0;
+};
+
 // DrawInstanced / DrawIndexedInstanced / DispatchMesh, with everything they use captured when they are recorded:
 // D3D12 reads render-target and depth descriptors at OMSetRenderTargets, and every other piece of state is the
 // list's state at the draw. resource 0 marks an unbound render-target slot or no depth buffer. A mesh draw
@@ -451,6 +463,14 @@ struct Draw {
     bool mesh = false;
     std::shared_ptr<const DrawViewports> viewports;  // non-null when >1 viewport or >1 scissor was bound
 };
+
+// Only indirect draws allocate this extra payload. Copies of the IR share both its
+// immutable state and the usual cached DrawViews; direct draws and barriers stay compact.
+struct IndirectRasterPayload {
+    Draw state;
+    IndirectDrawArgs arguments;
+};
+using IndirectRasterDraw = std::shared_ptr<const IndirectRasterPayload>;
 
 // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT and D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT.
 inline constexpr std::uint32_t texture_data_pitch_alignment = 256;
@@ -527,6 +547,7 @@ struct UavView {
     std::uint32_t mip;           // texture
     std::uint32_t first_layer;
     std::uint32_t layer_count;
+    bool exact_clear_format = false; // newly exposed 1D/3D UAVs: do not clear via a different backing format
 };
 
 // ClearUnorderedAccessViewUint / ...Float; the resource must be in unordered_access state at execution. values are
@@ -602,6 +623,17 @@ enum class IndirectKind : std::uint8_t {
     dispatch_mesh = 3,
 };
 
+// For a creation-validated signature, commands are stride bytes apart, but no padding follows the
+// last packed payload. A zero maximum reads no records (offset alignment is checked separately).
+constexpr bool indirect_records_fit(std::uint64_t buffer_size, std::uint64_t offset, std::uint32_t max_count,
+                                    std::uint32_t stride, std::uint32_t packed_size) {
+    if (!packed_size || packed_size > stride || stride % 4) return false;
+    if (!max_count) return true;
+    // All factors are UINT32 and packed_size <= stride: required <= UINT32_MAX squared.
+    const auto required = std::uint64_t(max_count - 1) * stride + packed_size;
+    return offset <= buffer_size && required <= buffer_size - offset;
+}
+
 struct ExecuteIndirect {
     IndirectKind kind = IndirectKind::draw;
     std::uint32_t stride = 0;
@@ -653,6 +685,11 @@ struct CopyAccelerationStructure {
     std::uint64_t dst_va = 0;
     std::uint64_t src_va = 0;
     std::uint32_t mode = 0;
+    // Set where the layer resolved a VA in the title's memory to the copy shaders reach it by (an XDXR build, at
+    // record time): the bytes that copy has from the VA on. 0: the VA names one of the layer's buffers, sized at
+    // replay by its binding.
+    std::uint64_t dst_room = 0;
+    std::uint64_t src_room = 0;
 };
 
 // EmitRaytracingAccelerationStructurePostbuildInfo, and each postbuild desc of BuildRaytracingAccelerationStructure:
@@ -662,14 +699,28 @@ struct AccelerationStructurePostbuild {
     std::uint64_t dest_va = 0;
     std::uint32_t type = 0;
     std::vector<std::uint64_t> sources;
+    std::uint64_t dest_room = 0;  // as CopyAccelerationStructure::dst_room
 };
 
 using Command = std::variant<TransitionBarrier, UavBarrier, AliasingBarrier, GlobalBarrier, BufferBarrier,
                              TextureBarrier, ClearRenderTarget, ClearDepthStencil, CopyBuffer, CopyTexture,
                              CopyResource, ResolveSubresource, Predication, ClearUnorderedAccess, DiscardResource,
-                             WriteImmediate, AtomicCopyBuffer, BeginQuery, EndQuery, ResolveQueries, DebugMarker,
+                             WriteImmediate, label::Write, AtomicCopyBuffer, BeginQuery, EndQuery, ResolveQueries, DebugMarker,
                              ExecuteIndirect, BuildAccelerationStructure, Dispatch, Draw, CopyAccelerationStructure,
-                             AccelerationStructurePostbuild>;
+                             AccelerationStructurePostbuild, IndirectRasterDraw>;
+
+struct DrawCommandView {
+    const Draw* state = nullptr;
+    const IndirectDrawArgs* arguments = nullptr;
+};
+
+// Queries, shader-work detection and replay all see the same captured graphics state.
+inline DrawCommandView draw_command(const Command& command) noexcept {
+    if (const auto* draw = std::get_if<Draw>(&command)) return {draw, nullptr};
+    if (const auto* indirect = std::get_if<IndirectRasterDraw>(&command); indirect && *indirect)
+        return {&(*indirect)->state, &(*indirect)->arguments};
+    return {};
+}
 
 class CommandList {
 public:
@@ -769,6 +820,12 @@ public:
         return append(std::move(draw));
     }
 
+    bool draw_indirect(Draw&& state, const IndirectDrawArgs& arguments) {
+        if (closed_ || !state.pipeline) return false;
+        if (!arguments.max_count) return true;
+        return append(std::make_shared<const IndirectRasterPayload>(std::move(state), arguments));
+    }
+
     // ClearRenderTargetView; the resource must be in render_target state at execution. No rects: the whole view.
     bool clear_render_target(const TargetView& target, const ClearColor& color, std::span<const Rect> rects = {}) {
         if (!valid(target)) return false;
@@ -797,6 +854,11 @@ public:
     }
 
     // WriteBufferImmediate: D3D12 requires a 4-byte aligned, non-null address and one of the three modes.
+    bool write_gpu_label(const label::Write& write) {
+        if(write.target.owner.expired() || write.clock>2) return false;
+        return append(write);
+    }
+
     bool write_immediate(const WriteImmediate& write) {
         if (!write.address || write.address % 4 || write.mode > write_immediate_mode::marker_out) return false;
         return append(write);

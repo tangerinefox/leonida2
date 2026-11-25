@@ -227,6 +227,23 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
                          ",\"allocation_base\":" + quote(hex(reinterpret_cast<uint64_t>(m.AllocationBase))) +
                          ",\"size\":" + quote(hex(m.RegionSize)) + ",\"state\":" + quote(hex(m.State)) +
                          ",\"protect\":" + quote(hex(m.Protect)) + ",\"type\":" + quote(hex(m.Type)) + "}";
+                // The runs the fault page's neighbours sit in: a writable run that ends mid-granule is a commit
+                // shorter than the console's 64 KiB granule, a run that ends at a granule boundary is not. VirtualQuery
+                // reports each from the page asked about (its BaseAddress is that page), so a run is the page, the
+                // allocation it belongs to and how far the run goes from there ("size").
+                std::string runs;
+                const uintptr_t page = static_cast<uintptr_t>(r.ExceptionInformation[1]) & ~uintptr_t(0xfff);
+                for (int i = -1; i <= 1; ++i) {
+                    const uintptr_t at = page + static_cast<uintptr_t>(static_cast<intptr_t>(i)) * 0x1000;
+                    MEMORY_BASIC_INFORMATION n{};
+                    if (!VirtualQuery(reinterpret_cast<const void*>(at), &n, sizeof(n))) continue;
+                    if (!runs.empty()) runs += ",";
+                    runs += "{\"at\":" + quote(hex(at)) + ",\"allocation_base\":" +
+                            quote(hex(reinterpret_cast<uint64_t>(n.AllocationBase))) + ",\"size\":" +
+                            quote(hex(n.RegionSize)) + ",\"state\":" + quote(hex(n.State)) + ",\"protect\":" +
+                            quote(hex(n.Protect)) + ",\"type\":" + quote(hex(n.Type)) + "}";
+                }
+                if (!runs.empty()) f += ",\"runs\":[" + runs + "]";
             }
             if (r.ExceptionCode == kCppException) f += ",\"cpp\":true";
             if (info.ContextRecord) {

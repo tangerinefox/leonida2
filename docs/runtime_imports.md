@@ -64,6 +64,16 @@ Since the library-loader shims (`runtime/shims/library_loader.cpp`), a module's 
 
 The process shim (`runtime/shims/process.cpp`) serves `ExitProcess` and `GetCommandLineA/W` the same way: through `kernel32`, `kernelbase`, and `api-ms-win-core-processthreads-l1-1-0` and `api-ms-win-core-processenvironment-l1-1-0`, the sets the API-set umbrella libraries (`OneCore_apiset.lib`, `mincore.lib`) bind them to. `vcomp140.dll` imports `ExitProcess` from the first of these. The UCRT's `_get_narrow_winmain_command_line` and `_get_wide_winmain_command_line` are served too, so a `WinMain` executable gets the game's command line as `lpCmdLine`. `abort()` raises `SIGABRT` when the guest installed a handler (the guest's `signal()` import binds to the host CRT, so its table is the one raised here); with the default or ignore disposition, or a handler that returns, the run still ends with code 3. `run_tiny_game_abort_exit_codes` compares that with a native run of the stand-in image. The table above is `gta6rt --dry-run` on each DLL at the commit that added this paragraph.
 
+The lifecycle shim (`runtime/shims/lifecycle.cpp`) serves `RegisterAppStateChangeNotification` and
+`UnregisterAppStateChangeNotification` under `api-ms-win-core-psm-appnotify-l1-1-0`, `-l1-1-1` and `kernelbase.dll`, and
+`CreateWindowExW`/`CreateWindowExA` under `user32.dll` and the two `ext-ms-win-rtcore-ntuser-window-l1-1-*` sets, and
+`CreateWindowExA` under `ext-ms-win-rtcore-ntuser-window-ansi-l1-1-0`. The title's import table names
+`RegisterAppStateChangeNotification` from `api-ms-win-core-psm-appnotify-l1-1-0` and `CreateWindowExA` from that ANSI
+set (`tools/pe_inspect.py`). Only the title's first top-level window (no parent, not a child, not a tool window) is fitted to the work area and hooked: its
+`SC_CLOSE` runs the registered suspend callbacks with `quiesced` TRUE under the registration lock, then the run ends
+through the title's own `ExitProcess`, so the host finishes its cleanup. A 1 s deadline ends the run the same way if the
+callbacks have not returned.
+
 The shims added since account for the rest of the difference from the first version of the table. The UCRT's `_configure_narrow_argv`, `_configure_wide_argv`, `__p___argc`, `__p___wargv` and `abort` are served by `runtime/shims/process.cpp`, which is why almost every DLL gained one or two. The file-system calls listed in *Console paths and the write overlay* below (`CreateFile2`, `CopyFile2`, `CreateDirectoryW`, `FindFirstFileExW`, `SetFileAttributesW` and the rest) account for `msvcp140.dll`, `vcomp140.dll`, `Bink2Scarlett.dll`'s `CreateFile2` and part of the two HTTP clients. `winhttp.dll` is a module the shims own (*WinHTTP offline* below), so every `WinHttp*` import binds to it: 15 in `libHttpClient.GDK.dll` (all 16 but `WinHttpCrackUrl`) and 15 in `XCurl.dll` (all but `WinHttpQueryOption`). That is why the two HTTP clients moved the most: 11 to 26 and 9 to 24 shim imports.
 
 The UCRT argv configuration imports honor the executable's startup mode. Each run starts with `argc == 0` and
@@ -163,17 +173,23 @@ policy "other" (none is counted as returning an `HRESULT`), and they come from s
 | `xapu.dll` | 5: `XApuConnect`, `XApuDequeueResult`, `XApuDisconnect`, `XApuEnqueueCommand`, `XApuGetResultCount` | the audio processing unit |
 | `AcpHal.dll` | 9: `AcpHalAllocateShapeContexts`, `AcpHalCreate`, `AcpHalReleaseShapeContexts`, `ApuAlloc`, `ApuCreateHeap`, `ApuFree`, `ApuIsVirtualAddressValid`, `ApuMapApuAddress`, `ApuMapVirtualAddress` | the audio hardware layer |
 
-The game executable imports two functions from `xg_xs.dll`, the console's texture layout library.
-`XGSuggestSwizzleMode` writes the Xbox layout encoding `0x100 | mode`, including when its output aliases the
-description. `XGCreateTextureComputer` returns a refcounted computer for supported layouts. Slot 2 writes the Series
-layout, slot 8 copies linear source rows into a subresource, and slot 10 reports 64 KiB tiled-resource geometry.
-Rows and tile extents are computed in storage elements, so block-compressed formats use one 4x4 block as an element.
-Packed mips share a block at the start of each slice, followed by the other mips from smallest to largest.
-The shim covers single-sample linear textures, 2D 4 KiB standard and 64 KiB standard/display textures, and single-mip
-4 KiB standard volumes. Unsupported descriptions return a failure and a fallback object because two measured
-callers dereference the output without checking the HRESULT. Set `LEONIDA_XG_TRACE=1` to log the first 1024 calls
-per entry point. See [the source notes](../runtime/shims/xg_xs_THIRD_PARTY.md) and `xg_xs_test`. The table above
-predates the shim.
+The game executable imports two functions from `xg_xs.dll`, the console's texture layout library:
+`XGSuggestSwizzleMode` (2 call sites, in the helper that fills a texture description) and `XGCreateTextureComputer`
+(4 call sites, which use slots 1, 2, 8 and 10 of the returned object's vtable). `runtime/shims/xg_xs.cpp` answers them
+from a model of the console's texture layouts, `runtime/src/console_texture_layout.h` (AMD addrlib's GFX10 rules for
+the linear, 256 B, 4 KiB and 64 KiB modes: block shapes, mip tails, the micro tile patterns, a separate stencil plane),
+ported with the computer's method table and layout structure from Marvisak/VIctory (GPL-3.0-or-later, `xg.rs` and `texture.rs`
+at `d2a4bae1f`). `XGSuggestSwizzleMode` writes `0x100 | mode` (linear for 1D, `64KB_Z_X` for depth, `64KB_R_X` for
+render targets, else `4KB_S`); the computer fills the layout (slot 2), gives an element's offset (slot 6), copies a
+subresource into (slot 8) and out of (slot 9) tiled memory, and reports the 64 KiB tiling (slot 10). Not modelled:
+compression metadata planes, and addressing or copies for the pipe/bank XOR modes and MSAA (`E_NOTIMPL`). A description
+it cannot lay out still gets a computer in the out pointer with `E_INVALIDARG`, because two of the four callers ignore
+the HRESULT and call through the object at once; that object answers every slot with `E_NOTIMPL` and writes nothing.
+`xg_xs_test` covers the model (hand-checked addresses, mip tails, a bijection and round trip over every element) and the
+shim's slots. The table above was measured before this shim and still lists these two as unimplemented; they are served
+now.
+Set `LEONIDA_XG_TRACE=1` to log the first 1024 calls per entry point; the source notes are in
+[xg_xs_THIRD_PARTY.md](../runtime/shims/xg_xs_THIRD_PARTY.md).
 
 Only two of these DLLs have a shim in the repository (`xmem.dll` and `d3d12_xs.dll`), and they are not complete:
 they hold 8 of the 30 unimplemented imports. The other 22 are in five DLLs (`xg_xs.dll`, `XCRDAPI.dll`, `chad.dll`,
@@ -186,6 +202,20 @@ The seven `xmem.dll` imports are served now (see the `xmem.dll` notes above), so
 again at detach (reason 0), and there is no `exception`, `error` or `unimplemented_call` event. So none of the 30
 unimplemented imports is reached by the TLS callbacks or the `DllMain`s.
 
+The executable's audio imports `xapu.dll` (`XApuConnect`, `XApuDequeueResult`, `XApuDisconnect`,
+`XApuEnqueueCommand`, `XApuGetResultCount`) and `chad.dll` (`XDspActivate`, `XDspConnectWithMaximumStreamLimit`,
+`XDspDeactivate`, `XDspDisconnect`, `XDspSubmitCommand`) are served by `runtime/shims/xapu_chad.cpp`. The shapes were
+read statically from the executable's call sites: one each, four for `XApuEnqueueCommand`. Both connects succeed with
+a handle; the APU connect also returns a zeroed shared buffer the title writes stream input to and reads output from.
+Commands are accepted and not processed, so the audio stays silent. A stream open (type 1) and a stream close
+(type 2) each queue one result of the same type and slot, because the title frees a stream id only when the close
+result arrives. `XDspActivate` writes its two outputs as pointers to zeroed memory, which the title reads as "command
+done" after each `XDspSubmitCommand`. `XApuConnect` leaves its first argument, a global of the title, untouched. The
+buffer size (128 stream slots), the two results and the zeroed DSP status are hypotheses, explained in the file.
+`xapu_chad_test` calls all ten in those shapes. With `--trace`, the first call of each, and the first command of each type, is an
+`audio_queue` event.
+The table above was measured before this shim and still lists these ten as unimplemented; they are served now. The call shapes agree with `docs/audio_hal_exe_calls.md`, which was measured with `tools/import_call_sites.py`.
+
 What this does not show: `--run` has not been run, so the entry point has not been called and no import is known to be
 reached on the way to the first frame. A bound import is not a working one (the binding only says a function with
 that name exists), and an unimplemented import stops the run only if the title calls it
@@ -194,6 +224,58 @@ functions from `ws2_32.dll` (23 by ordinal, plus `getaddrinfo` and `freeaddrinfo
 outbound and name-resolution calls among them, loopback only (see the Winsock2 section below), and the remaining
 imports bind to the host's. `winhttp.dll` is served by the offline shim, which opens none. Known gap: `dnsapi.dll`
 (`DnsQuery*`) is not shimmed, so a title that calls it reaches the host's resolver.
+
+## Audio hardware (`AcpHal.dll`)
+
+The game executable imports nine functions from `AcpHal.dll`, the console's audio hardware layer.
+`runtime/shims/acphal.cpp` serves them; the argument shapes come from a static read of the executable's call sites
+(one thunk per import, 16 call sites in all), and the names of the parameters and object slots are hypotheses.
+`ApuCreateHeap` reserves one block of ordinary memory for both sizes it is given, `ApuAlloc` and `ApuFree` manage it
+first fit, and an APU address is a fixed 32-bit base plus the offset in it, so `ApuMapVirtualAddress` and
+`ApuMapApuAddress` are arithmetic and `ApuIsVirtualAddressValid` checks a live block and the alignment.
+`AcpHalAllocateShapeContexts` fills zeroed 64-byte contexts per count, and `AcpHalCreate` returns an object whose
+calls succeed and do nothing: there is no audio processor, so the game gets no sound from this path. Its boot checks
+fail hard, which is why every call succeeds. `acphal_test` covers the call shapes.
+The table under [The retail executable](#the-retail-executable-rt-5) was measured before this shim and still lists these nine as unimplemented; they are served now.
+
+## Audio output off the console (WASAPI)
+
+Off the console the title's sound goes out through WASAPI, not through the `AcpHal` path above: it creates an
+`MMDeviceEnumerator` with `CoCreateInstance` (one call, `CLSCTX_ALL`, `IID_IMMDeviceEnumerator`), asks it for the
+default render endpoint and activates `ISpatialAudioClient` on it (measured: the first interface the title asks the
+device for). A console always has an output. A host with none
+answers `GetDefaultAudioEndpoint(eRender, ...)` with `0x80070490` (`ERROR_NOT_FOUND`), and the title's device start
+then takes an error path that leaves its own output-device lock held by a job worker: the audio engine never mixes, a
+main-thread command buffer fills up, and the title stops on an `int3` about 47 s into the boot (measured under Wine with
+its audio drivers disabled; refusing the enumerator itself stops it the same way, and a host null sink removes the stop).
+
+So `CoCreateInstance` of that class goes to `runtime/shims/silent_audio.cpp` (hooked in `shims/com_shim.cpp`). When
+the host's enumerator has a default render endpoint it is returned unchanged. When it has none, or cannot be made, or
+`LEONIDA_AUDIO=silent` is set, the title gets an enumerator whose render answers are a **silent output endpoint** of the
+runtime's own: `GetDefaultAudioEndpoint(eRender)`, `EnumAudioEndpoints(eRender)` (active devices) and `GetDevice` with
+its ID give an active `IMMDevice` whose property store has a friendly name and the device format; `Activate` gives
+`ISpatialAudioClient`, `ISpatialAudioClient2`, `IAudioClient`, `IAudioClient2` or `IAudioClient3` (any other interface
+is `E_NOINTERFACE`, logged once). The spatial client has a 7.1 bed of static objects and no dynamic objects, as an
+endpoint with no spatial sound format turned on; its objects are mono 48 kHz float, and its
+`ISpatialAudioObjectRenderStream` signals the stream's event every 10 ms pass (480 frames) while it runs and hands
+each object a scratch buffer between `BeginUpdatingAudioObjects` and `EndUpdatingAudioObjects`. The client
+takes any PCM or float format in shared mode (event-driven or polled), and `GetService` gives `IAudioRenderClient`
+(a scratch buffer), `IAudioClock`, `ISimpleAudioVolume` and `IAudioStreamVolume`. A clock consumes the written frames
+in real time, so `GetCurrentPadding` drains, and an event-driven stream's event is signalled every 10 ms period
+while it runs, so a title that paces its mixer on the event keeps running. Capture questions keep the host's answer
+(with `LEONIDA_AUDIO=silent` the host's enumerator is only made when one comes). Endpoint notification callbacks are
+accepted and never called. Nothing opens or touches a host audio device, and every sample is discarded. The first
+silent device handed out prints one `[rt] audio: serving the silent output endpoint (<reason>)` line, the reason being
+the host's failed call or `LEONIDA_AUDIO=silent`.
+
+The mix format is 48 kHz, 32-bit float, 7.1 (eight channels, mask `0x63F`). 48 kHz float is the shared-mode
+format of the Windows audio engine and of the console's. 7.1 is the console's case, and a hypothesis, not measured
+here: the console's system mixer takes a 7.1 bed whatever output is plugged in and downmixes it for stereo, so a
+console title is built for eight channels, where stereo would be the usual answer of a PC with headphones. The stream
+itself takes any channel count, so a title that asks for fewer is not refused. `silent_audio_test`
+covers the enumerator over stand-in hosts with and without an endpoint and with none, a render stream run for a
+few periods with its event and padding checked, a spatial stream run for ten passes, and the `CoCreateInstance` hook
+with `LEONIDA_AUDIO=silent`.
 
 ## Console paths and the write overlay
 

@@ -21,7 +21,7 @@ it is missing. Never share what it makes.
 Stages (each skips work that is already done, so a stopped build continues where it left off):
     check     always first: file names and sizes against game/<version>.json (add --full-check for SHA-256, slow)
     shaders   carve shaders.rpf, unpack the native RDNA2 code, disassemble, translate to SPIR-V; then the same for the
-              compute programs inside amd_fidelityfx_upscaler_xbox.dll and XboxBvhBuilder.dll
+              programs inside amd_fidelityfx_upscaler_xbox.dll, XboxBvhBuilder.dll and game_scarlett_master.exe
     assets    models (OBJ), texture dictionaries and texture pools (DDS), audio banks (AWC; --wav adds PCM WAV)
               BCPack uses strict decoding by default. For local calibration use <work>/bcpack-calibration.json.
     runtime   build the loader (needs the game's executable to run, not to build). On Linux it is cross-built with
@@ -1045,7 +1045,7 @@ def dotnet_sdk_ok() -> bool:
     if not shutil.which("dotnet"):
         return False
     try:
-        r = subprocess.run(["dotnet", "--list-sdks"], capture_output=True, text=True, timeout=60)
+        r = subprocess.run(["dotnet", "--list-sdks"], capture_output=True, text=True, errors="replace", timeout=60)
     except (OSError, subprocess.SubprocessError):
         return False
     return any(int(m) >= 8 for m in re.findall(r"^(\d+)\.", r.stdout, re.M))
@@ -1736,7 +1736,7 @@ def exe_shaders(game: str, work: str, mc_signature: str, jobs: int = 1, emulate:
         return
     settings = exe_settings(image, mc_signature, emulate, fallbacks)
     programs = exe_programs(unpacked, spirv) if read_shader_setting(settings_file) == settings else None
-    if programs:
+    if programs and len(programs[1]) < len(programs[0]):
         exe_report(programs)
         return
     log(f"shaders: extracting and translating the graphics programs of {EXE_IMAGE}")

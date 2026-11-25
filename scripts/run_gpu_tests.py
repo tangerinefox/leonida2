@@ -25,16 +25,16 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 import mc_command  # noqa: E402
 sys.path.insert(0, SHADER_DIR)
 from build import CLIP_CASES, clip_container, shader_source
-from check import (Skip, clip_test, fmt_1010102_test, fmt_d16_xyz_test, fmt_int_narrow_test, fmt_sint32_test,
-                   fmt_xy_xyz_test, tbuffer_store_test)
-from check import compute_unsupported   # vk_compute_test's exit 77 over a feature the module needs
+from check import (Skip, clip_test, fmt_1010102_test, fmt_d16_xyz_test, fmt_int_narrow_test,
+                   fmt_sint32_test, fmt_xy_xyz_test, tbuffer_store_test, compute_unsupported)
 from compute_fixture import compute_header
 from check import SAMPLER_CASES, sampler_test   # ps_ssharp: the S#/T# mip fields (vk_sampler_test)
-from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, CVT_PK_U8_WORDS, PK_MUL_LO_WORDS, GRADIENT_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
+from check import (CS_SMEM_VCC, CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, CVT_PK_U8_WORDS, PK_MUL_LO_WORDS, GRADIENT_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
                    TEXTURE_MIP_TEST, GATHER_LOD_TEST, MIP_TEST_PASSES, TEXTURE_CONSTANTS, USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message,
                    pick_build_dir, start_failure, table_fetch_test, texture_gradient_a16_test, texture_mip_test)
 from check import SIGNED_MIP_TEST, UINT_MIP_TEST
 from check import cbv_modulate_test
+from check import IMAGE_STORE_CASES, texture_uav_test
 from check import salu_ext_test   # 38 scalar ALU ops on operands seeded through VKC_SGPRS
 from check import HEAP_INIT_EXPECTED, heap_init_env   # cs_heap_init: vk_compute_test's VKC_HEAP_INIT
 from check import shift64_test   # dynamic 64-bit vector shifts and overlapping destinations
@@ -686,7 +686,8 @@ OTHER_HARNESS = {"ps_m15": "d3d12_translated_draw_test", "vs_m15": "d3d12_transl
                  "cs_m4_fill": "d3d12_m4_compute_test", "cs_m4_indirect": "d3d12_m4_compute_test",
                  "cs_buf_typed": "d3d12_buffer_uav_test", "cs_buf_counter": "d3d12_buffer_uav_test",
                  "ps_live_width": "w64_graphics.py",
-                 "ps_heap_index": "d3d12_heap_index_test"}
+                 "ps_heap_index": "d3d12_heap_index_test",
+                 "ps_quad_flat": "d3d12_quad_index_test", "vs_quad_inst": "d3d12_quad_index_test"}
 
 
 # Shaders a selected test draws with, built even when the filter leaves them out (#192).
@@ -1200,7 +1201,7 @@ def run_suite(a, work: str) -> int:
             # Whole-wave mask test, as in check.py: needs a 64-wide subgroup, skipped where the device has none.
             # With LEONIDA_W64_EMULATE=1 it was translated with --wave64-emulate and runs on any subgroup size.
             results.append((name,) + wavemask_check(vk_compute, spv, cs_env, w64_emulated()))
-        elif name in ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute", "cs_w32_sincos", "cs_w32_buffer_sub16", "cs_w32_buffer_store_sub", "cs_w32_fcmpswap", "cs_w32_permlane_fi", "cs_exec_const", "cs_w32_mask_imm", "cs_w64_mask_imm", "cs_w32_lds_u8_d16", "cs_w32_lds_subdword", "cs_w32_lds_wide", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl", "cs_wqm_w64", "cs_wqm_w32", "cs_wqm_w64_half",
+        elif name in ("cs_smem_vcc_base", "cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute", "cs_w32_sincos", "cs_w32_buffer_sub16", "cs_w32_buffer_store_sub", "cs_w32_fcmpswap", "cs_w32_permlane_fi", "cs_exec_const", "cs_w32_mask_imm", "cs_w64_mask_imm", "cs_w32_lds_u8_d16", "cs_w32_lds_subdword", "cs_w32_lds_wide", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl", "cs_wqm_w64", "cs_wqm_w32", "cs_wqm_w64_half",
                       "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8", "cs_dpp_ops", "cs_dpp_bank", "cs_dpp_fi",
                       "cs_dpp_bound", "cs_dpp_cmp", "cs_dpp_w64",
                       "cs_w64_mask_detect",
@@ -1214,6 +1215,7 @@ def run_suite(a, work: str) -> int:
             cs_dump_wants = {
                 "cs_store": [0x400080FF, 0xE00003FF, 0x3C004000, 0xEEEEEEEE, 0x40003C00, 0xBC003800, 0x40FF8000, 0x3FF00000],
                 # base + soffset + imm (cs_smem_soffset_imm.asm); out[4..7] are seeds the shader leaves alone
+                "cs_smem_vcc_base": CS_SMEM_VCC,
                 "cs_smem_soffset_imm": [0x5EED0024, 0x5EED0028, 0x5EED002C, 0x5EED0030,
                                         0x5EED0010, 0x5EED0014, 0x5EED0018, 0x5EED001C],
                 # SHADER-52: wave32 lane select & 31 (40 → 8)
@@ -1369,15 +1371,13 @@ def run_suite(a, work: str) -> int:
                     unjudged = ", ".join(str(i) for i, w in enumerate(want) if w is None)
                     detail += f" (words {unjudged} not judged on this device: UNJUDGED_WORDS in check.py)"
             results.append((name, ok, detail))
-        elif name == "cs_imgstore":
-            rc, msg = run_cmd([vk_store, spv])
+        elif name in IMAGE_STORE_CASES:
+            rc, msg = run_cmd([vk_store, spv, *IMAGE_STORE_CASES[name]])
             results.append((name, *helper_result(rc, msg)))
-        elif name == "cs_imgstore_cube":   # GPU-CUBE-STORE: six-layer 2D-array views at bindings 11/12/13
-            rc, msg = run_cmd([vk_store, spv, "cube"])
-            results.append((name, *helper_result(rc, msg)))
-        elif name in ("cs_imgload", "cs_imgload_tfe", "cs_imgload_d16", "cs_imgload_d16_tfe", "cs_sample_lz_int_d16"):
-            rc, msg = run_cmd([vk_store, spv, "load" if name in ("cs_imgload", "cs_imgload_tfe") else "load-d16"])
-            results.append((name, *helper_result(rc, msg)))
+        elif name == "cs_texture_uav":
+            problem = texture_uav_test(a.build, spv)
+            results.append((name, None if isinstance(problem, Skip) else not problem,
+                            problem or "D3D12/Vulkan storage-image readback matched"))
         elif name in MIP_TEST_PASSES:
             problem = texture_mip_test(a.build, spirv_dir, name)
             ok = None if isinstance(problem, Skip) else not problem

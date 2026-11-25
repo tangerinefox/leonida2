@@ -7,6 +7,7 @@
 #include "host_adapter.h"
 #include "host_wine.h"
 #include "../shims/d3d12_com.h"
+#include "../src/gfx10_descriptors.h"
 #include <dxgi1_4.h>
 #include <cstdint>
 #include <cstring>
@@ -171,6 +172,47 @@ bool round_trip(ID3D12Device* device, const D3D12_RESOURCE_DESC& desc, unsigned&
     readback->Unmap(0, nullptr);
     return same;
 }
+
+// The default SRV of a 1D (128) and a 3D (8x8x4) texture: a T# of the right image type, in R8_UNORM's GFX10 format,
+// with the swizzle (0, 0, 0, X). A check of the layer alone, so it runs where there is no Windows reference.
+bool default_srv_reads_alpha(ID3D12Device* device) {
+    namespace g = leonida::gfx10;
+    Ref<ID3D12DescriptorHeap> cpu_heap;
+    const D3D12_DESCRIPTOR_HEAP_DESC cpu_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_NONE};
+    CHECK(SUCCEEDED(device->CreateDescriptorHeap(&cpu_desc, IID_PPV_ARGS(&cpu_heap.p))));
+    const UINT step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    CHECK(step >= sizeof(g::ImageWords));
+    const std::uint32_t r8_code = g::format_from_vulkan(VK_FORMAT_R8_UNORM);
+    CHECK(r8_code != 0);
+    struct Case {
+        Shape shape;
+        g::ImageType type;
+    };
+    const Case cases[] = {
+        {{"1D 128", D3D12_RESOURCE_DIMENSION_TEXTURE1D, 128, 1, 1, 1}, g::ImageType::image_1d},
+        {{"3D 8x8x4", D3D12_RESOURCE_DIMENSION_TEXTURE3D, 8, 8, 4, 1}, g::ImageType::image_3d},
+    };
+    for (UINT c = 0; c < 2; ++c) {
+        const Case& k = cases[c];
+        Ref<ID3D12Resource> texture;
+        CHECK(SUCCEEDED(create(device, describe(k.shape, 0, D3D12_RESOURCE_FLAG_NONE), D3D12_RESOURCE_STATE_COMMON,
+                               &texture.p)));
+        D3D12_CPU_DESCRIPTOR_HANDLE handle = cpu_heap->GetCPUDescriptorHandleForHeapStart();
+        handle.ptr += SIZE_T(c) * step;
+        std::memset(reinterpret_cast<void*>(handle.ptr), 0x77, step);
+        device->CreateShaderResourceView(texture.p, nullptr, handle);
+        g::ImageWords words{};
+        std::memcpy(words.data(), reinterpret_cast<const void*>(handle.ptr), sizeof(words));
+        g::Image image{};
+        CHECK(g::is_image(words) && g::decode(words, image));
+        CHECK(image.type == k.type && image.width == k.shape.width && image.format == r8_code);
+        CHECK(k.type != g::ImageType::image_3d || (image.height == k.shape.height && image.depth == k.shape.depth));
+        const g::Swizzle alpha_only{g::select_zero, g::select_zero, g::select_zero, g::select_x};
+        CHECK(image.swizzle == alpha_only);
+        std::printf("A8_UNORM %s: the default SRV reads (0, 0, 0, A)\n", k.shape.name);
+    }
+    return true;
+}
 }  // namespace
 
 int main() {
@@ -192,7 +234,8 @@ int main() {
         info.storage_buffer_8bit = vk.storage_buffer_8bit;
         info.buffer_device_address = vk.buffer_device_address;
         if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&ours.p)))) return 1;
-        if (hostwine::host_is_wine()) return 77;  // every check is a comparison with Windows D3D12
+        if (!default_srv_reads_alpha(ours.p)) ++failures;
+        if (hostwine::host_is_wine()) return failures ? 1 : 77;  // every other check is a comparison with Windows D3D12
         Ref<IDXGIFactory4> factory;
         if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p)))) {
             std::fprintf(stderr, "no DXGI factory\n");

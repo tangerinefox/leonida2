@@ -1,0 +1,152 @@
+// Clamp the arguments of one D3D12 ExecuteIndirect batch on the GPU before the indirect command reads them.
+// The title's own compute passes write most of these arguments; a pass the replay drops (async pipeline skip, a stub
+// pipeline, LEONIDA_SKIP_COMPUTE) or mistranslates leaves whatever the memory held, and a dispatch of billions of
+// groups or a draw of four billion vertices runs until the host resets the display driver. So the active records are
+// copied into scratch with their values bounded, and the indirect command reads that scratch (vulkan_indirect_clamp.h).
+// One invocation per record, one tiny dispatch per ExecuteIndirect call; nothing is read back by the CPU.
+//
+// When a count buffer is given, threads at or past min(max_command_count, count) return an empty record without
+// charging the list budget. The command list charges its work (vertices, indices, or groups * 64) against 2^27 units with
+// an atomic CAS, so thousands of garbage records cannot run for seconds either.
+//
+// The bounds cut legitimate work beyond them, so they are generous: 2^24 vertices (or indices), 2^26 vertex instances,
+// 65 535 groups per dimension, 2^20 groups per dispatch, and mesh dispatches charged 128 threads per group. The
+// console's mesh dispatch is one-dimensional; the output uses one group in y and z.
+#version 460
+#extension GL_EXT_buffer_reference : require
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ArgsIn { uint data[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer CountIn { uint data[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer ArgsOut { uint data[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer CountOut { uint data[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Stats { uint data[]; };
+
+layout(push_constant) uniform Params {
+    ArgsIn arguments;    // the first record of this chunk
+    CountIn count;       // the D3D12 count buffer, or 0
+    ArgsOut records_out;      // this chunk's clamped records, compact
+    CountOut count_out;  // the clamped count word for a counted draw
+    Stats stats;         // clamped records, bounded counts, over-budget records, zeroed records
+    Stats list_budget;
+    uint kind;           // 0 draw, 1 draw indexed, 2 dispatch, 3 mesh dispatch (leonida::IndirectKind)
+    uint stride_words;   // the D3D12 record stride in words
+    uint records;        // records in this chunk
+    uint first_record;   // the record index this chunk starts at
+    uint max_records;    // max_command_count of the ExecuteIndirect call
+    uint flags;          // bit 0: counted; bits 1..16: optional per-dispatch group budget
+} p;
+
+// One ExecuteIndirect batch's limits. A record that asks for more runs empty instead of for seconds.
+const uint max_vertices = 1u << 24u;          // vertices or indices in one draw
+const uint max_vertex_instances = 1u << 26u;  // vertex (or index) count times instance count
+const uint max_group_dimension = 65535u;      // groups in x, y or z
+const uint max_groups = 1u << 20u;            // groups in one dispatch or mesh dispatch
+const uint budget = 1u << 27u;                // work in the whole command list: vertices, indices, or groups * 64
+
+// Charges `cost` units to the batch's budget. Saturating: a record that no longer fits runs empty, so the batch never
+// stops the GPU for longer than the budget allows.
+bool charge(uint cost) {
+    if (cost == 0u) return true;
+    uint before = atomicAdd(p.list_budget.data[0], 0u);
+    while (before < budget) {
+        const uint room = budget - before;
+        if (cost > room) return false;
+        const uint next = before + cost;
+        const uint previous = atomicCompSwap(p.list_budget.data[0], before, next);
+        if (previous == before) return true;
+        before = previous;
+    }
+    return false;
+}
+
+void main() {
+    const uint local = gl_GlobalInvocationID.x;
+    if (local >= p.records) return;
+    const uint global = p.first_record + local;
+    const uint out_words = p.kind <= 1u ? (p.kind == 0u ? 4u : 5u) : 3u;
+    const uint out_base = local * out_words;
+
+    const bool counted = (p.flags & 1u) != 0u;
+    // The count is clamped to max_command_count (VUID-vkCmdDrawIndirectCount-countBuffer-02717), so a *Count draw
+    // reads a count no larger than the records whose scratch this pass wrote.
+    uint effective = p.max_records;
+    if (counted) {
+        const uint asked = p.count.data[0];
+        effective = min(effective, asked);
+        if (global == 0u) {
+            p.count_out.data[0] = effective;
+            if (asked != effective) atomicAdd(p.stats.data[1], 1u);  // the count asked past max_command_count
+        }
+    }
+    if (global >= effective) {
+        for (uint i = 0u; i < out_words; ++i) p.records_out.data[out_base + i] = 0u;
+        return;
+    }
+
+    const uint src = local * p.stride_words;
+    bool unfilled = true;
+    for (uint i = 0u; i < out_words; ++i)
+        unfilled = unfilled && p.arguments.data[src + i] == 0xffffffffu;
+    if (unfilled || (p.kind == 3u && p.arguments.data[src] == 0xffffffffu)) {
+        for (uint i = 0u; i < out_words; ++i) p.records_out.data[out_base + i] = 0u;
+        atomicAdd(p.stats.data[0], 1u);
+        atomicAdd(p.stats.data[3], 1u);
+        return;
+    }
+    uint words[5] = uint[5](0u, 0u, 0u, 0u, 0u);
+    uint cost = 0u;
+    uint clamped = 0u;
+    if (p.kind <= 1u) {
+        // A draw or an indexed draw: count, instances, then the two (or three) locations, copied as they are.
+        const uint count = p.arguments.data[src];
+        const uint instances = p.arguments.data[src + 1u];
+        uint index_count = min(count, max_vertices);
+        uint instance_count = min(instances, max_vertex_instances / max(index_count, 1u));
+        if (index_count == 0u) instance_count = 0u;
+        clamped = index_count != count || instance_count != instances ? 1u : 0u;
+        cost = index_count * instance_count;
+        words[0] = index_count;
+        words[1] = instance_count;
+        words[2] = p.arguments.data[src + 2u];
+        words[3] = p.arguments.data[src + 3u];
+        if (p.kind == 1u) words[4] = p.arguments.data[src + 4u];
+    } else {
+        // A dispatch or a mesh dispatch: three group counts. x * y fits 32 bits (each is at most 65 535); the whole
+        // group count may not, so an oversized product runs empty.
+        const uint asked_x = p.arguments.data[src];
+        const uint asked_y = p.arguments.data[src + 1u];
+        const uint asked_z = p.arguments.data[src + 2u];
+        uint x = min(asked_x, max_group_dimension);
+        uint y = min(asked_y, max_group_dimension);
+        uint z = min(asked_z, max_group_dimension);
+        if (p.kind == 3u) { y = 1u; z = 1u; }
+        const uint groups = p.flags >> 1u;
+        if (groups != 0u && x != 0u && y != 0u && z != 0u) {
+            x = min(x, groups);
+            y = min(y, groups / x);
+            z = min(z, groups / x / y);
+        }
+        if (z != 0u && x * y > max_groups / z) {
+            x = 0u;
+            y = 0u;
+            z = 0u;
+        }
+        clamped = x != asked_x || y != asked_y || z != asked_z ? 1u : 0u;
+        cost = x * y * z * (p.kind == 3u ? 128u : 64u);
+        words[0] = x;
+        words[1] = y;
+        words[2] = z;
+    }
+
+    if (cost != 0u && !charge(cost)) {
+        clamped = 1u;
+        atomicAdd(p.stats.data[2], 1u);
+        words = uint[5](0u, 0u, 0u, 0u, 0u);
+    }
+    if (clamped != 0u) {
+        atomicAdd(p.stats.data[0], 1u);
+        if (words[0] == 0u) atomicAdd(p.stats.data[3], 1u);
+    }
+    for (uint i = 0u; i < out_words; ++i) p.records_out.data[out_base + i] = words[i];
+}

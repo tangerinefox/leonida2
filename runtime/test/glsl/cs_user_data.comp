@@ -38,6 +38,13 @@ Words at(uvec2 va) {
 void main() {
     const uint i = gl_GlobalInvocationID.x;
     Words result = at(uvec2(pc.s[6], pc.s[7]));
+    if (pc.s[5] == 0xFFFFFFFAu) {
+        // Inspect descriptor words without dereferencing a possibly invalid address. 0xFFFFFFFB is the rebound-table
+        // test's indexed CBV mode below.
+        Words view = at(uvec2(pc.s[8], 0u));
+        result.w[i] = view.w[i % 4u];
+        return;
+    }
     if (pc.s[5] == 0xFFFFFFFCu) {
         // Direct resource indexing. The explicit table is unrelated; the heap follows it at s9.
         uint value = 0u;
@@ -67,13 +74,18 @@ void main() {
         target.w[i] = result.w[64u + i] + pc.s[4];
         return;
     }
-    if (pc.s[5] == 0u) {
-        // Scalar CBV reads use byte capacity for both the console row descriptor and the raw override.
-        const uint stride = (table.w[1] >> 16u) & 0x3FFFu;
-        const uint capacity = table.w[2] * max(1u, stride);
-        const uint byte_off = pc.s[4] + i * 4u;
-        if (byte_off + 4u <= capacity) {
-            Words cbv = at(uvec2(table.w[0], table.w[1] & 0xFFFFu));
+    if (pc.s[5] == 0u || pc.s[5] == 0xFFFFFFFBu) {
+        // CBV V# mode: accept byte-address views and Xbox views counted in 16-byte constant rows.
+        // The rebound-table test indexes 32-byte CBV slots with s4.
+        const bool indexed = pc.s[5] == 0xFFFFFFFBu;
+        const uint word = indexed ? pc.s[4] * 8u : 0u;
+        const uint num_records = table.w[word + 2u];
+        const uint stride = (table.w[word + 1u] >> 16u) & 0x3fffu;
+        const uint mode = (table.w[word + 3u] >> 28u) & 3u;
+        const uint bytes_per_record = mode < 2u ? max(stride, 1u) : 1u;
+        const uint byte_off = (indexed ? 0u : pc.s[4]) + i * 4u;
+        if (byte_off <= 0xfffffffcu && (byte_off + 3u) / bytes_per_record < num_records) {
+            Words cbv = at(uvec2(table.w[word], table.w[word + 1u] & 0xFFFFu));
             result.w[i] = cbv.w[byte_off >> 2u];
         } else {
             result.w[i] = 0u;

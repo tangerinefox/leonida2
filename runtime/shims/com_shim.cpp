@@ -1,7 +1,8 @@
 // COM lifecycle and helper shims for api-ms-win-core-com-l1-1-0..3.dll.
 //
 // game_scarlett_master.exe imports CoInitializeEx, CoUninitialize, CoCreateInstance, CoCreateGuid, CoTaskMemFree,
-// PropVariantClear, and StringFromGUID2 through api-ms-win-core-com-l1-1-0.dll. When the host (or a host library) has
+// PropVariantClear, and StringFromGUID2 through api-ms-win-core-com-l1-1-0.dll. CoCreateInstance of the
+// MMDeviceEnumerator goes to silent_audio.cpp, which serves a silent output endpoint when the host has none. When the host (or a host library) has
 // already initialized a thread as STA, a guest call to CoInitializeEx(nullptr, COINIT_MULTITHREADED) fails with
 // RPC_E_CHANGED_MODE (0x80010106) and an unbalanced CoUninitialize can tear down host COM early.
 //
@@ -15,6 +16,7 @@
 #include <new>
 
 #include "shims.h"
+#include "silent_audio.h"
 
 namespace rt::com_shim {
 namespace {
@@ -128,6 +130,10 @@ void WINAPI co_uninitialize() {
 HRESULT WINAPI co_create_instance(REFCLSID rclsid, LPUNKNOWN outer, DWORD cls_context, REFIID riid, LPVOID* ppv) {
     if (!ppv) return E_POINTER;
     *ppv = nullptr;
+    // The audio device enumerator: the host's when it has an output, else (or with LEONIDA_AUDIO=silent) one that
+    // also answers with the silent output endpoint (silent_audio.h).
+    if (!outer && IsEqualCLSID(rclsid, rt::silent_audio::kClsidMMDeviceEnumerator))
+        return rt::silent_audio::create_enumerator(cls_context, riid, ppv);
     return ::CoCreateInstance(rclsid, outer, cls_context, riid, ppv);
 }
 

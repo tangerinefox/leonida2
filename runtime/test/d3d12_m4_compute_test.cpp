@@ -11,8 +11,10 @@
 //                  arguments of the next dispatch into the raw buffer. Barriers (a transition of the argument buffer to
 //                  INDIRECT_ARGUMENT and UAV barriers on the buffer and the image) and ExecuteIndirect with a dispatch
 //                  command signature runs a second PSO whose group count is that buffer's first word: it reads the
-//                  structured buffer and the image back and writes the raw output. Everything then goes to COMMON and
-//                  the queue does Signal(compute fence, 1).
+//                  structured buffer and the image back and writes the raw output. A second ExecuteIndirect runs a
+//                  garbage argument record (billions of groups in every dimension) that the argument clamp pass empties
+//                  on the GPU (runtime/src/vulkan_indirect_clamp.h), so it completes instead of resetting the driver.
+//                  Everything then goes to COMMON and the queue does Signal(compute fence, 1).
 //   COPY queue     Wait(compute fence, 1), a COPY list that copies the five results (four buffers and the image through
 //                  CopyTextureRegion) to a READBACK buffer, Signal(copy fence, 2). The CPU waits for that with
 //                  SetEventOnCompletion and an event.
@@ -28,6 +30,7 @@
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 #include "../src/shader_library.h"
+#include "../src/vulkan_indirect_clamp.h"
 
 #include <array>
 #include <cstring>
@@ -179,7 +182,7 @@ int main() {
         constexpr auto uav_flag = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         constexpr auto uav_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         constexpr auto common = D3D12_RESOURCE_STATE_COMMON;
-        Ref<ID3D12Resource> upload, input, data, args, out2, image, readback;
+        Ref<ID3D12Resource> upload, input, data, args, out2, image, readback, garbage;
         const auto create_buffer = [&](Ref<ID3D12Resource>& out, const D3D12_HEAP_PROPERTIES& heap, UINT64 bytes,
                                        D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES state) {
             const auto desc = buffer_desc(bytes, flags);
@@ -191,6 +194,9 @@ int main() {
         EXPECT(create_buffer(data, default_heap, data_bytes, uav_flag, uav_state));
         EXPECT(create_buffer(args, default_heap, 256, uav_flag, uav_state));
         EXPECT(create_buffer(out2, default_heap, out2_bytes, uav_flag, uav_state));
+        // The garbage arguments: what an argument buffer holds when the compute that writes it was skipped. This one
+        // asks for billions of groups in every dimension, and the clamp pass must run it empty (vulkan_indirect_clamp.h).
+        EXPECT(create_buffer(garbage, upload_heap, 256, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ));
         EXPECT(create_buffer(readback, readback_heap, readback_bytes, D3D12_RESOURCE_FLAG_NONE,
                              D3D12_RESOURCE_STATE_COPY_DEST));
         D3D12_RESOURCE_DESC image_desc{};
@@ -208,6 +214,14 @@ int main() {
             EXPECT(SUCCEEDED(upload->Map(0, nullptr, reinterpret_cast<void**>(&mapped))));
             for (UINT g = 0; g < records; ++g) mapped[g] = input_word(g);
             upload->Unmap(0, nullptr);
+        }
+        {
+            D3D12_DISPATCH_ARGUMENTS* mapped = nullptr;
+            EXPECT(SUCCEEDED(garbage->Map(0, nullptr, reinterpret_cast<void**>(&mapped))));
+            mapped->ThreadGroupCountX = 0xFFFFFFF0u;
+            mapped->ThreadGroupCountY = 0xFFFFFFFFu;
+            mapped->ThreadGroupCountZ = 1u;
+            garbage->Unmap(0, nullptr);
         }
 
         // The table: slot 0 structured buffer (stride 16), 1 raw argument buffer, 2 image, 3 raw input, 4 raw output.
@@ -301,6 +315,12 @@ int main() {
         compute_list->ResourceBarrier(3, between);
         compute_list->SetPipelineState(pso_indirect.p);   // the root arguments stay
         compute_list->ExecuteIndirect(signature.p, 1, args.p, 0, nullptr, 0);
+        // The clamp pass (vulkan_indirect_clamp.h) runs this one empty: its record asks for billions of groups, which
+        // would otherwise run until the host resets the display driver. out2's expected words below show it wrote
+        // nothing, which is also what a skipped compute pass leaves for a legitimate record to ask for. With
+        // LEONIDA_INDIRECT_CLAMP=0 the raw argument buffer is read again, so such a record is not recorded at all.
+        if (leonida::indirect_clamp_enabled())
+            compute_list->ExecuteIndirect(signature.p, 1, garbage.p, 0, nullptr, 0);
         D3D12_RESOURCE_BARRIER release[5] = {transition(data.p, uav_state, common),
                                              transition(args.p, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, common),
                                              transition(out2.p, uav_state, common),
@@ -361,7 +381,7 @@ int main() {
         got.assign(static_cast<const std::uint8_t*>(mapped), static_cast<const std::uint8_t*>(mapped) + readback_bytes);
         readback->Unmap(0, nullptr);
 
-        for (auto* r : {&upload, &input, &data, &args, &out2, &image, &readback}) r->reset();
+        for (auto* r : {&upload, &input, &data, &args, &out2, &image, &readback, &garbage}) r->reset();
         stream_list.reset(); compute_list.reset(); readback_list.reset();
         stream_alloc.reset(); compute_alloc.reset(); readback_alloc.reset();
         copy_fence.reset(); compute_fence.reset();

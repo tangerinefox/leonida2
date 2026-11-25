@@ -1890,6 +1890,7 @@ int main() {
         info.host_image_copy = vk.host_image_copy;
         info.bindless = vk.bindless;
         info.bindless_partially_bound = vk.partially_bound;
+        info.robust_image_access = vk.robust_image_access;  // a Texture3D UAV is bound only with it
         if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&ours.p)))) return 1;
         failures += check(ours.p, "vulkan");
         const std::vector<Case> vulkan_cases = open_cases(ours.p);

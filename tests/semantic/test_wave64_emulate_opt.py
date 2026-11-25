@@ -411,6 +411,14 @@ def run_emulated_workgroup(spvasm, local_size, push_constants=None, memory=None,
                     memory[p[1]] = v & MASK32
                 else:
                     p[0][p[1]] = v
+            elif op == "OpAtomicStore":   # pointer, scope, semantics, value: a store with no result
+                p = ptrs[a[0]]
+                v = vals[a[3]]
+                if p[0] == "psb":
+                    assert p[1] % 4 == 0, f"unaligned PSB store {p[1]:#x}"
+                    memory[p[1]] = v & MASK32
+                else:
+                    p[0][p[1]] = v
             elif op in ("OpAtomicOr", "OpAtomicIAdd", "OpAtomicAnd", "OpAtomicXor", "OpAtomicExchange"):
                 p = ptrs[a[1]]
                 old = memory.get(p[1], 0) if p[0] == "psb" else p[0][p[1]]
@@ -1758,6 +1766,58 @@ class StructuredEmulationTests(unittest.TestCase):
         # s_barrier cleared ("lds", "w"), and folded block 1 added ("mem", "r") after it.
         self.assertEqual(plan["dirty_in"][3], frozenset({("mem", "r")}))
         self.assertEqual(plan["dirty_in"][4], frozenset({("mem", "r")}))
+
+
+class SharedWordStoresTests(unittest.TestCase):
+    """The emulation resets %x_buf words every round. Lanes with nothing to reset aim the same store at one sink
+    word, and the prologue clamps its zeroing index, so several invocations write one word at once. A plain OpStore
+    there is a data race (GPU-assisted validation reports it in every emulated shader); OpAtomicStore is not."""
+
+    INSNS = [
+        ("v_cmp_lt_u32_e64 s[6:7], 20, v0", 8),
+        ("s_and_saveexec_b64 s[8:9], s[6:7]", 4),
+        ("s_cselect_b32 s14, 111, 222", 4),
+        ("s_mov_b64 exec, -1", 4),
+        ("v_mov_b32_e32 v5, s14", 4),
+        ("v_lshlrev_b32_e32 v6, 2, v0", 4),
+        ("buffer_store_dword v5, v6, s[0:3], 0 offen", 8),
+        ("s_endpgm", 4),
+    ]
+
+    @staticmethod
+    def shared_word_stores(spv):
+        """(plain, atomic) stores into %x_buf whose index is not one invocation's own: it comes from an OpSelect
+        (the sink) or from the prologue's UMin clamp."""
+        defined_by, element = {}, {}
+        for line in spv.splitlines():
+            m = re.match(r"\s*(%\w+) = (\w+) (.*)", line)
+            if not m:
+                continue
+            defined_by[m.group(1)] = m.group(2)
+            chain = re.match(r"%_ptr_WG_uint_x %x_buf (%\w+)$", m.group(3)) if m.group(2) == "OpAccessChain" else None
+            if chain:
+                element[m.group(1)] = chain.group(1)
+        plain, atomic = [], []
+        for line in spv.splitlines():
+            m = re.match(r"\s*(OpStore|OpAtomicStore) (%\w+) ", line)
+            if m and defined_by.get(element.get(m.group(2))) in ("OpSelect", "OpExtInst"):
+                (plain if m.group(1) == "OpStore" else atomic).append(line.strip())
+        return plain, atomic
+
+    def test_stores_several_invocations_aim_at_one_word_are_atomic(self):
+        for threads in (64, 128):   # one wave, and two (the per-wave and per-workgroup resets differ)
+            with self.subTest(threads=threads):
+                spv, _ = _translate_encoded(f"cs_shared_words_{threads}", self.INSNS, (threads, 1, 1), emulate=True)
+                plain, atomic = self.shared_word_stores(spv)
+                self.assertEqual(plain, [])
+                self.assertTrue(atomic, "the emulated translation has no shared-word resets to check")
+                # Workgroup scope, relaxed semantics, value 0: the same operands as the OpAtomicOr on this buffer.
+                for line in atomic:
+                    self.assertRegex(line, r"^OpAtomicStore %\w+ %c2 %c0 %c0$")
+
+    def test_native_wave64_translation_is_unchanged(self):
+        spv, _ = _translate_encoded("cs_shared_words_native", self.INSNS, (64, 1, 1), emulate=False)
+        self.assertNotIn("OpAtomicStore", spv)
 
 
 if __name__ == "__main__":

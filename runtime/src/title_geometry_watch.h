@@ -40,30 +40,40 @@ inline DWORD read_only(DWORD protection) {
     default: return 0;
     }
 }
-inline void reopen(std::uintptr_t va, Cell& c) {
+// True when it made a page writable again.
+inline bool reopen(std::uintptr_t va, Cell& c) {
+    bool opened = false;
     for (std::size_t i = 0; i < c.restore.size(); ++i) {
         if (!c.restore[i]) continue;
         void* p = reinterpret_cast<void*>(va + i * page_size);
         MEMORY_BASIC_INFORMATION m{};
         DWORD old{};
         if (!VirtualQuery(p, &m, sizeof m)) continue;
-        if (m.State == MEM_COMMIT && m.Protect == read_only(c.restore[i]) &&
-            !VirtualProtect(p, page_size, c.restore[i], &old)) continue;
+        if (m.State == MEM_COMMIT && m.Protect == read_only(c.restore[i])) {
+            if (!VirtualProtect(p, page_size, c.restore[i], &old)) continue;
+            opened = true;
+        }
         c.restore[i] = 0;
     }
+    return opened;
 }
 inline void release(std::uintptr_t va) {
     auto& s = state();
     std::lock_guard lock(s.mutex);
     auto it = s.cells.find(va);
     if (it != s.cells.end() && !--it->second.refs) {
-        reopen(va, it->second);
+        // A page reopened here may also be one a slot-133 shadow keeps read-only (both guard the title's geometry):
+        // it is writable now with no fault to tell that shadow, which then walks its pages again.
+        if (reopen(va, it->second)) title_memory_map::changed(va, va + tile_size);
         s.cells.erase(it);
         s.count.store(s.cells.size(), std::memory_order_release);
     }
 }
 enum class Event { write, open, fault, mapping, replaced };
-inline bool notify(std::uintptr_t begin, std::uintptr_t end, Event event) {
+// `restored` (open and fault): set when a tile's pages were made writable again. A tile reopens all of its pages, and
+// a page of it a slot-133 shadow also keeps read-only (both can guard one page: each queries, then protects, under its
+// own lock) is writable then without that shadow knowing; the caller has the shadows reopen the whole tiles too.
+inline bool notify(std::uintptr_t begin, std::uintptr_t end, Event event, bool* restored = nullptr) {
     auto& s = state();
     if (!s.count.load(std::memory_order_acquire) || end <= begin) return false;
     std::lock_guard lock(s.mutex);
@@ -74,7 +84,7 @@ inline bool notify(std::uintptr_t begin, std::uintptr_t end, Event event) {
     for (; it != s.cells.end() && it->first < end; ++it) {
         auto& cell = it->second;
         if (event == Event::open || event == Event::fault) {
-            reopen(it->first, cell);
+            if (reopen(it->first, cell) && restored) *restored = true;
             if (event == Event::fault) {
                 MEMORY_BASIC_INFORMATION m{};
                 opened = VirtualQuery(reinterpret_cast<void*>(begin), &m, sizeof m) &&
@@ -114,7 +124,12 @@ inline bool arm(std::uintptr_t va, Cell& c) {
         if (m.State == MEM_COMMIT && !(m.Protect & PAGE_GUARD) && guarded) {
             DWORD old{};
             if (!VirtualProtect(reinterpret_cast<void*>(p), end - p, guarded, &old)) return false;
-            for (auto j = i; j < next; ++j) c.restore[j] = old;
+            // What the query saw, not `old`: VirtualProtect returns the first page's protection only, and a slot-133
+            // shadow (which guards these pages under its own lock) may have made that page read-only in between. A
+            // read-only `old` then marked every page of the run as read-only already, so reopen() never gave them back
+            // and they stayed read-only with no guard to answer for them: title writes and kernel writes into them
+            // failed for good. Such a page has two guards now; reopening it tells the shadows (notify's `restored`).
+            for (auto j = i; j < next; ++j) c.restore[j] = m.Protect;
         }
         i = next;
     }

@@ -660,6 +660,7 @@ HRESULT WINAPI GetApiVersionImpl(uint64_t* first, uint64_t* second) {
     return S_OK;
 }
 
+
 // HRESULT XGameRuntimeInitialize(). Reference counted, as in the GDK: each call needs an XGameRuntimeUninitialize.
 HRESULT __stdcall XGameRuntimeInitialize() {
     if (g_runtime_refs.fetch_add(1) == 0) std::fprintf(stderr, "[rt] xgameruntime: initialized (offline)\n");

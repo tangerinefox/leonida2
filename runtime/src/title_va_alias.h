@@ -16,6 +16,7 @@
 // that makes a GPU copy for an address in the title's memory that has none yet, and a scanner that rewrites the
 // buffer V#s of a bound descriptor table before a submission. Without hooks the table only translates what was
 // added to it, so it is tested without a GPU (title_va_alias_test).
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -32,12 +33,13 @@ namespace leonida {
 class TitleVaAliases {
 public:
     // Where the layer saw the address, for the counters.
-    enum Kind : unsigned { root_view, created_view, table_view, vertex_view, index_view, kind_count };
+    enum Kind : unsigned { root_view, created_view, table_view, vertex_view, index_view, bvh_address, kind_count };
     static constexpr const char* kKindNames[kind_count] = {"root view", "created view", "table V#", "vertex view",
-                                                           "index view"};
+                                                           "index view", "BVH build address"};
 
-    // An address in the title's memory: true, with `shader_va` what a shader must be given (the address itself when
-    // no copy could be made). False: not the title's memory (an arena VA, a buffer of the layer's).
+    // An address in the title's memory: true, with `shader_va` what a shader must be given (0 when no copy can be
+    // made: the view is then written with a zero-size range, never with the raw address). False: not the title's
+    // memory (an arena VA, a buffer of the layer's).
     using Resolver = bool (*)(void* context, std::uint64_t va, std::uint64_t bytes, std::uint64_t& shader_va);
     using TableScanner = void (*)(void* context, std::uint64_t table_va, std::uint32_t descriptors);
 
@@ -52,12 +54,23 @@ public:
         return true;
     }
 
+    // The two addresses of one stream-pool extent (a GPU-only alias and the CPU view of the same pages, gfxgeom
+    // section 3): both name the same shader VA, so a title view carrying either resolves to the one mapping.
+    bool add_twin(std::uint64_t va, std::uint64_t twin, std::uint64_t bytes, std::uint64_t shader_va) {
+        if (va == twin) return add(va, bytes, shader_va);
+        const bool first = add(va, bytes, shader_va);
+        return add(twin, bytes, shader_va) && first;
+    }
+
     // Forgets the range that starts at title_va, if it still maps to shader_va (a newer range at the same VA keeps
     // its own entry).
     void remove(std::uint64_t title_va, std::uint64_t shader_va) {
         std::unique_lock lock(mutex_);
         const auto it = ranges_.find(title_va);
-        if (it != ranges_.end() && it->second.shader_va == shader_va) ranges_.erase(it);
+        if (it != ranges_.end() && it->second.shader_va == shader_va) {
+            ranges_.erase(it);
+            invalidations_.fetch_add(1, std::memory_order_release);
+        }
         count_.store(ranges_.size(), std::memory_order_release);
     }
 
@@ -71,6 +84,33 @@ public:
         --it;
         if (va >= it->second.end || bytes > it->second.end - va) return va;
         return it->second.shader_va + (va - it->first);
+    }
+
+    // The range that holds `va`: true with `shader_va` what `va` becomes and `available` the bytes from `va` to the
+    // range's end, all reached through the one copy. False when no range holds `va`.
+    bool range_of(std::uint64_t va, std::uint64_t& shader_va, std::uint64_t& available) const {
+        if (!count_.load(std::memory_order_acquire)) return false;
+        std::shared_lock lock(mutex_);
+        auto it = ranges_.upper_bound(va);
+        if (it == ranges_.begin()) return false;
+        --it;
+        if (va >= it->second.end) return false;
+        shader_va = it->second.shader_va + (va - it->first);
+        available = it->second.end - va;
+        return true;
+    }
+
+    // Every range, in title-VA order (they never overlap): what a GPU pass that finds title addresses in memory
+    // (the BLAS address of a TLAS build's instance descs) translates them with.
+    struct Mapping {
+        std::uint64_t title_va, end, shader_va;
+    };
+    void mappings(std::vector<Mapping>& out) const {
+        out.clear();
+        if (!count_.load(std::memory_order_acquire)) return;
+        std::shared_lock lock(mutex_);
+        out.reserve(ranges_.size());
+        for (const auto& [start, range] : ranges_) out.push_back({start, range.end, range.shader_va});
     }
 
     // Debug-only inverse lookup. V#s retain 48 bits, so an import below heap_base wraps.
@@ -99,7 +139,9 @@ public:
     }
 
     // shader_va, and when `va` is in the title's memory with no copy yet, a copy made by the device's resolver.
-    // Counted by kind: translated, or in the title's memory and left as it was.
+    // A resolver that cannot back the address (no window or geometry copy fits) answers 0: the view is then written
+    // with a zero-size range, never with the raw title address (heap_base + a raw VA is no allocation a shader can
+    // read or write). Counted by kind: translated, or in the title's memory and left as it was.
     std::uint64_t resolve(std::uint64_t va, std::uint64_t bytes, Kind kind) {
         if (!va) return va;
         std::uint64_t to = shader_va(va);
@@ -266,8 +308,13 @@ public:
         resolver_ = nullptr;
         scanner_ = nullptr;
     }
+    // The resolver alone, for a device that scans its descriptor tables itself.
+    void set_resolver(void* context, Resolver resolver) { set_hooks(context, resolver, nullptr); }
+    void clear_resolver(void* context) { clear_hooks(context); }
 
     std::size_t size() const { return count_.load(std::memory_order_acquire); }
+    std::uint64_t invalidations() const { return invalidations_.load(std::memory_order_acquire); }
+    void note_translation(Kind kind) { translated_[kind].fetch_add(1, std::memory_order_relaxed); }
     std::uint64_t translated(Kind kind) const { return translated_[kind].load(std::memory_order_relaxed); }
     std::uint64_t untranslated(Kind kind) const { return untranslated_[kind].load(std::memory_order_relaxed); }
 
@@ -283,12 +330,14 @@ private:
             auto previous = std::prev(it);
             if (previous->second.end > begin) it = previous;
         }
+        if (it != ranges_.end() && it->first < end) invalidations_.fetch_add(1, std::memory_order_release);
         while (it != ranges_.end() && it->first < end) it = ranges_.erase(it);
     }
 
     mutable std::shared_mutex mutex_;
     std::map<std::uint64_t, Range> ranges_;  // by title VA
     std::atomic<std::size_t> count_{0};
+    std::atomic<std::uint64_t> invalidations_{};
     std::mutex hook_mutex_;
     void* hook_context_ = nullptr;
     void* maker_context_ = nullptr;
@@ -309,6 +358,18 @@ private:
 inline TitleVaAliases& title_va_aliases() {
     static TitleVaAliases aliases;
     return aliases;
+}
+
+// One diagnostic per descriptor-writing path.
+inline void note_unbacked_view(const char* site, std::uint64_t va, std::uint64_t bytes) {
+    static std::mutex mutex;
+    static std::map<std::string, bool> sites;
+    {
+        std::lock_guard lock(mutex);
+        if (!sites.emplace(site, true).second) return;
+    }
+    std::fprintf(stderr, "[rt] d3d12: %s: address 0x%llx (%llu bytes) has no GPU copy; zero records\n",
+                 site, static_cast<unsigned long long>(va), static_cast<unsigned long long>(bytes));
 }
 
 }  // namespace leonida

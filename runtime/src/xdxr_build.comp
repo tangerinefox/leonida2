@@ -84,7 +84,7 @@ const uint INVALID = 0xffffffffu;
 const uint TRI0 = 0u, TRI1 = 1u, BOX16 = 4u, BOX32 = 5u, INSTANCE = 6u;
 const uint LEAF = 0x80000000u;              // a binary child that is a sorted element, not an inner node
 const uint REMAP_IDENTITY = 0x09u;
-const uint FLAG_TLAS = 1u, FLAG_BOX16 = 2u, FLAG_PAIR = 4u;  // pc.flags; xdxr_build.h XdxrBuilder flag_*
+const uint FLAG_TLAS = 1u, FLAG_BOX16 = 2u, FLAG_PAIR = 4u, FLAG_TRANSLATE = 8u;  // pc.flags; xdxr_build.h flag_*
 const uint FLAG_BOTTOM_LEVEL = 0x80000000u, VERSION_2403 = 6u, INST_IDENTITY_ROTATION = 0x80000000u,
            INST_FLAGS_MASK = 0xc0000000u;
 
@@ -92,14 +92,14 @@ layout(push_constant) uniform Push {
     uvec2 dst;            // the acceleration structure (header at byte 0)
     uvec2 scratch;        // xdxr_build.h XdxrLayout scratch words
     uvec2 src0;           // triangles: vertices; instances: the instance descs
-    uvec2 src1;           // triangles: indices (0 = none)
-    uvec2 src2;           // triangles: 3x4 transform (0 = none)
+    uvec2 src1;           // triangles: indices (0 = none); instances with FLAG_TRANSLATE: the BLAS address table
+    uvec2 src2;           // triangles: 3x4 transform (0 = none); instances with FLAG_TRANSLATE: the arena bound
     uvec2 bias;           // added to addresses read from memory
     uint mode;
     uint count;           // threads of this dispatch
     uint first;           // triangles: first element; radix: the pass (0..7)
     uint arg0;            // triangles: vertex stride; otherwise the most nodes the layout has room for
-    uint arg1;            // triangles: 0 = R32G32B32_FLOAT, 1 = R32G32_FLOAT
+    uint arg1;            // triangles: 0 = R32G32B32_FLOAT, 1 = R32G32_FLOAT; instances: table entries
     uint arg2;            // triangles: index type (0 none, 1 u16, 2 u32); header: 1 = an update (bounds only)
     uint geometry;        // triangles: geometry index << 8 | D3D12_RAYTRACING_GEOMETRY_FLAGS
     uint elements;        // element count N
@@ -109,7 +109,8 @@ layout(push_constant) uniform Push {
     uint parents_off;
     uint total_size;
     uint flags;           // FLAG_TLAS: elements are 128-byte instances; FLAG_BOX16: inner nodes are 64-byte BOX16;
-                          //   FLAG_PAIR: pair sibling triangles that share an edge into TRI0/TRI1 leaves
+                          //   FLAG_PAIR: pair sibling triangles that share an edge into TRI0/TRI1 leaves;
+                          //   FLAG_TRANSLATE (instances): BLAS addresses go through blas_address
 } pc;
 
 // ---- 64-bit addresses as uvec2 ----
@@ -128,6 +129,12 @@ uint load(uvec2 base, uint byte_offset) { return at(base, byte_offset).w[0]; }
 void store(uvec2 base, uint byte_offset, uint v) { at(base, byte_offset).w[0] = v; }
 void storef(uvec2 base, uint byte_offset, float v) { store(base, byte_offset, floatBitsToUint(v)); }
 bool is_null(uvec2 a) { return a.x == 0u && a.y == 0u; }
+bool less64(uvec2 a, uvec2 b) { return a.y < b.y || (a.y == b.y && a.x < b.x); }
+uvec2 sub64(uvec2 a, uvec2 b) {
+    uint borrow;
+    uint lo = usubBorrow(a.x, b.x, borrow);
+    return uvec2(lo, a.y - b.y - borrow);
+}
 
 // ---- scratch: centroid bounds (6 ordered words at 0) and the node count (word 6), keys and element indices twice
 // (the radix sort's two sides; the sorted result is back in the first after an even number of passes), digit
@@ -273,6 +280,38 @@ void build_triangle(uint t) {
 }
 
 // ---- MODE_INSTANCES ----
+// The VA shaders reach the BLAS at the application's VA `va` by (xdxr_build.h XdxrBlasTable). Without
+// FLAG_TRANSLATE, `va` itself. With it: inside a range of the table at src1 (arg1 entries of 6 words {title VA, end,
+// shader VA}, in title-VA order), that range's shader VA, when its 64-byte header lies in the range; outside every
+// range, `va` when the header lies below the arena bound src2 (0: no bound). Anything else, and a VA the INSTANCE
+// record cannot hold (40 bits in 256-byte units), is not reachable (false): nothing is read through it.
+bool blas_address(uvec2 va, out uvec2 shader_va) {
+    shader_va = va;
+    if ((pc.flags & FLAG_TRANSLATE) == 0u) return true;
+    uint lo = 0u, hi = pc.arg1;                    // the first entry that starts past va
+    while (lo < hi) {
+        uint mid = (lo + hi) >> 1u;
+        uvec2 start = uvec2(load(pc.src1, 24u * mid), load(pc.src1, 24u * mid + 4u));
+        if (less64(va, start)) hi = mid; else lo = mid + 1u;
+    }
+    uvec2 last = add(va, 64u);
+    if (less64(last, va)) return false;            // wraps
+    bool found = false;
+    if (lo > 0u) {
+        uint e = 24u * (lo - 1u);
+        uvec2 end = uvec2(load(pc.src1, e + 8u), load(pc.src1, e + 12u));
+        if (less64(va, end)) {
+            if (less64(end, last)) return false;   // the header runs past the copy
+            uvec2 start = uvec2(load(pc.src1, e), load(pc.src1, e + 4u));
+            uvec2 to = uvec2(load(pc.src1, e + 16u), load(pc.src1, e + 20u));
+            shader_va = add64(to, sub64(va, start));
+            found = true;
+        }
+    }
+    if (!found && !is_null(pc.src2) && less64(pc.src2, last)) return false;
+    return (shader_va.x & 255u) == 0u && shader_va.y < 256u;
+}
+
 void build_instance(uint i) {
     uint d = 64u * i;
     float m[12];
@@ -285,8 +324,10 @@ void build_instance(uint i) {
     store(pc.dst, o + 52u, contrib);
     vec3 lo = vec3(uintBitsToFloat(0x7f800000u)), hi = -lo;
     uint root = INVALID;
-    if (!is_null(blas_va)) {
-        uvec2 blas = add64(blas_va, pc.bias);
+    uvec2 blas_sva = blas_va;
+    bool reached = !is_null(blas_va) && blas_address(blas_va, blas_sva);
+    if (reached) {
+        uvec2 blas = add64(blas_sva, pc.bias);
         root = load(blas, 48u);
         vec3 blo = vec3(uintBitsToFloat(load(blas, 16u)), uintBitsToFloat(load(blas, 20u)), uintBitsToFloat(load(blas, 24u)));
         vec3 bhi = vec3(uintBitsToFloat(load(blas, 28u)), uintBitsToFloat(load(blas, 32u)), uintBitsToFloat(load(blas, 36u)));
@@ -303,8 +344,10 @@ void build_instance(uint i) {
     bool identity = m[0] == 1.0 && m[1] == 0.0 && m[2] == 0.0 && m[4] == 0.0 && m[5] == 1.0 && m[6] == 0.0 &&
                     m[8] == 0.0 && m[9] == 0.0 && m[10] == 1.0;
     store(pc.dst, o + 56u, (root & ~INST_FLAGS_MASK) | (identity ? INST_IDENTITY_ROTATION : 0u));
-    // The record holds the BLAS address in 256-byte units: the application's address, as the game wrote it.
-    store(pc.dst, o + 60u, (blas_va.x >> 8) | (blas_va.y << 24));
+    // The record holds the BLAS address in 256-byte units: the application's address, as the game wrote it, or with
+    // FLAG_TRANSLATE the one shaders reach it by (0 when there is none: a null BLAS).
+    if (!reached) blas_sva = uvec2(0u);
+    store(pc.dst, o + 60u, (blas_sva.x >> 8) | (blas_sva.y << 24));
     // world-to-object: the inverse of the affine transform
     mat3 a = mat3(m[0], m[4], m[8], m[1], m[5], m[9], m[2], m[6], m[10]);   // columns
     float det = determinant(a);

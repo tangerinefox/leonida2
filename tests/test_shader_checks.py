@@ -30,9 +30,11 @@ PARTIAL = {n for n, _ in check.W64X_PARTIAL}
 WAVE32_WORDS = {n: w for n, w in check.CS_DUMPS if n in check.WAVE32_DUMPS and n not in ("cs_store", "cs_smem_soffset_imm")}
 
 
-# All check.py cases, including the seven vk_store_test shaders and the three mesh fixtures, and TEST-184's
-# vk_store_test "words" fixtures and image_get_lod draws. One of the eight next to COMPUTE is cs_w32_salu_ext.
-TOTAL = (len(check.COMPUTE) + 8 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 7
+# All check.py cases except the optional Windows UAV fixture (no SPIR-V is staged for it here): the vk_store_test
+# shaders of IMAGE_STORE_CASES, the three mesh fixtures, TEST-184's vk_store_test "words" fixtures and image_get_lod
+# draws. One of the eight next to COMPUTE is cs_w32_salu_ext.
+TOTAL = (len(check.COMPUTE) + 8 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL)
+         + len(check.IMAGE_STORE_CASES)
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
          + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS)
@@ -57,6 +59,23 @@ def cvt_answer(env, wrong_for=None):
     bits = int((env or {}).get("VKC_SGPRS", "0"), 0)
     words = [0xBAD, 0xBAD] if bits == wrong_for else CVT.get(bits, [0, 0])
     return 0, "out[0..7] = " + " ".join(map(str, words + [0xEEEEEEEE] * 6)) + "\n"
+
+
+class TextureUavCheck(unittest.TestCase):
+    def test_windows_requires_a_real_successful_executable(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(check.os, "name", "nt"):
+            exe = check.os.path.join(tmp, "d3d12_texture_uav_test" + check.EXE)
+            spv = check.os.path.join(tmp, "cs_texture_uav.spv")
+            self.assertIn("missing", check.texture_uav_test(tmp, spv))
+            with open(exe, "wb"):
+                pass
+            with patch.object(check, "run", return_value=(0, "matched")) as run:
+                self.assertEqual(check.texture_uav_test(tmp, spv), "")
+                run.assert_called_once_with(exe, spv)
+            with patch.object(check, "run", return_value=(77, "SKIP: missing features")):
+                self.assertIsInstance(check.texture_uav_test(tmp, spv), check.Skip)
+            with patch.object(check, "run", return_value=(1, "bad texel")):
+                self.assertIn("bad texel", check.texture_uav_test(tmp, spv))
 
 
 class Wave64Checks(unittest.TestCase):
@@ -200,8 +219,8 @@ class Wave64Checks(unittest.TestCase):
                 return 0, "out[0..7] = " + " ".join(map(str, (WAVE32_WORDS[name] + [0] * 8)[:8])) + "\n"
             if name == "cs_workgroup_yz":     # #186: vk_compute_test's 2x3x4 Y/Z histogram line
                 return 0, "2x3x4 workgroup Y/Z: 0 mismatches\n"
-            if name in ("cs_imgstore", "cs_imgstore_cube", "cs_imgload", "cs_imgload_tfe", "cs_imgload_d16",
-                        "cs_imgload_d16_tfe", "cs_sample_lz_int_d16"):   # vk_store_test checks
+            if name in check.IMAGE_STORE_CASES:
+                self.assertEqual(args, check.IMAGE_STORE_CASES[name])
                 return 0, "0 bad\n0 bad\n0 bad\n"
             if name in check.STORE_WORDS:     # vk_store_test "words": the three images, judged by check.py
                 self.assertEqual(args, ("words",))

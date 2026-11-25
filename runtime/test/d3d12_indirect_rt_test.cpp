@@ -1,6 +1,6 @@
 // Real GPU test for:
-//   1) ExecuteIndirect with CountBuffer (ID3D12Device::CreateCommandSignature +
-//      ID3D12GraphicsCommandList::ExecuteIndirect -> vkCmdDrawIndirectCount, Vulkan 1.2 core).
+//   1) D3D12 draw-signature creation and a native Vulkan counted-draw pixel reference.
+//      The pixel reference tests suballocated argument/count offsets, not D3D12 command replay.
 //   2) Hardware Ray Tracing / BVH (ID3D12Device5::GetRaytracingAccelerationStructurePrebuildInfo +
 //      ID3D12GraphicsCommandList4::BuildRaytracingAccelerationStructure BLAS + TLAS + RayQueryKHR
 //      hit vs. miss; clean SKIP on GPUs without VK_KHR_acceleration_structure / VK_KHR_ray_query).
@@ -341,7 +341,7 @@ int main() {
     cl->Close();
 
     // -------------------------------------------------------------------------
-    // Part 1: ExecuteIndirect with CountBuffer (vkCmdDrawIndirectCount)
+    // Part 1: draw-signature creation smoke + native vkCmdDrawIndirectCount reference
     // -------------------------------------------------------------------------
     {
         D3D12_INDIRECT_ARGUMENT_DESC arg_desc{D3D12_INDIRECT_ARGUMENT_TYPE_DRAW};
@@ -350,7 +350,7 @@ int main() {
         if (FAILED(dev->CreateCommandSignature(&sig_desc, nullptr, IID_PPV_ARGS(&cmd_sig))) || !cmd_sig)
             return fail("CreateCommandSignature");
 
-        // Verify COM command-list recording of ExecuteIndirect with CountBuffer.
+        // The Vulkan reference below uses two independently prefixed upload slices.
         D3D12_HEAP_PROPERTIES up_hp{D3D12_HEAP_TYPE_UPLOAD};
         constexpr VkDeviceSize buffer_size = 256, argument_base = 64, count_base = 128;
         auto b256 = make_buf_desc(buffer_size);
@@ -380,13 +380,12 @@ int main() {
         counts[1] = 1u;  // draw 1 fullscreen triangle
         count_buf->Unmap(0, nullptr);
 
-        alloc->Reset();
-        cl->Reset(alloc, nullptr);
-        cl->ExecuteIndirect(cmd_sig, 2, arg_buf, argument_base, count_buf, count_base + sizeof(std::uint32_t));
-        if (FAILED(cl->Close())) return fail("ExecuteIndirect COM record Close");
-
 #if defined(LEONIDA_TEST_VS_TRI_SPV) && defined(LEONIDA_TEST_FS_SOLID_SPV)
-        if (chosen12.drawIndirectCount) {
+        if (chosen12.drawIndirectCount) {  // enabled at device creation
+            constexpr std::uint32_t max_draws = 1;  // this oracle tests counts 0 and 1, not multiDrawIndirect
+            static_assert(sizeof(D3D12_DRAW_ARGUMENTS) == sizeof(VkDrawIndirectCommand));
+            if (!vkCmdDrawIndirectCount || chosen.limits.maxDrawIndirectCount < max_draws)
+                return fail("native counted-draw feature/limit mismatch");
             std::vector<std::uint32_t> vs_words, fs_words;
             if (!read_spv(LEONIDA_TEST_VS_TRI_SPV, vs_words) || !read_spv(LEONIDA_TEST_FS_SOLID_SPV, fs_words))
                 return fail("read vs_tri/fs_solid spv");
@@ -501,19 +500,11 @@ int main() {
             cbai.commandBufferCount = 1;
             vkAllocateCommandBuffers(vk_dev, &cbai, &cb);
 
-            leonida::ReplayFunctions rf{};
-            rf.draw_indirect_count = vkCmdDrawIndirectCount;
-            auto run_indirect_count = [&](std::uint64_t count_offset, std::uint8_t exp_r, std::uint8_t exp_g,
-                                          std::uint8_t exp_b) -> int {
-                leonida::CommandList ir;
-                ir.execute_indirect({leonida::IndirectKind::draw, sizeof(D3D12_DRAW_ARGUMENTS), 2u,
-                                     rt::d3d12::resource_id(arg_buf), 0, rt::d3d12::resource_id(count_buf),
-                                     count_offset});
-                ir.close();
-
+            auto run_native_count = [&](VkDeviceSize count_offset, std::uint8_t exp_r, std::uint8_t exp_g,
+                                        std::uint8_t exp_b) -> int {
                 VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
                 bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-                vkBeginCommandBuffer(cb, &bi);
+                if (vkBeginCommandBuffer(cb, &bi) != VK_SUCCESS) return fail("begin native counted draw");
 
                 VkImageMemoryBarrier b_to_rt{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
                 b_to_rt.srcAccessMask = 0;
@@ -544,22 +535,10 @@ int main() {
                 vkCmdSetScissor(cb, 0, 1, &sc);
                 vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pso);
 
-                const auto resolver = [&](leonida::ResourceId id) -> const leonida::ResourceBinding* {
-                    // Treat the two upload buffers as backing stores for slices that start after a prefix.
-                    static leonida::ResourceBinding arg_b{}, cnt_b{};
-                    arg_b.buffer = rt::d3d12::vulkan_buffer(arg_buf);
-                    arg_b.buffer_offset = argument_base;
-                    arg_b.size = buffer_size - argument_base;
-                    cnt_b.buffer = rt::d3d12::vulkan_buffer(count_buf);
-                    cnt_b.buffer_offset = count_base;
-                    cnt_b.size = buffer_size - count_base;
-                    if (id == rt::d3d12::resource_id(arg_buf)) return &arg_b;
-                    if (id == rt::d3d12::resource_id(count_buf)) return &cnt_b;
-                    return nullptr;
-                };
-                if (leonida::replay(ir, cb, resolver, rf) != leonida::ReplayResult::success)
-                    return fail("leonida::replay(ExecuteIndirect CountBuffer)");
-
+                // Native reference, not a stateful D3D12 replay. Both bindings start after poison prefixes.
+                vkCmdDrawIndirectCount(cb, rt::d3d12::vulkan_buffer(arg_buf), argument_base,
+                                       rt::d3d12::vulkan_buffer(count_buf), count_base + count_offset,
+                                       max_draws, sizeof(VkDrawIndirectCommand));
                 vkCmdEndRendering(cb);
 
                 VkImageMemoryBarrier b_to_src{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -583,26 +562,26 @@ int main() {
                 host_b.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
                 vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &host_b, 0,
                                      nullptr, 0, nullptr);
-                vkEndCommandBuffer(cb);
+                if (vkEndCommandBuffer(cb) != VK_SUCCESS) return fail("end native counted draw");
 
                 VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
                 si.commandBufferCount = 1;
                 si.pCommandBuffers = &cb;
-                vkQueueSubmit(vk_queue, 1, &si, VK_NULL_HANDLE);
-                vkQueueWaitIdle(vk_queue);
+                if (vkQueueSubmit(vk_queue, 1, &si, VK_NULL_HANDLE) != VK_SUCCESS ||
+                    vkQueueWaitIdle(vk_queue) != VK_SUCCESS) return fail("submit/wait native counted draw");
 
                 void* mp = nullptr;
-                rb->Map(0, nullptr, &mp);
+                if (FAILED(rb->Map(0, nullptr, &mp)) || !mp) return fail("map native counted-draw readback");
                 const auto* px = static_cast<const std::uint8_t*>(mp);
                 const bool ok = std::abs(int(px[0]) - int(exp_r)) <= 1 && std::abs(int(px[1]) - int(exp_g)) <= 1 &&
                                 std::abs(int(px[2]) - int(exp_b)) <= 1 && px[3] == 255;
                 rb->Unmap(0, nullptr);
-                if (!ok) return fail("ExecuteIndirect CountBuffer pixel mismatch");
+                if (!ok) return fail("native counted-draw pixel mismatch");
                 return 0;
             };
 
-            if (run_indirect_count(0, 0, 0, 0) != 0) return 1;        // count = 0 -> black
-            if (run_indirect_count(4, 32, 160, 240) != 0) return 1;   // count = 1 -> triangle
+            if (run_native_count(0, 0, 0, 0) != 0) return 1;        // count = 0 -> black
+            if (run_native_count(4, 32, 160, 240) != 0) return 1;   // count = 1 -> triangle
 
             vkDestroyCommandPool(vk_dev, pool, nullptr);
             vkDestroyImageView(vk_dev, rt_view, nullptr);
@@ -610,8 +589,10 @@ int main() {
             vkDestroyPipelineLayout(vk_dev, pl, nullptr);
             rb->Release();
             rt->Release();
-            std::printf("  [PASS] ExecuteIndirect with suballocated argument and count buffers "
-                        "(count=0 skipped, count=1 rendered)\n");
+            std::printf("  [PASS] native Vulkan counted-draw reference with suballocated argument/count offsets "
+                        "(count=0 black, count=1 solid triangle)\n");
+        } else {
+            std::printf("  [SKIP] native counted-draw reference: drawIndirectCount unsupported\n");
         }
 #endif
         count_buf->Release();

@@ -492,6 +492,48 @@ int main() {
               "pack_stage: non-compute graphics stages still refuse spills");
     }
 
+    // The graphics root window (D3D-448-GRAPHICS): the graphics bind point lays a signature out once with
+    // Stage::Pixel, root dword k at push dword 8 + k. A vertex, pixel or geometry shader reads SGPR i from push
+    // dword i, and a mesh shader its s16 + k from push dword 8 + k (tools/rdna2spirv.py, user_data_dword), so every
+    // stage of a pipeline finds each parameter in the same dword. The mesh window holds 16 dwords, the others 24.
+    {
+        const std::vector<RootSignature> shapes = [] {
+            std::vector<RootSignature> out(4);
+            out[0].params = {consts(2), view()};
+            out[1].params = {table(), table(), consts(1)};
+            out[2].params = {table(), consts(4), view(), table()};
+            out[3].params.assign(16, table());
+            return out;
+        }();
+        for (std::size_t s = 0; s < shapes.size(); ++s) {
+            const StagePackResult vs = pack_stage(shapes[s], Stage::Vertex);
+            const StagePackResult ps = pack_stage(shapes[s], Stage::Pixel);
+            const StagePackResult gs = pack_stage(shapes[s], Stage::Geometry);
+            const StagePackResult ms = pack_stage(shapes[s], Stage::Mesh);
+            check(vs.ok && ps.ok && gs.ok && ms.ok, "graphics window: the shape fits every graphics stage");
+            check(vs.first_sgpr == ps.first_sgpr && vs.first_sgpr == gs.first_sgpr,
+                  "graphics window: VS, PS and GS place every parameter in the same SGPR");
+            bool same_dword = vs.first_sgpr.size() == ms.first_sgpr.size();
+            for (std::size_t i = 0; same_dword && i < vs.first_sgpr.size(); ++i)
+                same_dword = vs.first_sgpr[i] - 8 == ms.first_sgpr[i] - 16;
+            check(same_dword, "graphics window: a mesh shader's s16 + k is the pixel shader's s8 + k");
+        }
+        RootSignature twenty;
+        twenty.params = {consts(20)};
+        check(pack_stage(twenty, Stage::Vertex).ok && !pack_stage(twenty, Stage::Mesh).ok,
+              "graphics window: 20 dwords fit a pixel shader (24 from s8) but not a mesh shader (16 from s16)");
+        RootSignature full;
+        full.params = {consts(24)};
+        check(pack_stage(full, Stage::Pixel).ok, "graphics window: 24 constants fill s8..s31 exactly");
+        full.params = {consts(23), view()};
+        check(!pack_stage(full, Stage::Pixel).ok, "graphics window: a root view past s31 spills");
+        RootSignature tables;
+        tables.params = {table(), table()};
+        const StagePackResult t = pack_stage(tables, Stage::Pixel);
+        check(t.ok && t.first_sgpr == std::vector<uint32_t>({8, 9}) && t.end_sgpr == 10,
+              "graphics window: two tables are s8 and s9, one dword each (pack() gave s[0:1] and s[2:3])");
+    }
+
     // pack_stage keeps pack()'s validation.
     {
         RootSignature invalid_sig;

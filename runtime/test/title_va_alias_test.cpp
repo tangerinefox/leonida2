@@ -67,6 +67,24 @@ int main() {
     EXPECT(a.shader_va(title + 0x8000) == title + 0x8000);
     a.remove(title + 0x100000, below);
     EXPECT(a.size() == 0 && a.shader_va(title + 0x100010) == title + 0x100010);
+    // range_of: what a BVH build checks its bytes against (the whole range must lie in one copy), and mappings, the
+    // table a TLAS build translates its instances' BLAS addresses with.
+    std::uint64_t to = 0, room = 0;
+    std::vector<leonida::TitleVaAliases::Mapping> table;
+    a.mappings(table);
+    EXPECT(table.empty() && !a.range_of(title, to, room));
+    EXPECT(a.add(title + 0x40000, size, 0x7000000) && a.add(title, size, arena));
+    EXPECT(a.range_of(title + 0x100, to, room) && to == arena + 0x100 && room == size - 0x100);
+    EXPECT(a.range_of(title + size - 1, to, room) && to == arena + size - 1 && room == 1);
+    EXPECT(!a.range_of(title + size, to, room) && !a.range_of(title - 1, to, room));
+    EXPECT(a.resolve(title + 0x40010, 64, leonida::TitleVaAliases::bvh_address) == 0x7000010);
+    EXPECT(a.translated(leonida::TitleVaAliases::bvh_address) == 1);
+    a.mappings(table);
+    EXPECT(table.size() == 2 && table[0].title_va == title && table[0].end == title + size &&
+           table[0].shader_va == arena && table[1].title_va == title + 0x40000 && table[1].shader_va == 0x7000000);
+    a.remove(title, arena);
+    a.remove(title + 0x40000, 0x7000000);
+    EXPECT(a.size() == 0);
     std::printf("title_va_alias: translation inside a title-placed range, identity outside it and after release\n");
     return 0;
 }

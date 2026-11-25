@@ -7,8 +7,10 @@
 //   - an old RADV: sizes 32..64, COMPUTE only.
 // No game data.
 #include "../src/subgroup_size.h"
+#include "test_temp_dir.h"
 
 #include <cstdio>
+#include <fstream>
 #include <string>
 
 #define CHECK(condition) do {                                    \
@@ -136,6 +138,31 @@ int main() {
         }
         const auto emulated = decide_subgroup_size(entry("cs", true, {64, 1, 1}, true), caps);
         CHECK(emulated.outcome == SubgroupOutcome::emulated && emulated.size == 0);
+    }
+
+    // Read the translator's graphics tier through the same index lookup used at pipeline creation: tiers A and B are
+    // partition invariant (the device's 32-wide size is exact for them), C, an unknown tier and a non-string are not.
+    {
+        const testfiles::ScratchDir scratch("leonida_subgroup_graphics");
+        std::ofstream(scratch.path() / "index.json") << R"({
+            "a": {"stage":"vs","wave64":true,"subgroup_size":64,"fssm_sha256":"a","wave64_graphics":"A"},
+            "b": {"stage":"ps","wave64":true,"subgroup_size":64,"fssm_sha256":"b","wave64_graphics":"B"},
+            "c": {"stage":"gs","wave64":true,"subgroup_size":64,"fssm_sha256":"c","wave64_graphics":"C"},
+            "unknown": {"stage":"ps","wave64":true,"fssm_sha256":"unknown","wave64_graphics":"D"},
+            "bad": {"stage":"ps","wave64":true,"fssm_sha256":"bad","wave64_graphics":1}
+        })";
+        ShaderLibrary library;
+        CHECK(library.load(scratch.path()));
+        const auto* a = library.find("vs", "a");
+        const auto* b = library.find("ps", "b");
+        CHECK(a && b && graphics_partition_invariant(*a) && graphics_partition_invariant(*b));
+        for (const auto* shader : {library.find("gs", "c"), library.find("ps", "unknown"), library.find("ps", "bad")})
+            CHECK(shader && !graphics_partition_invariant(*shader));
+        // The size decision itself does not change: 64 cannot be had on NVIDIA, and AMD still gets it natively.
+        const auto fixed = decide_subgroup_size(*b, nvidia());
+        CHECK(fixed.outcome == SubgroupOutcome::unavailable && fixed.wanted == 64 && fixed.size == 0 && fixed.flags == 0);
+        const auto native = decide_subgroup_size(*b, amd());
+        CHECK(native.outcome == SubgroupOutcome::required && native.size == 64);
     }
 
     // --- An old RADV: COMPUTE only ----------------------------------------------------------------------------------

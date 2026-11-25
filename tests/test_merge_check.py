@@ -78,10 +78,11 @@ class MergeCheckTest(unittest.TestCase):
         title = subject or f"{branch}: add the effect record section"
         self.git("commit", "-q", "-m", f"{title} (#{number})")
 
-    def run_check(self, *pairs):
+    def run_check(self, *pairs, main="main"):
         out = io.StringIO()
         with redirect_stdout(out):
-            code = mc.main(["--repo", self.repo, "--main", "main", "--json", *pairs])
+            code = mc.main(["--repo", self.repo, "--main", main, "--json", *pairs])
+        self.assertNotEqual(code, 2, "merge_check exited before writing its JSON report")
         return code, json.loads(out.getvalue())
 
     def run_text(self, *pairs):
@@ -153,6 +154,20 @@ class MergeCheckTest(unittest.TestCase):
         self.assertEqual(r["merges"], [])  # another number: only the text check can see it
         self.assertEqual(r["duplicates"], {"docs/notes.md": 3})
 
+        # Each filename can also name an object that the checker passes to Git.
+        main_commit = self.git("rev-parse", "main")
+        tree, _ = mc.merged_tree(self.repo, "main", "moved")
+        collisions = [("main", "main"), (main_commit, main_commit), (tree, "main")]
+        if os.name != "nt":
+            collisions.append(("main:docs/notes.md", "main"))
+        for path, revision in collisions:
+            with self.subTest(path=path):
+                self.write(path, "Unrelated checkout file\n")
+                try:
+                    self.assertEqual(self.run_check("9=moved", main=revision), (code, [r]))
+                finally:
+                    os.remove(os.path.join(self.repo, path))
+
     def test_duplicate_check_reports_failed_blob_reads(self):
         self.append("docs/notes.md", "\n" + PARAGRAPH)
         self.commit("Existing paragraph")
@@ -162,7 +177,7 @@ class MergeCheckTest(unittest.TestCase):
 
         for rev in ("main", tree):
             with self.subTest(revision=rev):
-                read = ["show", f"{rev}:docs/notes.md"]
+                read = ["show", f"{rev}:docs/notes.md", "--"]
 
                 def fail_read(args, **kwargs):
                     if args[3:] == read:

@@ -240,12 +240,17 @@ void audit_pso_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, HRESULT hr, 
                  types.c_str(), shaders.c_str(), d3d12_trace::stream_refusal ? d3d12_trace::stream_refusal : "-");
 }
 
-PsoStreamRecord::~PsoStreamRecord() {
-    for (ID3D12RootSignature* root : roots_)
+PsoStreamRecord::Payloads::~Payloads() {
+    for (ID3D12RootSignature* root : roots)
         if (root) root->Release();
 }
 
 std::unique_ptr<PsoStreamRecord> PsoStreamRecord::capture(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, bool console) {
+    return capture(desc, std::span<const ShaderData>{}, console);
+}
+
+std::unique_ptr<PsoStreamRecord> PsoStreamRecord::capture(const D3D12_PIPELINE_STATE_STREAM_DESC& desc,
+                                                          std::span<const ShaderData> shaders, bool console) {
     if (!desc.pPipelineStateSubobjectStream || desc.SizeInBytes == 0 || desc.SizeInBytes > kMaxStreamBytes)
         return nullptr;
     const auto* source = static_cast<const unsigned char*>(desc.pPipelineStateSubobjectStream);
@@ -253,11 +258,22 @@ std::unique_ptr<PsoStreamRecord> PsoStreamRecord::capture(const D3D12_PIPELINE_S
     if (!walk(source, desc.SizeInBytes, subs, console)) return nullptr;
 
     std::unique_ptr<PsoStreamRecord> record(new PsoStreamRecord());
+    record->payloads_ = std::make_shared<Payloads>();
+    for (const auto& shader : shaders) if (shader) record->payloads_->shaders.push_back(shader);
     record->bytes_.assign(source, source + desc.SizeInBytes);
     for (const Subobject& sub : subs) {
         if (console) std::memcpy(record->bytes_.data() + sub.tag_offset, &sub.type, sizeof(sub.type));
         if (!record->copy_pointed_data(sub.type, sub.payload)) return nullptr;
     }
+    return record;
+}
+
+// The derived overrides touch value subobjects only. Shader bytes, semantic names and root
+// signature references have the lifetime of the shared payload even after releasing the base PSO.
+std::unique_ptr<PsoStreamRecord> PsoStreamRecord::derived(const PsoStreamRecord& base, std::vector<unsigned char> stream) {
+    std::unique_ptr<PsoStreamRecord> record(new PsoStreamRecord());
+    record->bytes_ = std::move(stream);
+    record->payloads_ = base.payloads_;
     return record;
 }
 
@@ -269,8 +285,8 @@ bool PsoStreamRecord::copy_pointed_data(std::size_t type, std::size_t payload_of
             ID3D12RootSignature* root = nullptr;
             std::memcpy(&root, payload, sizeof(root));
             if (root) {
+                payloads_->roots.push_back(root);
                 root->AddRef();
-                roots_.push_back(root);
             }
             return true;
         }
@@ -285,7 +301,9 @@ bool PsoStreamRecord::copy_pointed_data(std::size_t type, std::size_t payload_of
             D3D12_SHADER_BYTECODE code{};
             std::memcpy(&code, payload, sizeof(code));
             if (code.pShaderBytecode && code.BytecodeLength) {
-                code.pShaderBytecode = own_blob(blobs_, code.pShaderBytecode, code.BytecodeLength);
+                for (const auto& shader : payloads_->shaders)
+                    if (shader->data() == code.pShaderBytecode && shader->size() == code.BytecodeLength) return true;
+                code.pShaderBytecode = own_blob(payloads_->blobs, code.pShaderBytecode, code.BytecodeLength);
                 std::memcpy(payload, &code, sizeof(code));
             }
             return true;
@@ -295,10 +313,10 @@ bool PsoStreamRecord::copy_pointed_data(std::size_t type, std::size_t payload_of
             std::memcpy(&so, payload, sizeof(so));
             if (so.pSODeclaration && so.NumEntries)
                 so.pSODeclaration = reinterpret_cast<const D3D12_SO_DECLARATION_ENTRY*>(
-                    own_blob(blobs_, so.pSODeclaration, so.NumEntries * sizeof(D3D12_SO_DECLARATION_ENTRY)));
+                    own_blob(payloads_->blobs, so.pSODeclaration, so.NumEntries * sizeof(D3D12_SO_DECLARATION_ENTRY)));
             if (so.pBufferStrides && so.NumStrides)
                 so.pBufferStrides = reinterpret_cast<const UINT*>(
-                    own_blob(blobs_, so.pBufferStrides, so.NumStrides * sizeof(UINT)));
+                    own_blob(payloads_->blobs, so.pBufferStrides, so.NumStrides * sizeof(UINT)));
             std::memcpy(payload, &so, sizeof(so));
             return true;
         }
@@ -308,12 +326,12 @@ bool PsoStreamRecord::copy_pointed_data(std::size_t type, std::size_t payload_of
             if (!layout.pInputElementDescs || !layout.NumElements) return true;
             const std::size_t bytes = layout.NumElements * sizeof(D3D12_INPUT_ELEMENT_DESC);
             auto* elements = reinterpret_cast<D3D12_INPUT_ELEMENT_DESC*>(
-                const_cast<unsigned char*>(own_blob(blobs_, layout.pInputElementDescs, bytes)));
+                const_cast<unsigned char*>(own_blob(payloads_->blobs, layout.pInputElementDescs, bytes)));
             for (UINT i = 0; i < layout.NumElements; ++i) {
                 if (!elements[i].SemanticName) continue;
                 const std::size_t len = std::strlen(elements[i].SemanticName) + 1;
                 elements[i].SemanticName =
-                    reinterpret_cast<const char*>(own_blob(blobs_, elements[i].SemanticName, len));
+                    reinterpret_cast<const char*>(own_blob(payloads_->blobs, elements[i].SemanticName, len));
             }
             layout.pInputElementDescs = elements;
             std::memcpy(payload, &layout, sizeof(layout));
@@ -323,7 +341,7 @@ bool PsoStreamRecord::copy_pointed_data(std::size_t type, std::size_t payload_of
             D3D12_CACHED_PIPELINE_STATE cached{};
             std::memcpy(&cached, payload, sizeof(cached));
             if (cached.pCachedBlob && cached.CachedBlobSizeInBytes) {
-                cached.pCachedBlob = own_blob(blobs_, cached.pCachedBlob, cached.CachedBlobSizeInBytes);
+                cached.pCachedBlob = own_blob(payloads_->blobs, cached.pCachedBlob, cached.CachedBlobSizeInBytes);
                 std::memcpy(payload, &cached, sizeof(cached));
             }
             return true;
@@ -367,6 +385,15 @@ bool attach_pso_record(ID3D12Object* object, std::unique_ptr<PsoStreamRecord> re
     owner->Release();
     RecordOwner* pointer = owner;
     return SUCCEEDED(object->SetPrivateData(kRecordPointerGuid, sizeof(pointer), &pointer));
+}
+
+bool share_pso_record(ID3D12Object* source, ID3D12Object* target) {
+    UINT size=sizeof(RecordOwner*);
+    RecordOwner* owner=nullptr;
+    if(!source || !target || FAILED(source->GetPrivateData(kRecordPointerGuid,&size,&owner)) ||
+       size!=sizeof(owner) || !owner) return false;
+    if(FAILED(target->SetPrivateDataInterface(kRecordOwnerGuid,owner))) return false;
+    return SUCCEEDED(target->SetPrivateData(kRecordPointerGuid,sizeof(owner),&owner));
 }
 
 const PsoStreamRecord* find_pso_record(ID3D12Object* object) {

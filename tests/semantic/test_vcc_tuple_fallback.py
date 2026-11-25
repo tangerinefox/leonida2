@@ -144,6 +144,14 @@ class VccTupleFallbackTest(unittest.TestCase):
         with self.assertRaisesRegex(rdna2spirv.Unsupported, "fall-through into undecodable words"):
             translate(program)
 
+    def test_nsa_mimg_with_vcc_tuple_does_not_read_past_code_end(self):
+        # A 12-byte NSA1 image_load whose 3rd dword lies past code_end must not be restored across stop.
+        mimg_nsa1 = bytes.fromhex("0a 1f 00 f0 01 04 19 00 02 00 00 00")
+        self.assertEqual(rdna2spirv.restore_skipped_instructions([], mimg_nsa1, 0, 8), [])
+        restored = rdna2spirv.restore_skipped_instructions([], mimg_nsa1, 0, 12)
+        self.assertEqual(len(restored), 1)
+        self.assertEqual((restored[0]["pc"], len(restored[0]["enc"]) // 2), (0, 12))
+
 
 if __name__ == "__main__":
     unittest.main()

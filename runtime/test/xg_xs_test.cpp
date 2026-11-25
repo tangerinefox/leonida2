@@ -1,12 +1,22 @@
+// Checks the registered xg_xs.dll shim (runtime/shims/xg_xs.cpp) and the two texture layout models behind it
+// (runtime/shims/xg_xs_layout.h and runtime/src/console_texture_layout.h). Synthetic textures only; no game files.
+//
+// Both exports are resolved through rt::shims::find, so this is the table the runtime installs. The cases of the
+// second model and their expected numbers are those of the project it is ported from (Marvisak/VIctory,
+// GPL-3.0-or-later, translated from Rust to C++ and changed for Leonida,
+// crates/victory-formats/src/texture.rs and crates/victory-hle/src/modules/xg.rs tests at d2a4bae1f): hand-checked
+// addresses, mip tail placement, a two-plane depth-stencil, and a bijection plus round trip over every element.
 #include <windows.h>
 
 #include <array>
 #include <cstdint>
 #include <cstdio>
 #include <map>
+#include <memory>
 #include <cstring>
 #include <vector>
 
+#include "../src/console_texture_layout.h"
 #include "shims.h"
 #include "xg_xs_layout.h"
 #include "../src/title_texture_memory.h"
@@ -15,6 +25,7 @@
 namespace {
 
 using namespace rt::xg_xs;
+namespace ct = leonida::console_texture;
 using CreateFn = HRESULT(__stdcall*)(const void*, void**);
 using SuggestFn = HRESULT(__stdcall*)(const void*, uint32_t, uint32_t*);
 using RefFn = ULONG(__stdcall*)(void*);
@@ -98,6 +109,283 @@ void check_detile(const Texture& t) {
     check(true, "copy_elements reads each element at offset()");
 }
 
+bool all_bytes(const uint8_t* p, size_t n, uint8_t value) {
+    for (size_t i = 0; i < n; ++i)
+        if (p[i] != value) return false;
+    return true;
+}
+
+ct::Desc desc2d(uint32_t w, uint32_t h, uint32_t mips, uint32_t bpe, uint32_t swizzle) {
+    ct::Desc d;
+    d.width = w;
+    d.height = h;
+    d.mips = mips;
+    d.element_bytes = bpe;
+    d.swizzle = swizzle;
+    return d;
+}
+
+uint64_t offset_of(const ct::Layout& l, uint32_t mip, uint32_t x, uint32_t y, uint32_t z) {
+    uint64_t at = ~uint64_t{0};
+    return l.offset(mip, x, y, z, at) == ct::Error::ok ? at : ~uint64_t{0};
+}
+
+void test_layout_model() {
+    // Sizes past the hardware's 16384 texels per side are refused instead of overflowing.
+    for (uint32_t s : {ct::kLinear, ct::kSw64kbDX}) {
+        const auto largest = ct::Layout::make(desc2d(ct::kMaxExtent, ct::kMaxExtent, 15, 16, s));
+        check(largest && largest->size >= uint64_t{ct::kMaxExtent} * ct::kMaxExtent * 16, "largest texture lays out");
+        check(!ct::Layout::make(desc2d(ct::kMaxExtent + 1, 1, 1, 16, s)), "width past 16384 is refused");
+        check(!ct::Layout::make(desc2d(1, 0xffffffffu, 1, 16, s)), "height past 16384 is refused");
+        auto deep = desc2d(1, 1, 1, 16, s);
+        deep.depth = 0xffffffffu;
+        check(!ct::Layout::make(deep), "depth past 16384 is refused");
+    }
+    // Blocks hold their size in elements, and the pattern covers exactly the block's coordinates.
+    for (uint32_t log2 : {8u, 12u, 16u}) {
+        const uint32_t s = log2 == 8 ? ct::kSw256bS : log2 == 12 ? ct::kSw4kbS : ct::kSw64kbD;
+        for (uint32_t e = 0; e < 5; ++e) {
+            const auto l = ct::Layout::make(desc2d(1, 1, 1, 1u << e, s));
+            check(l && (uint64_t{l->block[0]} * l->block[1] * l->block[2] << e) == (uint64_t{1} << log2),
+                  "block holds its size in elements");
+            check(l && l->pattern()[0].size() == l->block[0] && l->pattern()[1].size() == l->block[1],
+                  "pattern covers the block");
+        }
+    }
+    {
+        const auto l = ct::Layout::make(desc2d(64, 64, 1, 16, ct::kSw64kbD));
+        check(l && l->block[0] == 64 && l->block[1] == 64 && l->block[2] == 1, "64 KiB, 16-byte elements: 64x64");
+        check(l && l->size == 65536 && l->alignment == 65536, "64 KiB, 16-byte elements: one block");
+    }
+    // Hand-checked: in a 64 KiB D block of 4-byte elements, x bits go to address bits 2, 3, 6, 9, 11, 13, 15 and y
+    // bits to 4, 5, 7, 8, 10, 12, 14; a 4 KiB S block of 16-byte elements is 16x16 with y first.
+    {
+        const auto l = ct::Layout::make(desc2d(128, 128, 1, 4, ct::kSw64kbD));
+        check(l && offset_of(*l, 0, 1, 0, 0) == (1u << 2), "64KB_D x=1");
+        check(l && offset_of(*l, 0, 4, 0, 0) == (1u << 6), "64KB_D x=4");
+        check(l && offset_of(*l, 0, 0, 4, 0) == (1u << 7), "64KB_D y=4");
+        check(l && offset_of(*l, 0, 0, 8, 0) == (1u << 8), "64KB_D y=8");
+        check(l && offset_of(*l, 0, 64, 64, 0) == ((1u << 15) | (1u << 14)), "64KB_D (64,64)");
+        const auto s = ct::Layout::make(desc2d(32, 32, 1, 16, ct::kSw4kbS));
+        check(s && s->block[0] == 16 && s->block[1] == 16, "4KB_S 16-byte block is 16x16");
+        check(s && offset_of(*s, 0, 0, 1, 0) == (1u << 4), "4KB_S y=1");
+        check(s && offset_of(*s, 0, 1, 0, 0) == (1u << 6), "4KB_S x=1");
+        check(s && offset_of(*s, 0, 16, 0, 0) == 4096, "4KB_S second block");
+        check(s && offset_of(*s, 0, 0, 16, 0) == 8192, "4KB_S third block");
+    }
+    // A 256x256 BC7 chain in 64 KiB D: one tail block holding mips 1-8, then mip 0; mip 1 sits at x = 32 elements,
+    // 32 KiB into the tail. 4 KiB blocks hold fewer tail mips.
+    {
+        const auto l = ct::Layout::make(desc2d(64, 64, 9, 16, ct::kSw64kbD));
+        check(l && l->first_tail_mip == 1 && l->size == 2 * 65536 && l->mips[0].offset == 65536, "tail comes first");
+        check(l && l->mips[1].tail && l->mips[1].tail->offset == 32768 && l->mips[1].tail->x == 32 &&
+                  l->mips[1].tail->y == 0,
+              "mip 1 tail position");
+        check(l && offset_of(*l, 1, 0, 0, 0) == 32768, "mip 1 element 0 address");
+        const auto s = ct::Layout::make(desc2d(64, 64, 9, 16, ct::kSw4kbS));
+        check(s && s->first_tail_mip == 3 && s->mips[2].offset == 4096 && s->mips[1].offset == 8192 &&
+                  s->mips[0].offset == 8192 + 16384,
+              "4 KiB tail holds fewer mips");
+    }
+    // Depth-stencil is two planes: 4-byte depth in 128x128 blocks, 1-byte stencil in 256x256 blocks.
+    {
+        ct::TextureDesc t;
+        t.width = 1920;
+        t.height = 1080;
+        t.format = 20;
+        t.swizzle = ct::kSw64kbZX;
+        const auto tex = ct::Texture::make(t);
+        check(tex && tex->planes.size() == 2, "D32_FLOAT_S8X24 has two planes");
+        check(tex && tex->planes[0].layout.size == 1920ull * 1152 * 4, "depth plane size");
+        check(tex && tex->planes[1].offset == tex->planes[0].layout.size, "stencil follows depth");
+        check(tex && tex->planes[1].layout.size == 2048ull * 1280, "stencil plane size");
+        check(tex && !tex->planes[0].layout.addressable(), "XOR modes are not addressed");
+    }
+    // Bad descriptions and buffers are refused.
+    {
+        check(!ct::Layout::make(desc2d(0, 4, 1, 4, ct::kSw4kbS)), "zero width is refused");
+        check(!ct::Layout::make(desc2d(4, 4, 1, 12, ct::kSw4kbS)), "12-byte elements are refused");
+        check(!ct::Layout::make(desc2d(4, 4, 1, 4, 3)), "mode 3 is refused");
+        const auto l = ct::Layout::make(desc2d(64, 64, 1, 4, ct::kSw4kbS));
+        std::vector<uint8_t> out(64 * 64 * 4), small(100);
+        check(l && l->detile(small.data(), small.size(), 0, 0, out.data(), out.size(), 256, 0) == ct::Error::too_small,
+              "a short tiled buffer is too small");
+        uint64_t at = 0;
+        check(l && l->offset(0, 64, 0, 0, at) == ct::Error::invalid, "an element outside is invalid");
+        const auto lin = ct::Layout::make(desc2d(4, 2, 1, 4, ct::kLinear));
+        std::vector<uint8_t> tiled(lin ? lin->size : 0), linear(32);
+        check(lin && lin->detile(tiled.data(), tiled.size(), 0, 0, linear.data(), linear.size(), SIZE_MAX, 0) ==
+                         ct::Error::too_small,
+              "an overflowing row pitch is refused");
+        auto vol = desc2d(4, 2, 1, 4, ct::kLinear);
+        vol.dimension = ct::Dimension::tex3d;
+        vol.depth = 3;
+        const auto v = ct::Layout::make(vol);
+        std::vector<uint8_t> vt(v ? v->size : 0), vl(96);
+        check(v && v->detile(vt.data(), vt.size(), 0, 0, vl.data(), vl.size(), 16, SIZE_MAX) == ct::Error::too_small,
+              "an overflowing depth pitch is refused");
+    }
+}
+
+// Every element of every mip and slice lands on its own address inside the texture, and tiling then detiling gives
+// the rows back without touching the padding around them.
+void test_bijection_and_round_trip() {
+    std::vector<ct::Desc> cases = {
+        desc2d(64, 64, 7, 16, ct::kSw64kbD), desc2d(100, 60, 7, 4, ct::kSw64kbD), desc2d(250, 175, 8, 8, ct::kSw4kbS),
+        desc2d(33, 17, 6, 1, ct::kSw4kbD),   desc2d(40, 9, 3, 2, ct::kSw64kbS),   desc2d(30, 20, 5, 4, ct::kLinear),
+        desc2d(83, 31, 6, 1, ct::kSw256bS),
+    };
+    auto bc = desc2d(109, 71, 6, 16, ct::kSw256bD);
+    bc.block = 4;
+    cases.push_back(bc);
+    auto array = desc2d(70, 70, 4, 16, ct::kSw4kbS);
+    array.depth = 3;
+    cases.push_back(array);
+    auto volume = desc2d(64, 32, 7, 4, ct::kSw4kbS);
+    volume.dimension = ct::Dimension::tex3d;
+    volume.depth = 16;
+    cases.push_back(volume);
+    for (const ct::Desc& d : cases) {
+        const auto l = ct::Layout::make(d);
+        if (!l) {
+            check(false, "round-trip case lays out");
+            continue;
+        }
+        std::vector<bool> seen(static_cast<size_t>(l->size));
+        std::vector<uint8_t> tiled(static_cast<size_t>(l->size));
+        const size_t n = d.element_bytes;
+        const uint32_t slices = d.dimension == ct::Dimension::tex3d ? 1 : d.depth;
+        bool ok = true;
+        for (uint32_t slice = 0; slice < slices; ++slice) {
+            for (uint32_t mip = 0; mip < d.mips; ++mip) {
+                const ct::Mip& m = l->mips[mip];
+                const size_t active = size_t{m.width} * n, row = active + 13, plane = row * m.height + 11;
+                std::vector<uint8_t> linear(plane * m.depth);
+                for (size_t i = 0; i < linear.size(); ++i) linear[i] = static_cast<uint8_t>(i * 7 + mip * 13 + slice);
+                ok &= l->tile(tiled.data(), tiled.size(), mip, slice, linear.data(), linear.size(), row, plane) ==
+                      ct::Error::ok;
+                std::vector<uint8_t> back(linear.size(), 0xcc);
+                ok &= l->detile(tiled.data(), tiled.size(), mip, slice, back.data(), back.size(), row, plane) ==
+                      ct::Error::ok;
+                for (uint32_t z = 0; z < m.depth; ++z) {
+                    const size_t base = z * plane;
+                    for (uint32_t y = 0; y < m.height; ++y) {
+                        const size_t start = base + y * row;
+                        ok &= std::memcmp(&back[start], &linear[start], active) == 0;
+                        ok &= all_bytes(&back[start + active], row - active, 0xcc);
+                        for (uint32_t x = 0; x < m.width; ++x) {
+                            uint64_t at64 = 0;
+                            if (l->offset(mip, x, y, slice + z, at64) != ct::Error::ok) {
+                                ok = false;
+                                continue;
+                            }
+                            const size_t at = static_cast<size_t>(at64);
+                            const size_t source = start + x * n;
+                            if (at + n > seen.size() || at % n != 0 || seen[at]) {
+                                ok = false;
+                                continue;
+                            }
+                            ok &= std::memcmp(&tiled[at], &linear[source], n) == 0;
+                            seen[at] = true;
+                        }
+                    }
+                    ok &= all_bytes(&back[base + plane - 11], 11, 0xcc);
+                }
+            }
+        }
+        char what[96];
+        std::snprintf(what, sizeof(what), "bijection and round trip: %ux%ux%u mips %u bpe %u mode %u", d.width,
+                      d.height, d.depth, d.mips, d.element_bytes, d.swizzle);
+        check(ok, what);
+    }
+}
+
+// Two models lay the console's textures out in this tree: xg_xs_layout.h, which the XG computer answers the title
+// with and the D3D12 layer's title-texture registry reads back with, and console_texture_layout.h, which the linear
+// and tiled uploads read with. A texture both lay out must have one size and one address per element, or one side
+// reads at offsets the other did not write. So for each such texture: the sizes are equal, each mip has the same
+// extent in elements, and what the first model tiles the second detiles to the same rows, for every mip and slice.
+void test_models_agree() {
+    struct Case {
+        uint32_t width, height, array, mips;
+        DXGI_FORMAT format;
+        uint32_t mode;
+    };
+    const DXGI_FORMAT formats[] = {DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                   DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT,
+                                   DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_BC3_UNORM};
+    const uint32_t modes[] = {kLinear, k4kbS, k64kbS, k64kbD};
+    struct Shape {
+        uint32_t width, height, array, mips;
+    };
+    const Shape shapes[] = {{1, 1, 1, 1},    {4, 4, 1, 3},      {16, 16, 1, 1},  {64, 64, 1, 7},   {100, 60, 1, 7},
+                            {256, 128, 1, 9}, {250, 175, 3, 8}, {512, 512, 1, 10}, {1024, 64, 2, 1}, {33, 1000, 1, 4}};
+    unsigned compared = 0, only_one = 0;
+    std::vector<uint8_t> tiled, source, back;
+    std::vector<uint64_t> columns;
+    for (const DXGI_FORMAT format : formats) {
+        for (const uint32_t mode : modes) {
+            for (const Shape& s : shapes) {
+                const Format f = format_info(uint32_t(format));
+                ResourceDesc d{kTexture2D, 0, s.width, s.height, uint16_t(s.array), uint16_t(s.mips),
+                               uint32_t(format), 1, 0, mode == kLinear ? 1u : (kSwizzled | mode), 0};
+                Texture t;
+                const bool first = build_texture(d, t);
+                ct::Desc p;
+                p.width = s.width;
+                p.height = s.height;
+                p.depth = s.array;
+                p.mips = s.mips;
+                p.element_bytes = f.bytes;
+                p.block = f.side;
+                p.swizzle = mode;
+                const auto l = ct::Layout::make(p);
+                const bool second = l && l->addressable();
+                char what[160];
+                std::snprintf(what, sizeof(what), "both models agree: %ux%u array %u mips %u format %u mode %u",
+                              s.width, s.height, s.array, s.mips, unsigned(format), mode);
+                if (!first || !second) {
+                    only_one += first != second;
+                    continue;
+                }
+                ++compared;
+                const char* differs = nullptr;
+                if (t.layout.size != l->size) differs = "size";
+                if (!differs && t.layout.mips != l->mips.size()) differs = "mip count";
+                if (!differs) tiled.assign(size_t(t.layout.size), uint8_t{0});
+                for (uint32_t level = 0; !differs && level < s.mips; ++level) {
+                    const auto& a = t.layout.plane[0].mips[level];
+                    const auto& b = l->mips[level];
+                    if (a.width_elements != b.width || a.height_elements != b.height) {
+                        differs = "mip extent";
+                        break;
+                    }
+                    const uint32_t pitch = a.width_elements * f.bytes;
+                    for (uint32_t slice = 0; !differs && slice < s.array; ++slice) {
+                        source.resize(size_t(pitch) * a.height_elements);
+                        for (size_t i = 0; i < source.size(); ++i)
+                            source[i] = uint8_t(i * 131 + (i >> 8) * 7 + level * 17 + slice * 29 + 1);
+                        copy_elements<true>(t, level, slice, source.data(), tiled.data(), pitch, 0, columns);
+                        back.assign(source.size(), uint8_t{0});
+                        const auto copied =
+                            l->detile(tiled.data(), tiled.size(), level, slice, back.data(), back.size(), pitch, 0);
+                        if (copied != ct::Error::ok) differs = "the second model refuses the copy";
+                        else if (back != source) differs = "element addresses";
+                    }
+                }
+                if (differs) {
+                    std::printf("     %s: %s differ (sizes %llu and %llu)\n", what, differs,
+                                static_cast<unsigned long long>(t.layout.size),
+                                static_cast<unsigned long long>(l->size));
+                }
+                check(!differs, what);
+            }
+        }
+    }
+    std::printf("     %u textures laid out by both models, %u by one of them only\n", compared, only_one);
+    check(compared >= 200, "both models lay out most of the list, so the comparison is not empty");
+}
+
 }  // namespace
 
 int main() {
@@ -109,21 +397,42 @@ int main() {
         std::uint64_t cursor = 0;
         std::vector<int> polled;
         const auto visit = [&](Entry& t) { polled.push_back(t.id); };
-        leonida::poll_title_textures(entries, cursor, visit, [&] { return !polled.empty(); });
+        const auto poll = [&](auto exhausted) {
+            const auto snapshot = leonida::title_texture_snapshot(entries);
+            leonida::poll_title_textures(snapshot, cursor, visit, exhausted);
+        };
+        poll([&] { return !polled.empty(); });
         check(polled == std::vector<int>{1}, "budget stops after a background texture");
         entries.erase(10);
         entries[50] = &added;
-        leonida::poll_title_textures(entries, cursor, visit, [&] { return polled.size() == 2; });
+        poll([&] { return polled.size() == 2; });
         check(polled == std::vector<int>{1, 4}, "poll resumes after deletion and skips priority textures");
         polled.clear();
-        leonida::poll_title_textures(entries, cursor, visit, [] { return false; });
+        poll([] { return false; });
         check(polled == std::vector<int>{5, 4}, "unlimited poll wraps once and includes new textures");
         cursor = 20;
         polled.clear();
-        for (unsigned pass = 0; pass < 3; ++pass)
-            leonida::poll_title_textures(entries, cursor, visit, [] { return true; });
+        for (unsigned pass = 0; pass < 3; ++pass) poll([] { return true; });
         check(polled == std::vector<int>{4}, "an expired wall budget advances past priority entries to the next texture");
 
+        // A fill made during a pass submits, and that submission destroys a retired image whose destructor erases its
+        // registry entry; the registry mutex is recursive for its owner on Windows, so the erase lands inside the pass.
+        // A walk over a snapshot keeps every entry of the pass alive and in order, which a walk over the registry
+        // itself cannot do: its iterator steps into a freed node.
+        std::map<std::uint64_t, std::shared_ptr<Entry>> registry;
+        for (std::uint64_t address = 1; address <= 32; ++address)
+            registry[address * 16] = std::make_shared<Entry>(Entry{false, false, int(address)});
+        std::vector<int> walked;
+        const auto pass = leonida::title_texture_snapshot(registry);
+        for (const auto& entry : pass) {
+            walked.push_back(entry.second->id);
+            registry.erase(entry.first);                 // a retired image whose entry leaves mid-pass
+            registry[entry.first + 1] = entry.second;    // and an image re-registered at the next address
+        }
+        std::vector<int> every(32);
+        for (int i = 0; i < 32; ++i) every[i] = i + 1;
+        check(walked == every, "a pass walks every entry once even when a visit erases and re-registers");
+        check(registry.size() == 32, "the registry kept the re-registrations made during the pass");
     }
 
     {
@@ -201,6 +510,46 @@ int main() {
     auto suggest = reinterpret_cast<SuggestFn>(rt::shims::find("xg_xs.dll", "XGSuggestSwizzleMode"));
     check(create && suggest && rt::shims::owns_dll("xg_xs.dll"), "XG exports are registered");
     if (!create || !suggest) return 1;
+
+    test_layout_model();
+    test_bijection_and_round_trip();
+    test_models_agree();
+    ResourceDesc exposure{3, 0, 1, 1, 1, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 0, 0x100, 0x100001};
+    void* target = nullptr;
+    if (!make(create, exposure, target, "create exposure readback render target")) return 1;
+    ResourceLayout exposure_layout{};
+    check(slot<LayoutFn>(target, 2)(target, &exposure_layout) == S_OK, "exposure slot 2 returns layout");
+    const auto& plane = exposure_layout.plane[0];
+    const auto& mip = plane.mips[0];
+    check(exposure_layout.planes == 1 && exposure_layout.mips == 1 && plane.offset == 0 && mip.offset == 0,
+          "first plane and mip start at the returned Map pointer");
+    check(exposure_layout.size == 256 && mip.pitch_bytes == 256 && mip.slice_bytes == 256 && mip.size == 256,
+          "one RGBA32F texel occupies one aligned linear row");
+    slot<RefFn>(target, 1)(target);
+    for (uint32_t flags : {kRenderTarget, kRenderTarget | 0x300000u}) {
+        auto variant = exposure;
+        variant.flags = flags;
+        if (!make(create, variant, target, "linear render target with console flag variants")) return 1;
+        ResourceLayout layout{};
+        check(slot<LayoutFn>(target, 2)(target, &layout) == S_OK &&
+              !std::memcmp(&layout, &exposure_layout, sizeof(layout)), "console flag variants have identical footprints");
+        slot<RefFn>(target, 1)(target);
+    }
+    for (unsigned i = 0; i < 5; ++i) {
+        auto other = exposure;
+        switch (i) {
+        case 0: other.width = 2; break;
+        case 1: other.layout = 0x11b; break;
+        case 2: other.flags |= kDepthStencil; break;
+        case 3: other.samples = 4; break;
+        case 4: other.format = DXGI_FORMAT_R8_UNORM; break;
+        }
+        Texture primary{};
+        check(!build_texture(other, primary), "the linear readback shortcut excludes other target layouts");
+        target = nullptr;
+        check(create(&other, &target) == S_OK && target, "the other render targets still use the general layout model");
+        if (target) slot<RefFn>(target, 1)(target);
+    }
 
     ResourceDesc d{3, 0, 256, 128, 1, 1, DXGI_FORMAT_R8_UNORM, 1, 0, 0, 0};
     check(suggest(&d, 0, &d.layout) == S_OK && d.layout == 0x105, "2D SRV selects SW_4KB_S with aliased output");
@@ -346,7 +695,7 @@ int main() {
         check(distinct && matches, "odd volume mips and z slices are disjoint and preserve padded linear pitches");
     }
 
-    d.samples = 4;
+    d.format = DXGI_FORMAT_UNKNOWN;
     check(create(&d, &computer) == E_NOTIMPL && computer, "unsupported texture keeps a safe fallback object");
     check(slot<LayoutFn>(computer, 2)(computer, &l) == E_NOTIMPL && l.size == 8192 &&
           slot<RefFn>(computer, 1)(computer) == 1, "fallback leaves caller outputs untouched and is safe to release");

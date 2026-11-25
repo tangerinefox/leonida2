@@ -5,6 +5,8 @@
 // CPU and what the GPU address arena holds at the same VA (the shader's heap_base + VA), which T#s have a bindless
 // entry, and which render targets the present-probe should read back as well.
 
+#include "title_va_alias.h"
+
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -192,7 +194,11 @@ inline void describe_table(const char* tag, std::uint64_t va, std::uint32_t slot
                          tag, i, static_cast<unsigned long long>(base), stride, w[2],
                          in_arena ? "arena" : "outside the arena buffer", in_arena ? hex_words(data, 16).c_str() : "",
                          nonzero, made ? "" : " (no CreateConstantBufferView made this V#)");
-            if (made && !in_arena && location) {  // the CB as the title wrote it (title memory, CPU view)
+            // The CB as the title wrote it, when its location is the title's memory (CPU view): an upload buffer's
+            // VA, also outside the arena, is no CPU address.
+            std::uint64_t title_lo = 0, title_hi = 0;
+            if (made && !in_arena && location && title_va_aliases().title_memory(location, title_lo, title_hi) &&
+                title_hi - location >= 64) {
                 std::uint32_t cb[16]{};
                 std::memcpy(cb, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(location)), sizeof cb);
                 std::fprintf(stderr, "[rt] fsdraw: %s   slot %u CB at title 0x%llx: [%s]\n", tag, i,

@@ -34,6 +34,7 @@
 #include "../src/shader_library.h"  // leonida::zlib_inflate
 #include "../src/title_page_watch.h"  // title_gpu_views, title_texel_writes, kernel_writes
 #include "../src/bcpack.h"
+#include "../src/guarded_copy.h"
 #include "../src/shader_directory.h"
 #include "../src/dstorage_swizzle.h"
 #include "../src/dstorage_trace.h"
@@ -405,10 +406,11 @@ File* live_file(IDStorageFileX* p) {
 // ---- Reads --------------------------------------------------------------------------------------------------------
 
 // memmove that turns an access violation into an error instead of ending the process. No C++ objects here: a
-// function with __try cannot have any that need unwinding.
+// function with __try cannot have any that need unwinding. The bytes move in leonida::guarded::move, not the CRT's
+// memmove: under Wine a fault inside ucrtbase never reaches this __except (src/guarded_copy.h).
 bool guarded_move(void* destination, const void* source, size_t size) {
     __try {
-        std::memmove(destination, source, size);
+        leonida::guarded::move(destination, source, size);
         return true;
     } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER
                                                                   : EXCEPTION_CONTINUE_SEARCH) {
@@ -427,6 +429,14 @@ void touch_pages(void* buffer, size_t size) {
         } __except (EXCEPTION_EXECUTE_HANDLER) {
         }
     }
+}
+
+// A copy into a request's destination, title memory: through kernel_writes like the file reads into it, so a page the
+// D3D12 layer keeps read-only (a slot-133 shadow's guard, a geometry tile's) is opened and pinned first, and the GPU
+// copies of it take the bytes at the next submission. A copy that faults anyway is retried once after the range is
+// reopened (title_page_watch.h); false only when it still faults.
+bool title_write(void* destination, const void* source, size_t size) {
+    return leonida::kernel_writes::write(destination, source, size);
 }
 
 HRESULT read_error(DWORD error) {
@@ -1042,7 +1052,7 @@ private:
         void* const destination = cpu_destination(r);
         if (memory) {
             const auto begin = Timing::start();
-            const auto hr = written(r, guarded_move(destination, r.Source, r.SourceSize) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION);
+            const auto hr = written(r, title_write(destination, r.Source, r.SourceSize) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION);
             e.timing.copy = Timing::elapsed(begin);
             if (FAILED(hr)) e.reason = "copy";
             return hr;
@@ -1187,7 +1197,7 @@ private:
                 e.reason = "destination-commit";
                 return E_DSTORAGE_ACCESS_VIOLATION;
             }
-            hr = written(r, guarded_move(dest, data.data(), data.size()) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION);
+            hr = written(r, title_write(dest, data.data(), data.size()) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION);
         }
         e.timing.copy = Timing::elapsed(copy_begin);
         if (FAILED(hr)) e.reason = "publish";

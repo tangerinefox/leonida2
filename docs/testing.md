@@ -56,9 +56,9 @@ This page collects the setup steps and the problems testers have run into so far
 
 ## Build the test programs
 
-On a Windows runtime build with Vulkan enabled, CMake only registers `d3d12_translated_draw`, `d3d12_m2_textured`,
-`d3d12_m2_formats`, `d3d12_m3_frame`, `d3d12_m4_compute` and `d3d12_buffer_uav` when it finds `llvm-mc`,
-`spirv-as` and `spirv-val`. It registers `d3d12_subgroup` only when it finds `llvm-mc` and `glslangValidator`.
+On a Windows runtime build with Vulkan enabled, CMake only registers `d3d12_translated_draw`, `d3d12_rect_list`,
+`d3d12_quad_index`, `d3d12_m2_textured`, `d3d12_m2_formats`, `d3d12_m3_frame`, `d3d12_m4_compute` and
+`d3d12_buffer_uav` when it finds `llvm-mc`, `spirv-as` and `spirv-val`. It registers `d3d12_subgroup` only when it finds `llvm-mc` and `glslangValidator`.
 Without `glslangValidator`, other tests are also omitted, including `d3d12_compute`, `d3d12_draw`,
 `d3d12_set0_compute` and `d3d12_mesh`; some registered tests run only part of their checks. These tests can be
 **absent**, not reported as skipped, when their build prerequisites are missing, so a passing `ctest` percentage
@@ -172,6 +172,25 @@ python -I runtime/test/shaders/check.py <out dir> <folder with the test programs
 ```
 
 For D3D12/runtime tests, `LEONIDA_VK_VALIDATION=1` enables `VK_LAYER_KHRONOS_validation`. When running with validation, set `DISABLE_RTSS_LAYER=1` and `DISABLE_VULKAN_OBS_CAPTURE=1` if MSI Afterburner (RivaTuner) or OBS is installed: their overlay layers can add unsupported swapchain usage, and in an elevated (administrator) terminal the loader ignores `VK_LOADER_LAYERS_DISABLE=~implicit~` (see "Known problems").
+
+On Windows, `run_gpu_tests.py` assembles and translates the D3D-78 fixture and runs the UAV readback and WARP
+comparison from the same build folder. Use `--filter cs_texture_uav` to run only this case:
+
+```powershell
+$env:LEONIDA_VK_VALIDATION = "1"
+python -I scripts/run_gpu_tests.py --build runtime/build --filter cs_texture_uav
+```
+
+Use the actual configuration subfolder for the executables with a multi-config generator. The native Windows
+case reports SKIP without WARP or a sufficiently capable Vulkan device; failed translation, a missing test
+executable on Windows, and readback mismatches fail the runner. Devices without sliced 3D views still run the 1D,
+array and whole-mip cases and check that partial views are refused.
+
+CTest runs the same D3D-78 descriptor creation, copy, range/refusal and clear checks with `--descriptors-only`.
+That mode requires Vulkan, but not a translated shader or WARP. The GPU runner still exercises dispatch and readback.
+
+Use `--filter cs_imgload_mip` to check 2D `image_load_mip` on FLOAT (UNORM), UINT and SINT sampled views with
+both full-width and D16 loads; mip 0 contains decoy data and mip 1 holds the expected texels.
 
 `vk_compute_test`, `vk_bindless_test` and `vk_image_fuzz` read `LEONIDA_VK_VALIDATION` too (`vk_compute_test`
 through `runtime/test/vk_validation.h`): each validation message goes to stderr and a validation error makes the

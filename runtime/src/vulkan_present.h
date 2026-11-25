@@ -29,6 +29,7 @@
 #include "vulkan_present_compose.h"
 #include "fsdraw_probe.h"  // LOCAL DIAGNOSTIC
 #include "local_diagnostics.h"
+#include "present_dump.h"
 
 // Use the original EXT spellings. They are aliases of the promoted KHR types and are available in older headers.
 #if defined(VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME) && defined(VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME)
@@ -657,7 +658,17 @@ private:
         // Only a present the engine took counts (SUBOPTIMAL is shown too). OUT_OF_DATE was not shown: the swapchain
         // is recreated next time, and the caller sees VK_SUCCESS, since its work was submitted.
         if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) {
-            ++presented_;
+            const auto shown = ++presented_;
+            submit_phases::totals().presents.fetch_add(1, std::memory_order_relaxed);  // frames a second, phase line
+            submit_phases::totals().present_serial.fetch_add(1, std::memory_order_relaxed);
+            if (dump_.due(shown - 1)) {
+                // Presentation is already queued and the queue/tracker locks are released. A sampled frame
+                // may stall here for its transfer fence and a private CPU copy. PNG and disk I/O run on a worker.
+                if (vkWaitForFences_(device, 1, &frame.done, VK_TRUE, UINT64_MAX) == VK_SUCCESS)
+                    dump_.save(shown, extent_, format_, dump_pq_, capture_ptr_, size_t(capture_size_));
+                else
+                    dump_.disable("present dump fence wait failed");
+            }
             if (planes) ++composed_;
             if (tearing) {
                 last_tore_ = true;
@@ -1304,7 +1315,7 @@ private:
         const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         VkImageLayout layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         VkAccessFlags access = VK_ACCESS_TRANSFER_WRITE_BIT;
-        if (capture_ && capture_buffer_) {
+        if (capture_buffer_ && (capture_ || dump_.due(presented_))) {
             // Two frames may be in flight and share `capture_buffer_`: serialize the prior frame's capture copy
             // before overwriting it, while moving this frame's swapchain image to TRANSFER_SRC.
             VkBufferMemoryBarrier capture_waw{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
@@ -1331,6 +1342,10 @@ private:
             copy.imageExtent = {extent_.width, extent_.height, 1};
             fn.copy_image_to_buffer(commands, images_[image], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, capture_buffer_, 1,
                                     &copy);
+            auto to_host = capture_waw;
+            to_host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+            fn.pipeline_barrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
+                                0, nullptr, 1, &to_host, 0, nullptr);
             layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
             access = VK_ACCESS_TRANSFER_READ_BIT;
         }
@@ -1343,7 +1358,7 @@ private:
         release_capture();
         auto& vk = context_.vk;
         const VkDevice device = context_.device();
-        capture_size_ = VkDeviceSize(extent_.width) * extent_.height * 4;
+        capture_size_ = VkDeviceSize(extent_.width) * extent_.height * present_dump::texel_size(format_);
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = capture_size_;
         info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -1533,7 +1548,9 @@ private:
             return true;
         }
         VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-        if (capture_) usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        if (dump_.enabled() && !(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT))
+            dump_.disable("surface does not support swapchain readback");
+        if (capture_ || dump_.enabled()) usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         if ((caps.supportedUsageFlags & usage) != usage) return false;
         // Not used by the presenter itself (it blits or copies into the images), but overlays that hook the swapchain
         // draw their own frame into its images through a framebuffer, which needs COLOR_ATTACHMENT: without it
@@ -1678,13 +1695,14 @@ private:
         extent_ = extent;
         extent_packed_ = (std::uint64_t(extent.width) << 32) | extent.height;
         hdr_active_ = chose_hdr;
-        if (capture_) {
-            // A capture that cannot be made fails the recreation with the swapchain in place and stale_ still set.
-            const bool four_bytes = format_ == VK_FORMAT_B8G8R8A8_UNORM || format_ == VK_FORMAT_R8G8B8A8_UNORM ||
-                                    format_ == VK_FORMAT_B8G8R8A8_SRGB || format_ == VK_FORMAT_R8G8B8A8_SRGB ||
-                                    format_ == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ||
-                                    format_ == VK_FORMAT_A2R10G10B10_UNORM_PACK32;
-            if (!four_bytes || !make_capture_buffer()) return false;
+        dump_pq_ = chosen.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT;
+        if (capture_ || dump_.enabled()) {
+            const auto stride = present_dump::texel_size(format_);
+            if (capture_ && stride != 4) return false;  // read_back() promises four bytes per texel
+            if (!stride || !make_capture_buffer()) {
+                dump_.disable("cannot read back this swapchain format or allocate its capture buffer");
+                if (capture_) return false;
+            }
         }
         vsync_ = vsync;
         swapchain_srgb_ = srgb;
@@ -1799,6 +1817,8 @@ private:
     ResourceId splash_source_{};
     bool splash_capture_only_ = false;
     bool capture_ = false;
+    present_dump::PresentDump dump_;
+    bool dump_pq_ = false;
     VkBuffer capture_buffer_ = VK_NULL_HANDLE;
     VkDeviceMemory capture_memory_ = VK_NULL_HANDLE;
     VkDeviceSize capture_size_ = 0;

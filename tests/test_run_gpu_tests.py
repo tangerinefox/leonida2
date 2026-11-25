@@ -213,6 +213,77 @@ class BindlessTestOnASmallPushConstantDevice(unittest.TestCase):
         self.assertNotIn("skipped", out)
 
 
+class TextureUavFixture(unittest.TestCase):
+    """Run the real filtered suite and checker, substituting only the external tools."""
+    def run_uav(self, code=0, message="", *, windows=True, compiled=True, executable=True):
+        import check
+
+        name = "cs_texture_uav"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args = SimpleNamespace(filter=name, build=str(root / "build"), llvm_mc="unused")
+            exe = Path(args.build) / "d3d12_texture_uav_test.exe"
+            exe.parent.mkdir()
+            if executable:
+                exe.touch()
+            spv = root / "spirv" / f"{name}.spv"
+            spv.parent.mkdir()
+            spv.write_bytes(b"stale fixture")
+
+            def translate(cmd, env=None, gpu=True):
+                self.assertFalse(gpu)
+                self.assertEqual(cmd[2], rgt.TRANSLATOR)
+                self.assertEqual([p.name for p in Path(cmd[3]).iterdir()], [f"{name}.s"])
+                self.assertEqual(Path(cmd[cmd.index("--out") + 1]), spv.parent)
+                self.assertFalse(spv.exists(), "an old SPIR-V must not mask a failed translation")
+                if compiled:
+                    spv.touch()
+                return 0, ""
+
+            result = SimpleNamespace(returncode=code, stdout=message, stderr="")
+            output = io.StringIO()
+            with (patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                  patch.object(rgt, "spirv_as"),
+                  patch.object(rgt, "run_cmd", side_effect=translate),
+                  patch.object(rgt, "bary_fallback", return_value=False),
+                  patch.object(rgt, "f16_interp_fallback", return_value=False),
+                  patch.object(check, "os", SimpleNamespace(name="nt" if windows else "posix", path=check.os.path,
+                                                           environ=check.os.environ)),
+                  patch.object(check, "EXE", ".exe"),
+                  patch.object(check.subprocess, "run", return_value=result) as launch,
+                  contextlib.redirect_stdout(output)):
+                rc = rgt.run_suite(args, tmp)
+            if windows and compiled and executable:
+                launch.assert_called_once()
+                self.assertEqual(tuple(launch.call_args.args[0]), (str(exe), str(spv)))
+            else:
+                launch.assert_not_called()
+            return rc, output.getvalue()
+
+    def test_translates_and_runs_the_windows_uav_fixture(self):
+        rc, out = self.run_uav()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("1/1 passed", out)
+
+    def test_unavailable_warp_and_non_windows_are_skips(self):
+        for options in (dict(code=77, message="SKIP: no D3D12 WARP adapter"), dict(windows=False)):
+            with self.subTest(options=options):
+                rc, out = self.run_uav(**options)
+                self.assertEqual(rc, 0, out)
+                self.assertIn("SKIP  cs_texture_uav", out)
+                self.assertIn("0/1 passed, 1 skipped", out)
+
+    def test_failed_gpu_run_missing_translation_and_missing_executable_fail(self):
+        for options, detail in ((dict(code=1, message="bad texel"), "bad texel"),
+                                (dict(compiled=False), "missing .spv"),
+                                (dict(executable=False), "missing ")):
+            with self.subTest(options=options):
+                rc, out = self.run_uav(**options)
+                self.assertEqual(rc, 1, out)
+                self.assertIn(detail, out)
+                self.assertIn("0/1 passed", out)
+                self.assertNotIn("skipped", out)
+
 class StoreHelperUnsupported(unittest.TestCase):
     """vk_store_test exits 77 when the device lacks a feature (TEST-469): a SKIP that quotes why, not a FAIL."""
 

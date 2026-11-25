@@ -121,7 +121,7 @@ def build_image(is64: bool = True, with_directories: bool = True) -> bytes:
     place(buf, 0x1540, bytes(32))                                      # terminator
     place(buf, 0x1580, struct.pack(f"<{thunk}{thunk}", 0x1420, 0))
     place(buf, 0x1600, bytes(16))
-    place(buf, 0x1620, struct.pack(f"<{thunk}{thunk}", 0x1440, 0))
+    place(buf, 0x1620, struct.pack(f"<{thunk}{thunk}", 0x1440 if is64 else base + 0x1440, 0))
     place(buf, 0x1640, bytes(16))
     place(buf, 0x1340, b"xmem.dll\0")
     place(buf, 0x1360, b"d3d12_xs.dll\0")
@@ -229,6 +229,26 @@ class PeInspectTest(unittest.TestCase):
         self.assertEqual(imports[("xmem.dll", "delay")]["functions"], ["XMemAlloc"])
         self.assertEqual(imports[("d3d12_xs.dll", "delay")]["functions"],
                          ["D3D12SerializeVersionedRootSignature"])
+
+    def test_delay_import_va_descriptor_skips_image_base_dll_and_handles_ordinals(self):
+        # Legacy dlattrRva=0 descriptor with szName == ImageBase (RVA 0) must not read "MZ" from the DOS header,
+        # and VA-based lookup tables with mixed named + ordinal entries must resolve both.
+        data = bytearray(build_image(is64=False))
+        base = 0x10000000
+        # Add an ordinal entry right after the VA named entry at RVA 0x1620 (file offset 0x400 + 0x620)
+        place(data, 0x1620, struct.pack("<III", base + 0x1440, (1 << 31) | 9, 0))
+        img = pe_inspect.PeImage(bytes(data))
+        entries = {(e["dll"], e["kind"]): e["functions"]
+                   for e in pe_inspect._imports(img, "delay", pe_inspect.DIR_DELAY_IMPORT, delay=True)}
+        self.assertEqual(entries[("d3d12_xs.dll", "delay")],
+                         ["D3D12SerializeVersionedRootSignature", "#9"])
+
+        # Point descriptor #2's szName directly at ImageBase -> dll_rva == 0 -> must be skipped, not "MZ".
+        place(data, 0x1520 + 4, struct.pack("<I", base))
+        img_mz = pe_inspect.PeImage(bytes(data))
+        dlls = [e["dll"] for e in pe_inspect._imports(img_mz, "delay", pe_inspect.DIR_DELAY_IMPORT, delay=True)]
+        self.assertNotIn("MZ", dlls)
+        self.assertEqual(dlls, ["xmem.dll"])
 
     def test_exports_include_ordinal_only_entry(self):
         for report in (self.report, self.report32):

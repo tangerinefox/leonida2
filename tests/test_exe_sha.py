@@ -83,9 +83,17 @@ class ExeShaTests(unittest.TestCase):
         self.assertIn("no recorded size or hash", out)
 
     def test_expect_overrides_the_manifest(self):
-        manifest = self.manifest(expected_exe_sha256="0" * 64)
-        code, _, err = run(str(self.exe), "--manifest", str(manifest), "--expect", self.sha)
-        self.assertEqual(code, 0, err)
+        manifest = self.manifest(expected_exe_size=self.size + 1, expected_exe_sha256="0" * 64)
+        for path in (manifest, self.root / "missing.json"):
+            args = (str(self.exe), "--manifest", str(path), "--expect", self.sha)
+            with self.subTest(manifest=path.name, output="text"):
+                code, out, err = run(*args)
+                self.assertEqual(code, 0, err)
+                self.assertIn("ok: matches --expect", out)
+            with self.subTest(manifest=path.name, output="json"):
+                code, out, err = run(*args, "--json")
+                self.assertEqual(code, 0, err)
+                self.assertEqual(json.loads(out)["source"], "--expect")
         code, _, err = run(str(self.exe), "--expect", "1" * 64)
         self.assertEqual(code, 1)
         self.assertIn("1" * 64, err)

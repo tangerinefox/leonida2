@@ -211,15 +211,17 @@ def compare(cond, a, b):
 
 
 def fixup(s0, s1, s2):
+    # Measured on gfx1036 under the game's MODE (docs/design.md, v_div_fixup row): a NaN source passes through
+    # unquieted, the underflow cutoff is exp(S2) - exp(S1) <= -1076 and there is no overflow cutoff.
     sign = (s1 ^ s2) & 0x8000000000000000
-    if is_nan(s2): return s2 | (1 << 51)
-    if is_nan(s1): return s1 | (1 << 51)
+    if is_nan(s2): return s2
+    if is_nan(s1): return s1
     z1, z2, i1, i2 = is_zero(s1), is_zero(s2), is_inf(s1), is_inf(s2)
     if (z1 and z2) or (i1 and i2): return 0xFFF8000000000000
     e1, e2 = (s1 >> 52) & 0x7FF, (s2 >> 52) & 0x7FF
     ediff = e2 - e1
-    if i1 or z2 or ediff < -1074: return sign
-    if z1 or i2 or ediff >= 1024 or is_nan(s0): return sign | EXP
+    if i1 or z2 or ediff <= -1076: return sign
+    if z1 or i2 or is_nan(s0): return sign | EXP
     return (s0 & 0x7FFFFFFFFFFFFFFF) | sign
 
 
@@ -348,7 +350,7 @@ def ref_program(lines, include_known=False, exec_lo=M32):
             ediff = ((s2 >> 52) & 0x7FF) - ((s1 >> 52) & 0x7FF)
             normal_division = (not is_nan(s1) and not is_inf(s1) and not is_zero(s1)
                                and not is_nan(s2) and not is_inf(s2) and not is_zero(s2)
-                               and -1074 <= ediff < 1024)
+                               and ediff > -1076)
             if not include_known and is_nan(s0) and normal_division:
                 raise SkipCase(f"KNOWN_DIVERGENCE div-fixup-nan-s0: {KNOWN_DIVERGENCES['div-fixup-nan-s0']}")
             d = int(dst[2:-1].split(":")[0]); vgpr[d], vgpr[d + 1] = bits_to_words(fixup(*args))

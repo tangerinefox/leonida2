@@ -6,14 +6,18 @@
 
 namespace leonida {
 
-// Keep negative probes until the title changes the map or a writer reports this footprint.
+// Keep negative probes until the title changes the map or a writer reports this footprint. With cache_success,
+// positive ones too: a caller that is told of every map change over the footprint (retry) and reads it under a guard
+// (a page gone since faults into a defer) need not walk the pages before every read.
 class TextureReadability {
 public:
     template<class Probe>
-    bool check(std::uint64_t generation, bool cache_failure, Probe probe) {
+    bool check(std::uint64_t generation, bool cache_failure, Probe probe, bool cache_success = false) {
         if (cache_failure && pending_ && !retry_ && generation_ == generation) return false;
+        if (cache_success && probed_ && !pending_ && !retry_ && generation_ == generation) return true;
         generation_ = generation;  // snapshot before the probe so a concurrent map change is noticed
         retry_ = false;
+        probed_ = true;
         pending_ = !probe();
         return !pending_;
     }
@@ -22,7 +26,7 @@ public:
     bool pending() const { return pending_; }
 private:
     std::uint64_t generation_ = 0;
-    bool pending_ = false, retry_ = false;
+    bool pending_ = false, retry_ = false, probed_ = false;
 };
 
 using TexturePageCommitter = bool (*)(const void*, std::size_t);

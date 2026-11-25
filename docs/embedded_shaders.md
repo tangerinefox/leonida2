@@ -322,6 +322,14 @@ The step is reused on the same conditions as the builder's (the image, the three
 translator, llvm-mc, the wave64 mode and the fallback flags) and reports every program left untranslated on every
 run. Measured on 1.0.2.1: **12/12 translate and pass `spirv-val`** (1 VS, 11 PS, 1,245–4,239 bytes); the VS's
 SHA-256 is `01ac7810dcabd62afcd904b231e90d9a031a51808a700e3349290bec5f0d426f`.
+The count is twelve because `pe_shader_containers.py` extracts the ten plain containers and the two packed pixel
+shaders above. A second measurement, made on the tree of the first-run UI integration, whose extractor took the
+ten plain containers only (1 VS, 9 PS): the ten translate and pass `spirv-val` natively and with
+`--wave64-emulate`, `ShaderLibrary::load` finds all ten by `(stage, fssm_sha256)`, and `vk_pipeline_check` passes
+10/10 modules and 10/10 pipelines (0 failed, 0 skipped) on an AMD Radeon RX 9070 XT (RADV GFX1201, Mesa 26.2.6) and
+on an AMD Ryzen 7 9800X3D integrated GPU (RADV RAPHAEL_MENDOCINO, Mesa 26.2.6). The two packed pixel shaders were
+not part of that run.
+`tests/test_exe_shaders_stage.py` covers the step on synthetic VS/PS `PSV0` containers without game data.
 
 **That VS is why 14 graphics PSOs failed (measured).** On the base commit, a 100 s boot refused **14** of 50,469
 `CreatePipelineState` calls, every one with `no translated vs for FSSM sha256 01ac...`: none of the 26,503 indexed
@@ -439,6 +447,6 @@ constructor's pipelines are created, not that a build produces the right tree (s
 `tests/test_bvh_shaders_stage.py` runs the step on a synthetic DLL (hand-built containers around a made-up `FSSM`
 blob, no game data): the key the extracted layout gives the translator, the tools and arguments, reuse and each
 reason to run again, a second run that leaves no duplicate containers, the report of an untranslated program on
-every run and the failure when nothing translates. `shader_library_test` covers the `bvh/` index (found by the
-container's program hash, counted apart, a broken or missing index beside the others) and `d3d12_compute_test`
+every run and the failure when nothing translates. `shader_library_test` covers the `bvh/` and `exe/` indexes (found
+by the container's program hash, counted apart, a broken or missing index beside the others) and `d3d12_compute_test`
 creates a pipeline through slot 62 whose only translation is in `<shaders>/bvh/index.json`.

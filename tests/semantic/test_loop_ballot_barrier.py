@@ -435,6 +435,9 @@ def run_compute_workgroup(asm, threads, subgroup_size, push_constants=None, memo
             elif op == "OpStore":
                 p = base_ptr(inv, args[0])
                 write_ptr(inv, p, val_of(inv, args[1]))
+            elif op == "OpAtomicStore":   # pointer, scope, semantics, value: a store with no result
+                p = base_ptr(inv, args[0])
+                write_ptr(inv, p, val_of(inv, args[3]))
             elif op == "OpConvertUToPtr":
                 inv.ssa[res] = ("phys", val_of(inv, args[1]))
             elif op == "OpUConvert":

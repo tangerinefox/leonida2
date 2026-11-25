@@ -1,4 +1,6 @@
 #pragma once
+#include <utility>
+#include <memory>
 
 // Frame pacing for the Xbox presentation path (docs/d3d12_vulkan.md section 4.5): what SetFrameIntervalX,
 // ScheduleFrameEventX, WaitFrameEventX and GetFrameStatisticsX do, and the token check and flip bookkeeping that
@@ -115,6 +117,7 @@ inline constexpr std::uint32_t frame_event_flip = 2;
 inline constexpr std::uint32_t frame_event_count = 3;
 // Issue a consecutive frame token even when WaitFrameEventX(origin, ...) times out (returns S_FALSE).
 inline constexpr std::uint32_t frame_wait_flag_token_on_timeout = 2;
+inline constexpr std::uint32_t wait_flag_current_token = frame_wait_flag_token_on_timeout;
 // Statistics types (bit mask). Interval and render entries are never produced here.
 inline constexpr std::uint32_t stat_frame_interval = 0x01;
 inline constexpr std::uint32_t stat_frame_event = 0x02;
@@ -184,8 +187,10 @@ private:
 
 class FramePacer {
 public:
-    explicit FramePacer(FrameClock& clock, std::shared_ptr<FrameTokenSource> tokens = nullptr)
-        : clock_(clock), tokens_(tokens ? std::move(tokens) : std::make_shared<FrameTokenSource>()) {
+    explicit FramePacer(FrameClock& clock, std::shared_ptr<FrameTokenSource> tokens = nullptr,
+                        bool current_origin_poll = false)
+        : clock_(clock), tokens_(tokens ? std::move(tokens) : std::make_shared<FrameTokenSource>()),
+          current_origin_poll_(current_origin_poll) {
         clock_.set_wake([this] {
             { std::lock_guard guard(mutex_); }
             cv_.notify_all();
@@ -251,6 +256,8 @@ public:
         if (event >= frame_event_count) return pacer_hr::invalid_arg;
         if (event == frame_event_origin && !token) return pacer_hr::invalid_arg;
         std::unique_lock lock(mutex_);
+        if (current_origin_poll_ && event == frame_event_origin && timeout_ms == 0 && (flags & wait_flag_current_token))
+            return current_token_locked(token);
         ++waiters_;
         const std::int32_t result = wait_locked(lock, event, timeout_ms, flags, token);
         if (--waiters_ == 0) cv_.notify_all();
@@ -513,6 +520,24 @@ private:
         }
     }
 
+    std::int32_t current_token_locked(std::uint64_t* token) {
+        if (shutdown_ || suspended_) return pacer_hr::invalid_state;
+        if (!interval_set_ || !event_armed_[frame_event_origin]) {
+            *token = tokens_->issue();
+            return pacer_hr::ok;
+        }
+        const auto now = clock_.now_us();
+        retire_locked(now);
+        const auto offset = event_offset_us_[frame_event_origin];
+        const auto first = epoch_us_ + offset;
+        const auto newest = now >= first ? static_cast<std::int64_t>((now - first) / period_us_) : 0;
+        auto& tick = last_event_tick_[frame_event_origin];
+        tick = std::max(tick, newest);
+        const auto origin = first + static_cast<std::uint64_t>(tick) * period_us_;
+        *token = issue_token_locked(origin, origin - offset + period_us_);
+        return pacer_hr::ok;
+    }
+
     bool any_armed_locked() const {
         return event_armed_[0] || event_armed_[1] || event_armed_[2];
     }
@@ -594,6 +619,7 @@ private:
     std::uint64_t epoch_us_ = 0;
     std::int64_t last_event_tick_[frame_event_count] = {0, 0, 0};  // tick 0 is the epoch itself, which has passed
     std::shared_ptr<FrameTokenSource> tokens_;
+    bool current_origin_poll_ = false;
     std::uint64_t last_presented_ = 0;
     std::uint64_t immediate_presents_ = 0;
     std::uint64_t presents_recorded_ = 0;

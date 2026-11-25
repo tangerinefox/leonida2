@@ -671,6 +671,22 @@ int main(int argc, char** argv) {
     check(rt::d3d12_xs::device_slot_hits(76) == 2, "slot 76 hit counter is 2");
     check(rt::d3d12_xs::device_slot_first_call_seen(76), "slot 76 first-call flag is set");
 
+    // A backend can run out of memory after allocating the native depth image. Slot 76 must propagate that
+    // failure without handing a depth-only resource to a caller that requested a working UAV.
+    {
+        auto ds_uav = xbox_texture;
+        ds_uav.Format = DXGI_FORMAT_R32G8X24_TYPELESS;
+        ds_uav.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        check(rt::d3d12_xs::set_depth_stencil_uav_provider(device.Get(), [](ID3D12Resource*, D3D12_HEAP_FLAGS) -> HRESULT {
+            return E_OUTOFMEMORY;
+        }), "install a failing Xbox storage-image provider");
+        void* result = reinterpret_cast<void*>(1);
+        hr = create_resource(device.Get(), &heap_properties, D3D12_HEAP_FLAG_NONE, &ds_uav,
+                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, iid_resource, &result);
+        check(hr == E_OUTOFMEMORY && !result, "slot 76 propagates storage-image allocation failure atomically");
+        rt::d3d12_xs::set_depth_stencil_uav_provider(device.Get(), nullptr);
+    }
+
     // Xbox device slots from the public HLE. On the Vulkan device the PC entries at 78/79 are
     // CreateReservedResource2/CreateSampler2 and 80 is past the 80-slot table, so success here can only come from
     // the routes: frame events return S_OK and a fresh token, CreateCommandQueueX returns a queue proxy and

@@ -24,6 +24,7 @@
 
 #include <vulkan/vulkan.h>
 
+#include "vulkan_aftermath.h"
 #include "xdxr_build_spv.h"
 
 namespace leonida {
@@ -105,6 +106,20 @@ struct XdxrTriangles {
     std::uint32_t flags = 0;          // D3D12_RAYTRACING_GEOMETRY_FLAGS (bit 0 opaque)
 };
 
+// How a top-level build reaches the BLAS addresses its instance descs hold (xdxr_build.comp blas_address). They are
+// the application's GPU VAs; with `translate`, one inside a range of `address` (`count` 24-byte entries {title VA,
+// end, shader VA}, in title-VA order, none overlapping: src/title_va_alias.h) becomes that range's shader VA, one
+// outside every range is kept below `bound` (an arena VA; `bound` 0: any VA is kept), and any other is not reachable:
+// that instance is built with no BLAS (an empty box, never hit) and nothing is read through its address. The record
+// then holds the shader VA, which is what the traversal shaders add heap_base to. Without `translate` every address
+// is kept, as before.
+struct XdxrBlasTable {
+    bool translate = false;
+    std::uint64_t address = 0;  // device address of the entries
+    std::uint32_t count = 0;
+    std::uint64_t bound = 0;
+};
+
 class XdxrBuilder {
 public:
     XdxrBuilder(PFN_vkGetDeviceProcAddr get, VkDevice device) : device_(device) {
@@ -166,9 +181,11 @@ public:
     }
 
     // Records a top-level build from `count` D3D12_RAYTRACING_INSTANCE_DESCs at `instances`.
-    // `update_from`: as for record_blas; the instances may move, and name other BLASes.
+    // `update_from`: as for record_blas; the instances may move, and name other BLASes. `blases`: how the BLAS
+    // addresses in the descs are reached (XdxrBlasTable); null keeps them as they are.
     bool record_tlas(VkCommandBuffer cb, const XdxrLayout& layout, std::uint64_t instances, std::uint64_t dst,
-                     std::uint64_t scratch, std::uint64_t bias = 0, std::uint64_t update_from = 0) {
+                     std::uint64_t scratch, std::uint64_t bias = 0, std::uint64_t update_from = 0,
+                     const XdxrBlasTable* blases = nullptr) {
         if (!loaded_ || !layout.tlas || !layout.size || !dst || !scratch || (layout.elements && !instances))
             return false;
         Push p = base(layout, dst, scratch);
@@ -179,6 +196,12 @@ public:
             t.mode = mode_instances;
             t.count = layout.elements;
             t.src0 = split(instances);
+            if (blases && blases->translate) {
+                t.flags |= flag_translate;
+                t.src1 = split(blases->count ? blases->address : 0);
+                t.arg1 = blases->address ? blases->count : 0;
+                t.src2 = split(blases->bound);
+            }
             dispatch(cb, t, t.count);
         }
         if (update_from) refit_finish(cb, layout, p); else finish(cb, layout, p);
@@ -231,7 +254,7 @@ private:
         std::uint32_t mode = 0, count = 0, first = 0, arg0 = 0, arg1 = 0, arg2 = 0, geometry = 0, elements = 0,
                       sort_size = 0, elements_off = 0, nodes_off = 0, parents_off = 0, total_size = 0, flags = 0;
     };
-    enum : std::uint32_t { flag_tlas = 1, flag_box16 = 2, flag_pair = 4 };  // xdxr_build.comp FLAG_*
+    enum : std::uint32_t { flag_tlas = 1, flag_box16 = 2, flag_pair = 4, flag_translate = 8 };  // xdxr_build.comp FLAG_*
     static_assert(sizeof(Push) == 104, "push constants must match xdxr_build.comp");
 
     static Addr split(std::uint64_t a) { return {std::uint32_t(a), std::uint32_t(a >> 32)}; }
@@ -388,6 +411,7 @@ private:
         module_info.codeSize = sizeof(xdxr_build_spirv);
         module_info.pCode = xdxr_build_spirv;
         VkShaderModule module = VK_NULL_HANDLE;
+        const aftermath::ShaderName aftermath_name("(runtime) xdxr_build.comp");
         if (vk_.vkCreateShaderModule(device_, &module_info, nullptr, &module) != VK_SUCCESS) return false;
         VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT,

@@ -155,6 +155,29 @@ int main() {
         EXPECT(next.get().token == 2);
     }
 
+    // wait_flag_current_token never blocks or times out: a fresh token for the newest passed origin, registered or not.
+    {
+        ManualFrameClock clock;
+        FramePacer pacer(clock, nullptr, true);
+        std::uint64_t token = 0;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, wait_flag_current_token, &token) == pacer_hr::ok &&
+               token == 1);
+        EXPECT(setup(pacer, 1));
+        clock.advance_us(period * 2 + period / 4);
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, wait_flag_current_token, &token) == pacer_hr::ok &&
+               token == 2);
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, wait_flag_current_token, &token) == pacer_hr::ok &&
+               token == 3);
+        std::uint32_t count = 1;
+        FrameStatistic stat;
+        EXPECT(pacer.get_frame_statistics(3, stat_frame_event, &count, &stat) == pacer_hr::ok);
+        EXPECT(stat.time_us == period * 2);
+        auto next = wait_async(pacer, infinite_timeout_ms);
+        EXPECT(blocked(next));
+        clock.advance_us(period * 3 / 4);
+        EXPECT(next.get().token == 4);
+    }
+
     // Timeouts: 0 polls, a finite one counts fake time, the token is left alone, and a later wait still works.
     {
         ManualFrameClock clock;

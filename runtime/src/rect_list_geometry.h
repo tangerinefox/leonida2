@@ -42,6 +42,7 @@ namespace leonida {
 constexpr std::uint32_t topology_rect_list = 17;
 constexpr std::uint32_t topology_quad_list = 19;
 constexpr std::uint32_t topology_type_rect_list = 19;
+constexpr std::array<std::uint32_t, 6> quad_triangle_indices{0, 1, 2, 0, 2, 3};
 
 // The geometry stage for `vertex_words`' outputs; empty, with `why` set, when the vertex stage cannot be expanded.
 inline std::vector<std::uint32_t> rect_list_geometry(const std::vector<std::uint32_t>& vertex_words, std::string& why) {
@@ -99,6 +100,10 @@ inline std::vector<std::uint32_t> rect_list_geometry(const std::vector<std::uint
         const Type& ptr = types[variable_type[id]];
         const Type& vec = types[ptr.component];
         const Type& scalar = types[vec.component];
+        // Known limit: every vec4 float output gets the plain a + b - p corner. The translator can export an attribute
+        // as the register's raw bits with two packed f16 halves (only the pixel shader knows, through per_vertex in
+        // tools/rdna2spirv.py), and nothing on the vertex side tells those apart, so such an output would get a wrong
+        // fourth corner. Fixing it needs the pixel shader's words here and a per-channel marker from the translator.
         if (vec.op != op_type_vector || vec.count != 4 || scalar.op != op_type_float || scalar.width != 32) {
             why = "a vertex output is not a vec4 float";
             return {};

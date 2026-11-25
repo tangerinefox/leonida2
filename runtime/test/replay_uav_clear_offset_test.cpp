@@ -318,6 +318,44 @@ int main() {
     tex.array_layers = 4;
     tex.color_attachment = true;
 
+    // A dedicated compute family has no rendering commands. A rectangular clear fills transfer scratch and
+    // copies the clipped rectangle to the requested array slices without disturbing adjacent pixels.
+    {
+        auto image = tex;
+        image.format = VK_FORMAT_R8_UINT;
+        auto compute = tex_vk;
+        compute.graphics_family = false;
+        compute.queue_stages = detail::queue_stages_compute;
+        compute.begin_rendering = nullptr;
+        compute.image_view = {};
+        VkDeviceSize requested_bytes = 0;
+        compute.copy_scratch = [&](VkDeviceSize size, VkBuffer& buffer, VkDeviceSize& offset) {
+            requested_bytes = size;
+            buffer = scratch;
+            offset = 256;
+            return true;
+        };
+        static std::vector<VkBufferImageCopy> copies;
+        compute.copy_buffer_to_image = [](VkCommandBuffer, VkBuffer, VkImage, VkImageLayout layout,
+                                          std::uint32_t count, const VkBufferImageCopy* regions) {
+            expect(layout == VK_IMAGE_LAYOUT_GENERAL && count == 1, "one compute clear transfer in UAV layout");
+            copies.push_back(regions[0]);
+        };
+        const std::array<Rect, 2> rects{{{-1, 2, 3, 4}, {1, 3, 2, 4}}};
+        writes.clear();
+        expect(run_tex(image, {2, false, VK_FORMAT_R8_UINT, 0, 0, 0, 0, 1, 2}, false, {0x39,0,0,0},
+                       rects, &compute) == ReplayResult::success, "rectangle UAV clear on compute-only family");
+        expect(requested_bytes == 12 && writes.size() == 1 && writes[0].kind == 'f' && writes[0].offset == 256 &&
+               writes[0].size == 12 && copies.size() == 2 && attachment_clears == 0, "one fill and two rectangle copies");
+        if (copies.size() == 2) {
+            const auto& r = copies[0];
+            expect(r.bufferOffset == 256 && r.imageOffset.x == 0 && r.imageOffset.y == 2 &&
+                   r.imageExtent.width == 3 && r.imageExtent.height == 2 &&
+                   r.imageSubresource.baseArrayLayer == 1 && r.imageSubresource.layerCount == 2 &&
+                   copies[1].imageOffset.x == 1 && copies[1].imageOffset.y == 3, "clipped pixels and exactly two layers");
+        }
+    }
+
     const auto fbits = [](float f) { return std::bit_cast<std::uint32_t>(f); };
     // R16G16_TYPELESS (SFLOAT) cleared as R16G16_UNORM Float(1.0, 1.0): uses R16G16_UNORM view and float32 {1, 1}.
     expect(run_tex(tex, {2, false, VK_FORMAT_R16G16_UNORM, 0, 0, 0, 0, 1, 2}, true, {fbits(1.0f), fbits(1.0f), 0, 0}) ==

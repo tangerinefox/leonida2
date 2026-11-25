@@ -308,6 +308,7 @@ int main() {
         srv_struct_b(elements), srv_typed(elements), srv_null(elements);
     {
         rt::d3d12::VulkanDeviceInfo info{};
+        info.prepare_on_bind=d.prepare_on_bind;
         info.get_instance_proc = d.instance_proc;
         info.instance = d.instance;
         info.physical = d.physical;
@@ -587,15 +588,53 @@ int main() {
             list->SetDescriptorHeaps(2, both);
             list->SetComputeRootDescriptorTable(2, {gpu + 32});
             list->Dispatch(1, 1, 1);
+            Ref<ID3D12CommandAllocator> bundle_allocator;
+            Ref<ID3D12GraphicsCommandList> bundle;
+            EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_BUNDLE, IID_PPV_ARGS(&bundle_allocator.p))));
+            EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_BUNDLE, bundle_allocator.p, nullptr,
+                                                       IID_PPV_ARGS(&bundle.p))));
+            bundle->Dispatch(1, 1, 1);
+            EXPECT(SUCCEEDED(bundle->Close()));
+            list->ExecuteBundle(bundle.p);
             list->SetDescriptorHeaps(1, &heap.p);
             list->ExecuteIndirect(signature.p, 1, out_a.p, 0, nullptr, 0);
+            list->SetDescriptorHeaps(1, &sampler.p);
+            list->ExecuteIndirect(signature.p, 1, out_a.p, 0, nullptr, 0);
+            // 27 constants starting at s4 leave room for one heap. At 28, s31 is explicit too.
+            for (UINT count : {27u, 28u}) {
+                auto constants_param = params[0];
+                constants_param.Constants.Num32BitValues = count;
+                auto full_desc = direct_desc;
+                full_desc.Desc_1_0.NumParameters = 1;
+                full_desc.Desc_1_0.pParameters = &constants_param;
+                const auto blob = serialize(full_desc);
+                Ref<ID3D12RootSignature> full;
+                EXPECT(SUCCEEDED(device->CreateRootSignature(0, blob.data(), blob.size(), IID_PPV_ARGS(&full.p))));
+                pipeline_desc.pRootSignature = full.p;
+                Ref<ID3D12PipelineState> full_pso;
+                EXPECT(SUCCEEDED(device->CreateComputePipelineState(&pipeline_desc, IID_PPV_ARGS(&full_pso.p))));
+                list->SetPipelineState(full_pso.p);
+                list->SetComputeRootSignature(full.p);
+                list->SetComputeRoot32BitConstant(0, 123, count - 1);
+                list->SetDescriptorHeaps(2, both);
+                list->Dispatch(1, 1, 1);
+            }
             EXPECT(SUCCEEDED(list->Close()));
             std::vector<leonida::Command> commands;
-            EXPECT(rt::d3d12::recorded_commands(list.p, commands) && commands.size() == 2);
+            EXPECT(rt::d3d12::recorded_commands(list.p, commands) && commands.size() == 6);
             const auto& before = std::get<leonida::Dispatch>(commands[0]).user_data;
-            const auto& after = std::get<leonida::ExecuteIndirect>(commands[1]).user_data;
-            EXPECT(before[8] == gpu + 32 && before[9] == gpu && before[10] == smp);
-            EXPECT(after[8] == gpu + 32 && after[9] == gpu && after[10] == 0);
+            const auto& after = std::get<leonida::ExecuteIndirect>(commands[2]).user_data;
+            char setting[2]{};
+            const bool enabled = GetEnvironmentVariableA("LEONIDA_COMPUTE_DIRECT_HEAPS", setting, 2) != 1 ||
+                                 setting[0] != '0';
+            EXPECT(before[8] == gpu + 32 && before[9] == (enabled ? gpu : 0) && before[10] == (enabled ? smp : 0));
+            EXPECT(after[8] == gpu + 32 && after[9] == (enabled ? gpu : 0) && after[10] == 0);
+            EXPECT(std::get<leonida::Dispatch>(commands[1]).user_data == before);
+            const auto& sampler_only = std::get<leonida::ExecuteIndirect>(commands[3]).user_data;
+            EXPECT(sampler_only[9] == 0 && sampler_only[10] == (enabled ? smp : 0));
+            const auto& one_slot = std::get<leonida::Dispatch>(commands[4]).user_data;
+            EXPECT(one_slot[30] == 123 && one_slot[31] == (enabled ? gpu : 0));
+            EXPECT(std::get<leonida::Dispatch>(commands[5]).user_data[31] == 123);
             EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
             // The shader follows the V# at the heap index in s4. Slot 1 and the unrelated explicit table are null.
             D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
@@ -634,10 +673,11 @@ int main() {
             const auto* values = static_cast<const UINT*>(results);
             for (UINT i = 0; i < elements; ++i) {
                 EXPECT(values[i] == 0);
-                EXPECT(values[elements + i] == table_values[i % 4]);
+                EXPECT(values[elements + i] == (enabled ? table_values[i % 4] : 0));
             }
             readback->Unmap(0, nullptr);
-            std::puts("directly indexed compute heap: 64 buffer reads and 64 null controls matched");
+            std::puts(enabled ? "directly indexed compute heap: 64 buffer reads and 64 null controls matched"
+                              : "directly indexed compute heap disabled: 128 zero controls matched");
             EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
         }
 

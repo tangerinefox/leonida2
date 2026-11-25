@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <cstring>
 #include <mutex>
 #include <span>
@@ -26,6 +27,14 @@ struct DeviceFaultExtensions {
     bool diagnostics_config = false;
 };
 
+// What a device asks for. LEONIDA_DEVICE_FAULT=1 wants all of it; LEONIDA_AFTERMATH=1 alone (vulkan_aftermath.h) only
+// needs the NVIDIA diagnostics config, whose flags turn on the Aftermath features of the GPU crash dump.
+struct DeviceFaultRequest {
+    bool fault = true;               // VK_EXT_device_fault and VK_NV_device_diagnostic_checkpoints
+    bool diagnostics_config = true;  // VK_NV_device_diagnostics_config
+    VkDeviceDiagnosticsConfigFlagsNV extra_flags = 0;  // added to the default config flags below
+};
+
 // Owns the feature structures until vkCreateDevice returns.
 struct DeviceFaultFeatures {
     VkPhysicalDeviceFaultFeaturesEXT fault{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
@@ -35,14 +44,15 @@ struct DeviceFaultFeatures {
 
     DeviceFaultExtensions enable(VkPhysicalDevice physical, PFN_vkGetPhysicalDeviceFeatures2 query,
                                  std::span<const VkExtensionProperties> advertised,
-                                 std::vector<const char*>& extensions, VkDeviceCreateInfo& device) {
+                                 std::vector<const char*>& extensions, VkDeviceCreateInfo& device,
+                                 DeviceFaultRequest request = {}) {
         const auto has = [&](const char* name) {
             return std::any_of(advertised.begin(), advertised.end(), [name](const auto& ext) {
                 return std::strcmp(ext.extensionName, name) == 0;
             });
         };
-        const bool has_fault = has(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
-        const bool has_config = has(VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME);
+        const bool has_fault = request.fault && has(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+        const bool has_config = request.diagnostics_config && has(VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME);
         if (has_fault || has_config) {
             diagnostics.pNext = nullptr;
             fault.pNext = has_config ? &diagnostics : nullptr;
@@ -51,7 +61,7 @@ struct DeviceFaultFeatures {
             query(physical, &features);
         }
         const DeviceFaultExtensions enabled{has_fault && fault.deviceFault == VK_TRUE,
-                                            has(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME),
+                                            request.fault && has(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME),
                                             has_config && diagnostics.diagnosticsConfig == VK_TRUE};
         if (enabled.fault) {
             extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
@@ -65,7 +75,7 @@ struct DeviceFaultFeatures {
             config.pNext = &diagnostics;
             config.flags = VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_SHADER_DEBUG_INFO_BIT_NV |
                            VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_RESOURCE_TRACKING_BIT_NV |
-                           VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_AUTOMATIC_CHECKPOINTS_BIT_NV;
+                           VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_AUTOMATIC_CHECKPOINTS_BIT_NV | request.extra_flags;
             device.pNext = &config;
         }
         return enabled;
@@ -225,6 +235,15 @@ private:
     bool reported_ = false;
 };
 
+// Runs on every VK_ERROR_DEVICE_LOST that DeviceFaultDiagnostics::observe or VulkanContext::mark_device_lost sees,
+// with or without LEONIDA_DEVICE_FAULT. Set before the device exists by the Aftermath integration
+// (vulkan_aftermath.h), which blocks there until its GPU crash dump is written.
+inline std::atomic<void (*)() noexcept> device_lost_hook{nullptr};
+
+inline void run_device_lost_hook() noexcept {
+    if (const auto hook = device_lost_hook.load(std::memory_order_acquire)) hook();
+}
+
 class DeviceFaultDiagnostics {
 public:
     DeviceFaultDiagnostics(PFN_vkGetDeviceProcAddr get, VkDevice device, DeviceFaultExtensions enabled)
@@ -272,7 +291,10 @@ public:
     }
 
     static VkResult observe(DeviceFaultDiagnostics* diagnostics, VkResult result, const char* operation) noexcept {
-        if (result == VK_ERROR_DEVICE_LOST && diagnostics) diagnostics->report(operation);
+        if (result == VK_ERROR_DEVICE_LOST) {
+            if (diagnostics) diagnostics->report(operation);
+            run_device_lost_hook();
+        }
         return result;
     }
 
@@ -281,6 +303,20 @@ public:
                              ", last observed retired ticket %" PRIu64 "\n", reason, submitted, retired);
         // NV checkpoints and EXT fault data require a lost device. The CPU ring is valid at any time.
         dump_dispatches();
+        // LEONIDA_STALL_CHECKPOINTS=1 (diagnostic): ask for the checkpoints anyway. A hang (Xid 109) the driver
+        // recovers from without losing the device otherwise names no program; outside the lost state the call is
+        // out of the extension's contract, which the NVIDIA driver has answered so far.
+        static const bool stall_checkpoints = [] {
+            const char* v = std::getenv("LEONIDA_STALL_CHECKPOINTS");
+            return v && std::strcmp(v, "1") == 0;
+        }();
+        if (!stall_checkpoints || !vkGetQueueCheckpointDataNV) return;
+        try {
+            std::lock_guard lock(mutex_);
+            for (VkQueue queue : queues_) report_queue(queue);
+        } catch (...) {
+            std::fprintf(stderr, "[rt] device-fault: checkpoint collection failed\n");
+        }
     }
 
 private:
@@ -305,10 +341,29 @@ private:
         }
     }
 
+public:
+    // LOCAL DIAGNOSTIC: run once after a loss is reported (the compute input probe rechecks the descriptors it saw).
+    void set_lost_hook(std::function<void()> hook) {
+        std::lock_guard lock(mutex_);
+        lost_hook_ = std::move(hook);
+    }
+
+private:
+    std::function<void()> lost_hook_;
+
     void report(const char* operation) noexcept {
         if (reported_.exchange(true, std::memory_order_relaxed)) return;
         std::fprintf(stderr, "[rt] device-fault: VK_ERROR_DEVICE_LOST from %s\n", operation);
         dump_dispatches();
+        try {
+            std::function<void()> hook;
+            {
+                std::lock_guard lock(mutex_);
+                hook = lost_hook_;
+            }
+            if (hook) hook();
+        } catch (...) {
+        }
         try {
             if (vkGetDeviceFaultInfoEXT) report_fault();
         } catch (...) {

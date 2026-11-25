@@ -34,6 +34,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <vector>
@@ -315,6 +316,7 @@ int main(int argc, char** argv) {
     LD(vkDestroyCommandPool); LD(vkDestroyShaderModule); LD(vkDestroyFramebuffer); LD(vkDestroyRenderPass);
     LD(vkDestroySampler); LD(vkDestroyImageView); LD(vkDestroyImage); LD(vkDestroyBuffer);
     LD(vkFreeMemory); LD(vkDestroyDevice); LD(vkCmdClearColorImage);
+    LD(vkGetDescriptorSetLayoutSupport);
     VkQueue queue = VK_NULL_HANDLE;
     vkGetDeviceQueue(dev, qi, 0, &queue);
     VkPhysicalDeviceMemoryProperties mp;
@@ -536,47 +538,60 @@ int main(int argc, char** argv) {
     }
     CHECK(submit());
 
-    // An adapter at the original 5632 sampled-image limit must keep the original set. The per-stage
-    // resource budget can also leave room for just one class (9985 original resources + 512).
-    constexpr auto ms_classes = [](std::uint32_t sampled, std::uint32_t total) {
-        BindlessFeatures f{};
-        f.ms_samples.fill(VK_SAMPLE_COUNT_4_BIT);
-        bindless::limit_ms_bindings(f, sampled, total);
-        return f.ms_samples;
-    };
-    static_assert(ms_classes(5632, 20000) ==
-                  std::array{VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_1_BIT});
-    static_assert(ms_classes(7168, 10497) ==
-                  std::array{VK_SAMPLE_COUNT_4_BIT, VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_1_BIT});
-
-    // Does a set with these flags fit the device? Every binding is visible to every stage.
-    const auto descriptors = [](VkDescriptorType type, const BindlessFeatures& f) {
+    constexpr auto descriptors = [](VkDescriptorType type, const BindlessFeatures& f) {
         std::uint32_t count = 0;
         for (std::uint32_t b = 0; b < bindless::bindings.size(); ++b)
             if (bindless::bindings[b].type == type && bindless::binding_enabled(b, f))
                 count += f.counts[b];
         return count;
     };
+
+    // An adapter at the single-sample limit must keep the original set. The stage resource budget
+    // can also leave room for just one MS class. Include the non-MS bindings after the MS pairs.
+    constexpr BindlessFeatures defaults{};
+    constexpr auto base_sampled = descriptors(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, defaults);
+    constexpr auto base_resources = base_sampled + descriptors(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, defaults) +
+                                    descriptors(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, defaults);
+    constexpr auto ms_pair =
+        defaults.counts[bindless::first_ms_binding] + defaults.counts[bindless::first_ms_binding + 1];
+    constexpr auto ms_classes = [](std::uint32_t sampled, std::uint32_t total) {
+        BindlessFeatures f{};
+        f.ms_samples.fill(VK_SAMPLE_COUNT_4_BIT);
+        bindless::limit_ms_bindings(f, sampled, total);
+        return f.ms_samples;
+    };
+    static_assert(ms_classes(base_sampled, base_resources + ms_pair) ==
+                  std::array{VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_1_BIT});
+    static_assert(ms_classes(base_sampled + 3 * ms_pair, base_resources + ms_pair) ==
+                  std::array{VK_SAMPLE_COUNT_4_BIT, VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_1_BIT});
+
+    // Check the sized layout against the device's limits. Standalone samplers count in the pool,
+    // but not towards the per-stage resource budget.
     const auto fits = [&](const BindlessFeatures& f) {
         const auto sampled_total = descriptors(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, f);
         const auto sampler_total = descriptors(VK_DESCRIPTOR_TYPE_SAMPLER, f);
         const auto storage_total = descriptors(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, f);
-        const auto stage_resources = sampled_total + storage_total + 2;  // table buffer and fragment output
+        const auto buffer_total = descriptors(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, f);
+        const auto stage_resources = sampled_total + storage_total + buffer_total + 1;  // fragment output
+        const auto pool_descriptors = sampled_total + sampler_total + storage_total + buffer_total;
         const VkPhysicalDeviceLimits& l = props.properties.limits;
         if (f.update_after_bind)
             return props12.maxPerStageDescriptorUpdateAfterBindSampledImages >= sampled_total &&
                    props12.maxPerStageDescriptorUpdateAfterBindSamplers >= sampler_total &&
                    props12.maxPerStageDescriptorUpdateAfterBindStorageImages >= storage_total &&
+                   props12.maxPerStageDescriptorUpdateAfterBindStorageBuffers >= buffer_total &&
                    props12.maxPerStageUpdateAfterBindResources >= stage_resources &&
-                   props12.maxUpdateAfterBindDescriptorsInAllPools >= sampled_total + sampler_total + storage_total + 1 &&
+                   props12.maxUpdateAfterBindDescriptorsInAllPools >= pool_descriptors &&
                    props12.maxDescriptorSetUpdateAfterBindSampledImages >= sampled_total &&
                    props12.maxDescriptorSetUpdateAfterBindSamplers >= sampler_total &&
-                   props12.maxDescriptorSetUpdateAfterBindStorageImages >= storage_total;
+                   props12.maxDescriptorSetUpdateAfterBindStorageImages >= storage_total &&
+                   props12.maxDescriptorSetUpdateAfterBindStorageBuffers >= buffer_total;
         return l.maxPerStageDescriptorSampledImages >= sampled_total && l.maxPerStageDescriptorSamplers >= sampler_total &&
                l.maxPerStageDescriptorStorageImages >= storage_total &&
+               l.maxPerStageDescriptorStorageBuffers >= buffer_total &&
                l.maxPerStageResources >= stage_resources &&
                l.maxDescriptorSetSampledImages >= sampled_total && l.maxDescriptorSetSamplers >= sampler_total &&
-               l.maxDescriptorSetStorageImages >= storage_total;
+               l.maxDescriptorSetStorageImages >= storage_total && l.maxDescriptorSetStorageBuffers >= buffer_total;
     };
 
     unsigned mismatches = 0, runs = 0, readbacks = 0;
@@ -602,11 +617,19 @@ int main(int argc, char** argv) {
 
     BindlessFeatures configurations[2] = {device_flags, {}};
     const int configuration_count = (device_flags.update_after_bind || device_flags.partially_bound) ? 2 : 1;
+    std::function<bool(const BindlessFeatures&)> layout_supported;
+    if (vkGetDescriptorSetLayoutSupport)
+        layout_supported = [&](const BindlessFeatures& candidate) {
+            const bindless::SetLayout layout(candidate);
+            VkDescriptorSetLayoutSupport support{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_SUPPORT};
+            vkGetDescriptorSetLayoutSupport(dev, &layout.info, &support);
+            return support.supported == VK_TRUE;
+        };
     for (int configuration = 0; configuration < configuration_count; ++configuration) {
         BindlessFeatures flags = configurations[configuration];
         flags.ms_samples[0] = VK_SAMPLE_COUNT_4_BIT;
         // A device below the default counts gets a smaller set; this test needs at least those.
-        const bool full = bindless::size_bindings(flags, props.properties.limits, props11, props12);
+        const bool full = bindless::size_bindings(flags, props.properties.limits, props11, props12, layout_supported);
         const char* name = flags.update_after_bind && flags.partially_bound ? "update after bind, partially bound"
                            : flags.update_after_bind ? "update after bind" : flags.partially_bound ? "partially bound" : "no flags";
         if (!full || !fits(flags)) {
@@ -615,6 +638,8 @@ int main(int argc, char** argv) {
         }
         BindlessSet set(vkGetDeviceProcAddr, dev, mp, flags);
         EXPECT(set.ok() && set.layout() && set.set());
+        EXPECT(set.image_capacity(ImageDimension::dim_1d_array) == set.storage_capacity(ImageDimension::dim_1d_array));
+        EXPECT(set.add_image(ImageDimension::dim_1d_array, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL) == 0);
 
         const VkPushConstantRange push{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, push_bytes};
         const VkDescriptorSetLayout set_layout = set.layout();
@@ -746,7 +771,8 @@ int main(int argc, char** argv) {
             const std::array<DescriptorKey, 4> keys{{{0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8},
                                                      {0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8},
                                                      {0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8},
-                                                     {0xd1, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8}}};
+                                                     {0xd1, 20u << 20, 0xd3, 0xd4, 0x800000d5, 0xd6, 0xd7,
+                                                      0xd7801800}}};
             for (std::uint32_t k = 0; k < 4; ++k)
                 std::memcpy(static_cast<char*>(heap_map) + atomic_va + 32 * k, keys[k].data(), 32);
             const VkImageUsageFlags atomic_usage =

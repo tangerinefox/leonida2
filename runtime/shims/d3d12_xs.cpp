@@ -2,7 +2,9 @@
 // The SDK types describe the Windows side. The measured guest ABI differs in the root-signature flag word: Xbox
 // sets bits in the high byte (observed 0x03000000) and the PC serializer rejects them, so descriptors are copied
 // with that byte cleared before forwarding. On a host that serializes only up to 1.1 (Windows 10's built-in
-// d3d12.dll), version 1.2 descriptions are rewritten as 1.1 when no static sampler uses 1.2's flags.
+// d3d12.dll), version 1.2 descriptions are rewritten as 1.1 when no static sampler uses 1.2's flags, and the same
+// host refuses the two heap-directly-indexed flags at every version, so they are serialized without them and put
+// back into the blob (d3d12_xs_rootsig.h).
 // D3D12XboxCreateDevice returns an Xbox-ABI proxy (d3d12_xs_device.h) over the PC device; only the measured slots
 // are overridden, the rest follow the PC vtable.
 #include <windows.h>
@@ -85,9 +87,9 @@ HRESULT WINAPI serialize_root_signature(const D3D12_VERSIONED_ROOT_SIGNATURE_DES
             std::fprintf(stderr,
                          "[rt] d3d12_xs: the host d3d12.dll serializes root signatures only up to 1.1; version 1.2 "
                          "descriptions without static sampler flags are serialized as 1.1\n");
-        return fn(&v11, blob, error);
+        return rt::d3d12_xs::serialize_versioned_keeping_heap_flags(fn, v11, blob, error);
     }
-    return fn(&cleared, blob, error);
+    return rt::d3d12_xs::serialize_versioned_keeping_heap_flags(fn, cleared, blob, error);
 }
 
 // The package DLLs import the versioned serializer; the legacy entry point is kept because it is trivial to forward
@@ -101,7 +103,7 @@ HRESULT WINAPI serialize_root_signature_legacy(const D3D12_ROOT_SIGNATURE_DESC* 
 
     D3D12_ROOT_SIGNATURE_DESC cleared{};
     rt::d3d12_xs::copy_root_signature_desc_clear_xbox_flags(*desc, cleared);
-    return fn(&cleared, version, blob, error);
+    return rt::d3d12_xs::serialize_legacy_keeping_heap_flags(fn, cleared, version, blob, error);
 }
 
 HRESULT WINAPI create_root_signature_deserializer(const void* data, SIZE_T size, REFIID iid, void** out) {

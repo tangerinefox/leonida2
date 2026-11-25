@@ -28,17 +28,35 @@ inline bool title_write_overlaps(const TitleWriteRanges& writes, std::uintptr_t 
     return begin < end && it != writes.end() && it->first < end;
 }
 
-// Poll unmarked textures in placement order. A time or byte limit resumes the next pass at
+// The registry's entries as one pass will visit them, in placement order. A pass cannot walk the registry itself: a
+// fill it makes can submit, a submission destroys a retired image, and that image's destructor erases its entry
+// (DeviceState::title_texture_gone). Windows' mutex is recursive for its owner, so the erase lands inside the pass and
+// the walk would step through a freed node. The list holds a reference to each entry, so an entry erased during the
+// pass is still alive when its turn comes.
+template<class Registry>
+std::vector<std::pair<std::uint64_t, typename Registry::mapped_type>> title_texture_snapshot(const Registry& textures) {
+    std::vector<std::pair<std::uint64_t, typename Registry::mapped_type>> entries;
+    entries.reserve(textures.size());
+    for (const auto& [address, texture] : textures) entries.emplace_back(address, texture);
+    return entries;
+}
+
+// Poll unmarked textures of a snapshot in placement order. A time or byte limit resumes the next pass at
 // the following address. The cursor also survives insertion or removal between passes.
-template<class Registry, class Visit, class Exhausted>
-void poll_title_textures(Registry& textures, std::uint64_t& cursor, Visit visit, Exhausted exhausted) {
-    auto it = textures.lower_bound(cursor);
-    for (auto left = textures.size(); left; --left) {
-        if (it == textures.end()) it = textures.begin();
-        auto& [address, texture] = *it++;
+template<class Entry, class Visit, class Exhausted>
+void poll_title_textures(const std::vector<Entry>& entries, std::uint64_t& cursor, Visit visit, Exhausted exhausted) {
+    if (entries.empty()) return;
+    // A snapshot of a std::map comes out sorted by address.
+    const auto first = std::lower_bound(entries.begin(), entries.end(), cursor,
+                                        [](const Entry& entry, std::uint64_t at) { return entry.first < at; });
+    auto index = std::size_t(first - entries.begin());
+    if (index == entries.size()) index = 0;  // the cursor is past the last address: resume at the first
+    for (auto left = entries.size(); left; --left) {
+        const auto& [address, texture] = entries[index];
         cursor = address + 1;
         if (!texture->mapped && !texture->stale) visit(*texture);
         if (exhausted()) break;  // advance at least one registry entry even if a deadline already passed
+        index = index + 1 == entries.size() ? 0 : index + 1;
     }
 }
 

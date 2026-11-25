@@ -100,6 +100,7 @@ COMPUTE = [("cs_lds", "4", "mirror64"), ("cs_exec64", "1", "exec64"), ("cs_bvh",
            ("cs_workgroup_yz", "2x3x4", "workgroup_yz")]
 COMPUTE += [("cs_bvh32", "1", "bvh")]   # TEST-184: image_bvh_intersect_ray, the 32-bit node pointer; same scene and words
 CS_STORE = [0x400080ff, 0xe00003ff, 0x3c004000, 0xeeeeeeee, 0x40003c00, 0xbc003800, 0x40ff8000, 0x3ff00000]
+CS_SMEM_VCC = list(range(0x7210, 0x7218))
 CS_SMEM = [0x5eed0024, 0x5eed0028, 0x5eed002c, 0x5eed0030, 0x5eed0010, 0x5eed0014, 0x5eed0018, 0x5eed001c]
 # -0, and NaN checks that need SignedZeroInfNanPreserve (cs_signed_zero_nan.asm); 0 in out[4..7] means it's missing
 SIGNED_ZERO_NAN = [0x80000000, 0x80000000, 0x80008000, 0x00008000, 1, 1, 1, 0x00007c00]
@@ -130,7 +131,7 @@ CS_DPP = [("cs_dpp", [1, 0, 3, 2, 5, 4, 7, 6]),
           ("cs_dpp_cmp", [3, 2, 3, 2, 1, 0, 1, 0])]
 WAVE32_DUMPS += tuple(n for n, _ in CS_DPP)
 WAVE32_LANE_DUMPS += tuple(n for n, _ in CS_DPP)
-CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
+CS_DUMPS = [*CS_DPP, ("cs_smem_vcc_base", CS_SMEM_VCC), ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             # SHADER-52: wave32 lane select is & 31; lane 40 wraps to 8
             ("cs_w32_lane_wrap", [25, 16, 777, 777]),
             # v_movrelsd_2_b32: VGPR[D + M0[25:16]] = VGPR[S0 + M0[9:0]]
@@ -1115,7 +1116,7 @@ def fmt_sint32_test(tools, spirv, env=None):
 
 
 def fmt_all_test(tools, spirv, env=None):
-    """cs_fmt_all: 28 loads, the inputs, 15 stores, and the untouched words between (316 words in all). Wave32, one
+    """cs_fmt_all: 32 loads, the inputs, 20 stores, and the untouched words between (336 words in all). Wave32, one
     thread: the translator recorded 32 for it, so the run is pinned to a 32-wide subgroup like compute_test does."""
     env = dict(os.environ if env is None else env)
     env.setdefault("VKC_SUBGROUP_SIZE", str(subgroup_size(spirv, "cs_fmt_all") or 32))
@@ -2183,6 +2184,32 @@ def clip_test(tools, spirv, name):
     return ""
 
 
+def texture_uav_test(tools, spv):
+    """The Windows D3D12 test compares every texel itself, through both Vulkan and WARP."""
+    if os.name != "nt":
+        return Skip("SKIP (needs the Windows D3D12 runtime)")
+    exe = os.path.join(tools, "d3d12_texture_uav_test" + EXE)
+    if not os.path.isfile(exe):
+        return f"missing {exe}"
+    code, out = run(exe, spv)
+    if code == UNSUPPORTED:
+        reason = next((line for line in out.splitlines() if line.startswith("SKIP:")), "unsupported device")
+        return Skip(reason)
+    return "" if code == 0 else failure(code, out, 8)
+
+
+IMAGE_STORE_CASES = {
+    "cs_imgstore": (),
+    "cs_imgstore_cube": ("cube",),   # GPU-CUBE-STORE: six-layer 2D-array views at bindings 11/12/13
+    "cs_imgload": ("load",),
+    "cs_imgload_tfe": ("load",),
+    "cs_imgload_d16": ("load-d16",),
+    "cs_imgload_d16_tfe": ("load-d16",),
+    "cs_sample_lz_int_d16": ("load-d16",),
+    "cs_imgload_mip": ("load-mip",),
+}
+
+
 def main():
     if any(arg in ("-h", "--help") for arg in sys.argv[1:]):
         print(__doc__)
@@ -2238,10 +2265,7 @@ def main():
     results.append(("ms_wave_info_s3", mesh_w64x_test(tools, spirv, "ms_wave_info_s3")))
     with tempfile.TemporaryDirectory(prefix="leonida-mesh-") as tmp:
         results.append(("ms_v5_workgroup", mesh_v5_test(tools, spirv, Path(tmp) / "groups.raw")))
-    for name, args in (("cs_imgstore", []), ("cs_imgstore_cube", ["cube"]), ("cs_imgload", ["load"]),
-                       ("cs_imgload_tfe", ["load"]),
-                       ("cs_imgload_d16", ["load-d16"]), ("cs_imgload_d16_tfe", ["load-d16"]),
-                       ("cs_sample_lz_int_d16", ["load-d16"])):
+    for name, args in IMAGE_STORE_CASES.items():
         code, out = run(os.path.join(tools, "vk_store_test" + EXE), os.path.join(spirv, name + ".spv"), *args)
         if code == UNSUPPORTED:   # vk_store_test: the device lacks a feature this test needs
             m = re.search(r"unsupported: .*", out)
@@ -2249,6 +2273,9 @@ def main():
             continue
         bad = re.findall(r"(\d+) bad", out)
         results.append((name, "" if code == 0 and len(bad) == 3 and set(bad) == {"0"} else failure(code, out, 3)))
+    texture_uav_spv = os.path.join(spirv, "cs_texture_uav.spv")
+    if os.path.isfile(texture_uav_spv):
+        results.append(("cs_texture_uav", texture_uav_test(tools, texture_uav_spv)))
     for name in STORE_WORDS:   # TEST-184: image atomics and image_get_resinfo
         results.append((name, store_words_test(tools, spirv, name)))
     for name in GET_LOD_TESTS:   # TEST-184: image_get_lod, 2D and 2D array

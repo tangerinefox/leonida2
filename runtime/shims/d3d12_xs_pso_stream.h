@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <vector>
 
 namespace rt::d3d12_xs {
@@ -46,7 +47,13 @@ class PsoStreamRecord {
 public:
     // Null when the stream is malformed, holds a subobject type this module does not walk, or is too large.
     static std::unique_ptr<PsoStreamRecord> capture(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, bool console = false);
-    ~PsoStreamRecord();
+    // The same, with shader containers the caller already keeps alive: a stage whose bytecode is one of `shaders` is
+    // referenced through it and not copied.
+    using ShaderData = std::shared_ptr<const std::vector<std::uint8_t>>;
+    static std::unique_ptr<PsoStreamRecord> capture(const D3D12_PIPELINE_STATE_STREAM_DESC& desc,
+                                                     std::span<const ShaderData> shaders, bool console = false);
+    static std::unique_ptr<PsoStreamRecord> derived(const PsoStreamRecord& base, std::vector<unsigned char> stream);
+    ~PsoStreamRecord() = default;
     PsoStreamRecord(const PsoStreamRecord&) = delete;
     PsoStreamRecord& operator=(const PsoStreamRecord&) = delete;
 
@@ -65,8 +72,13 @@ private:
     bool copy_pointed_data(std::size_t type, std::size_t payload_offset);
 
     std::vector<unsigned char> bytes_;
-    std::vector<std::vector<unsigned char>> blobs_;  // owned copies; their buffers do not move when this grows
-    std::vector<ID3D12RootSignature*> roots_;        // AddRef'd
+    struct Payloads {
+        std::vector<std::vector<unsigned char>> blobs;  // owned copies; their buffers do not move when this grows
+        std::vector<ShaderData> shaders;
+        std::vector<ID3D12RootSignature*> roots;        // AddRef'd
+        ~Payloads();
+    };
+    std::shared_ptr<Payloads> payloads_;
 };
 
 enum class DeriveStatus { ok, unknown_tag, missing_state, malformed };
@@ -79,6 +91,7 @@ DeriveStatus derive_stream(const PsoStreamRecord& base, const unsigned char* rec
 // Keeps `record` on `object` (lifetime follows the object) and finds it again. attach returns false on failure, and
 // then the record is dropped. find returns null when no record was attached to that object.
 bool attach_pso_record(ID3D12Object* object, std::unique_ptr<PsoStreamRecord> record);
+bool share_pso_record(ID3D12Object* source, ID3D12Object* target);
 const PsoStreamRecord* find_pso_record(ID3D12Object* object);
 
 }  // namespace rt::d3d12_xs

@@ -1,7 +1,8 @@
 // Publish a checkpoint only after every byte has reached a closed, same-directory staging file.
 //
-// Used by vk_pipeline_check for its offline corpus checkpoints. The runtime fills a mapped session staging file
-// directly (d3d12_pipeline_checkpoint.h).
+// Used by vk_pipeline_check (its corpus checkpoints) and by the runtime, which writes the session cache on device
+// teardown (pipeline_cache_store.h; a reader of the old file keeps it open until its rename completes) and fills a
+// mapped session staging file directly (d3d12_pipeline_checkpoint.h).
 #pragma once
 
 #include <algorithm>

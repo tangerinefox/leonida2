@@ -129,8 +129,11 @@ constexpr uint32_t kMaxD3d12Cost = 64;
 //     in this layout equals the program's RSRC2 USER_SGPR count in 29 of 29, and the programs read the tables and
 //     root CBVs at exactly these SGPRs (tools/rootsig_census.py --disasm). The game's compute census agrees (lowest
 //     pointer s4, one-dword tables).
-//   - vertex/pixel/geometry s8 and mesh s16: a hypothesis from the corpus census only (lowest pointer SGPR per stage);
-//     no signature confirms them, and visibility is not modelled (every parameter takes its place in every stage).
+//   - vertex/pixel/geometry s8 and mesh s16: from the corpus census (lowest pointer SGPR per stage) and one live
+//     retail frame (a VS and PS reading their tables at s8, s9, s10; issue #14, comment 7131556366); no serialized
+//     signature confirms them yet, and visibility is not modelled (every parameter takes its place in every stage).
+//     The graphics bind point uses Stage::Pixel (s8, as vertex and geometry); a mesh shader reads the same dwords
+//     through its translator-side window (docs/d3d12_vulkan.md section 3.5).
 // A parameter that does not fit goes to the console's spill array behind s[0:1] (compute, section 7) together with
 // every parameter after it. For compute that packed spill array (1 dword per 32-bit constant, 2 per root descriptor,
 // 1 per descriptor table, no alignment padding) is modelled in StagePackResult; non-compute stages still refuse spills

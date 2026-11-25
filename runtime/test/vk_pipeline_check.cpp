@@ -1,7 +1,7 @@
 // Driver-level check of the translated corpus: vk_pipeline_check <spirv dir> [pipeline_cache.bin]
 // Reads <spirv dir>/index.json (written by tools/rdna2spirv.py) and checks module and pipeline creation for compatible
 // entries with the translator's resource contract (set 0: sampled images 0, 3, 5, 6; samplers 1; descriptor hash
-// table 2; storage images 4, 7 and 8..19; set 1 binding 0 dynamic UBO for --pc-tail-ubo shaders; push constants
+// table 2; storage images 4, 7 and 8..19 and 26..28; set 1 binding 0 dynamic UBO for --pc-tail-ubo shaders; push constants
 // sized from push_constant_bytes, default 144 or 128 with pc_tail):
 //   - cs: compute pipeline via vkCreateComputePipelines, using the runtime layout and subgroup request for
 //     descriptor-free shaders with the standard push-constant range
@@ -55,6 +55,7 @@
 #include "pipeline_summary.h"
 #include "../src/spirv_words.h"
 #include "../src/subgroup_size.h"
+#include "../src/vulkan_bindless.h"
 
 #include <algorithm>
 #include <array>
@@ -71,6 +72,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <map>
@@ -1101,10 +1103,13 @@ int main(int argc, char** argv) {
     }
     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(pd, &props);
     VkPhysicalDeviceSubgroupSizeControlProperties sgProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
-    VkPhysicalDeviceFloatControlsProperties fcProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES};
+    VkPhysicalDeviceVulkan11Properties indexing_limits{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES};
+    // Vulkan12Properties already includes the float controls (do not chain both promoted structs).
+    VkPhysicalDeviceVulkan12Properties indexed{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
     VkPhysicalDeviceProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    indexing_limits.pNext = &indexed;
+    sgProps.pNext = &indexing_limits;
     props2.pNext = &sgProps;
-    sgProps.pNext = &fcProps;
     vkGetPhysicalDeviceProperties2(pd, &props2);
     std::fprintf(stderr, "device: %s (subgroup %u..%u)\n", props.deviceName, sgProps.minSubgroupSize, sgProps.maxSubgroupSize);
 
@@ -1171,12 +1176,12 @@ int main(int argc, char** argv) {
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2.pNext = chain;
     vkGetPhysicalDeviceFeatures2(pd, &f2);            // fills every linked struct with what's supported
-    // The runtime's device (create_vulkan_device_standalone) never enables these three, and a driver makes them part
-    // of a pipeline's cache key: with any of them on here, the cache this tool saves does not hit in gta6rt
-    // (pipeline_cache_seed_test; docs/pipeline_check.md, "The cache and the runtime's device").
+    // The runtime's device (create_vulkan_device_standalone) never enables the first two, and a driver makes them part
+    // of a pipeline's cache key: with either of them on here, the cache this tool saves does not hit in gta6rt
+    // (pipeline_cache_seed_test; docs/pipeline_check.md, "The cache and the runtime's device"). The runtime enables
+    // robustImageAccess where supported (for 1D and 3D storage views), so its queried value is kept.
     f2.features.robustBufferAccess = VK_FALSE;
     f12.scalarBlockLayout = VK_FALSE;
-    f13.robustImageAccess = VK_FALSE;
     VkPhysicalDeviceMeshShaderPropertiesEXT mesh_props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT};
     if (ext_mesh && mesh.meshShader) {
         VkPhysicalDeviceProperties2 mesh_device_props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
@@ -1243,6 +1248,7 @@ int main(int argc, char** argv) {
     }
 #define LOADD(name) auto name = reinterpret_cast<PFN_##name>(vkGetDeviceProcAddr(dev, #name))
     LOADD(vkCreateShaderModule); LOADD(vkDestroyShaderModule); LOADD(vkCreateDescriptorSetLayout);
+    LOADD(vkGetDescriptorSetLayoutSupport);
     LOADD(vkCreatePipelineLayout); LOADD(vkCreateComputePipelines); LOADD(vkCreateGraphicsPipelines);
     LOADD(vkDestroyPipeline); LOADD(vkCreatePipelineCache); LOADD(vkGetPipelineCacheData);
     LOADD(vkGetPipelineExecutablePropertiesKHR); LOADD(vkGetPipelineExecutableStatisticsKHR);
@@ -1296,15 +1302,16 @@ int main(int argc, char** argv) {
         // DenormPreserve 16) need a device property, not a feature.
         for (const auto& fc : meta.float_controls) {
             if (fc == "shaderSignedZeroInfNanPreserveFloat32") {
-                if (!fcProps.shaderSignedZeroInfNanPreserveFloat32) return "no " + fc;
+                if (!indexed.shaderSignedZeroInfNanPreserveFloat32) return "no " + fc;
             } else if (fc == "shaderSignedZeroInfNanPreserveFloat64") {
-                if (!fcProps.shaderSignedZeroInfNanPreserveFloat64) return "no " + fc;
+                if (!indexed.shaderSignedZeroInfNanPreserveFloat64) return "no " + fc;
             } else if (fc == "shaderDenormPreserveFloat16") {
-                if (!fcProps.shaderDenormPreserveFloat16) return "no " + fc;
+                if (!indexed.shaderDenormPreserveFloat16) return "no " + fc;
             } else {
                 return "unknown float control " + fc;
             }
         }
+        // Per-format read/write support for formatless storage is checked when the runtime binds the actual view.
         for (const auto& feat : meta.features) {
             if (feat == "meshShader" && !(ext_mesh && mesh.meshShader)) return "no VK_EXT_mesh_shader";
             if (feat == "geometryShader" && !f2.features.geometryShader) return "no geometryShader";
@@ -1319,28 +1326,38 @@ int main(int argc, char** argv) {
             if (feat == "runtimeDescriptorArray" && !f12.runtimeDescriptorArray) return "no runtimeDescriptorArray";
             if (feat == "shaderImageGatherExtended" && !f2.features.shaderImageGatherExtended) return "no shaderImageGatherExtended";
             if (feat == "shaderResourceMinLod" && !f2.features.shaderResourceMinLod) return "no shaderResourceMinLod";
-            if (feat == "shaderStorageImageWriteWithoutFormat" && !f2.features.shaderStorageImageWriteWithoutFormat)
-                return "no shaderStorageImageWriteWithoutFormat";
-            if (feat == "shaderStorageImageReadWithoutFormat" && !f2.features.shaderStorageImageReadWithoutFormat)
-                return "no shaderStorageImageReadWithoutFormat";
+            if (props.apiVersion < VK_API_VERSION_1_3) {
+                if (feat == "shaderStorageImageWriteWithoutFormat" && !f2.features.shaderStorageImageWriteWithoutFormat)
+                    return "no shaderStorageImageWriteWithoutFormat";
+                if (feat == "shaderStorageImageReadWithoutFormat" && !f2.features.shaderStorageImageReadWithoutFormat)
+                    return "no shaderStorageImageReadWithoutFormat";
+            }
         }
         return {};
     };
 
-    // Resource contract (docs/design.md): set 0, runtime-sized arrays as large bindless arrays.
-    std::vector<VkDescriptorSetLayoutBinding> b;
-    auto add = [&](uint32_t bind, VkDescriptorType t, uint32_t cnt) {
-        b.push_back({bind, t, cnt, VK_SHADER_STAGE_ALL, nullptr});
-    };
-    add(0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 4096); add(1, VK_DESCRIPTOR_TYPE_SAMPLER, 1024);
-    add(2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1); add(3, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024);
-    add(4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024); add(5, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256);
-    add(6, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256); add(7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256);
-    for (uint32_t i = 8; i <= 19; i++) add(i, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256);
-    VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dli.bindingCount = uint32_t(b.size()); dli.pBindings = b.data();
+    // Use the runtime's set-0 layout and sizing rules. The translator does not declare the runtime-only MS SRVs.
+    leonida::BindlessFeatures bindless{};
+    std::function<bool(const leonida::BindlessFeatures&)> layout_supported;
+    if (vkGetDescriptorSetLayoutSupport)
+        layout_supported = [&](const leonida::BindlessFeatures& candidate) {
+            const leonida::bindless::SetLayout layout(candidate);
+            VkDescriptorSetLayoutSupport support{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_SUPPORT};
+            vkGetDescriptorSetLayoutSupport(dev, &layout.info, &support);
+            return support.supported == VK_TRUE;
+        };
+    if (!leonida::bindless::size_bindings(bindless, props2.properties.limits, indexing_limits, indexed, layout_supported) &&
+        f12.descriptorBindingSampledImageUpdateAfterBind && f12.descriptorBindingStorageImageUpdateAfterBind &&
+        f12.descriptorBindingStorageBufferUpdateAfterBind) {
+        bindless.update_after_bind = true;
+        leonida::bindless::size_bindings(bindless, props2.properties.limits, indexing_limits, indexed, layout_supported);
+    }
+    const leonida::bindless::SetLayout layout(bindless);
     VkDescriptorSetLayout dsl;
-    if (VkResult r = vkCreateDescriptorSetLayout(dev, &dli, nullptr, &dsl)) { std::fprintf(stderr, "layout %d\n", r); return 1; }
+    if (VkResult r = vkCreateDescriptorSetLayout(dev, &layout.info, nullptr, &dsl)) {
+        std::fprintf(stderr, "layout %d\n", r);
+        return 1;
+    }
     // Set 1 of --pc-tail-ubo shaders (docs/design.md): dynamic uniform block at binding 0 holding heap/code base.
     const VkDescriptorSetLayoutBinding tail_binding{0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1,
                                                     VK_SHADER_STAGE_ALL, nullptr};

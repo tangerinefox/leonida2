@@ -7,6 +7,10 @@
 //     v1 (-1, 1), v2 (1, 1), v3 (-1, -1) cover the top-left, top-right and bottom-left of the 64x64 target; the fourth
 //     corner, v2 + v3 - v1 = (1, -1) with colour c2 + c3 - c1, is made by the layer. Every pixel must carry the plane
 //     through the three corner colours; the bottom-right quadrant is only right when the fourth corner is.
+//   frames 3 to 5, rectangle lists whose right angle is at the second vertex, at the third vertex, and a triangle with
+//     no right angle at all. The layer takes the right-angle corner as the vertex opposite the longest screen edge, so
+//     the first two must cover all 64x64 pixels on the colour plane too (the retail boot's full-screen draw has its
+//     right angle at the second vertex); the third only has to draw something and not fail.
 //   frame 2, quad list: PSO topology type TRIANGLE, IASetPrimitiveTopology(19), DrawInstanced(8): two quads (corners
 //     in order around the quad), the top-left and bottom-right quadrants, each one colour. These pixels are exact.
 // Pixels are read back and compared; the other two quadrants of frame 2 stay the clear colour. LEONIDA_VK_VALIDATION=1
@@ -86,12 +90,21 @@ int main() {
     // Frame 1: the rectangle's three corners. Vertices 0..2. Frame 2: two quads, vertices 3..10.
     const float ca[4] = {0.0f, 0.0f, 0.0f, 1.0f}, cb[4] = {1.0f, 0.0f, 0.5f, 1.0f}, cc[4] = {0.0f, 0.5f, 1.0f, 1.0f};
     const float q1[4] = {0.25f, 0.5f, 0.75f, 1.0f}, q2[4] = {1.0f, 0.0f, 0.5f, 1.0f};
-    const Vertex vertices[11] = {vertex(-1, 1, ca), vertex(1, 1, cb), vertex(-1, -1, cc),
+    const Vertex vertices[20] = {vertex(-1, 1, ca), vertex(1, 1, cb), vertex(-1, -1, cc),
                                  vertex(-1, 1, q1), vertex(0, 1, q1), vertex(0, 0, q1), vertex(-1, 0, q1),
-                                 vertex(0, 0, q2), vertex(1, 0, q2), vertex(1, -1, q2), vertex(0, -1, q2)};
-    static_assert(sizeof(Vertex) == 32 && sizeof(vertices) == 352);
+                                 vertex(0, 0, q2), vertex(1, 0, q2), vertex(1, -1, q2), vertex(0, -1, q2),
+                                 // vertices 11..13: right angle at the second vertex; 14..16: at the third; 17..19: none
+                                 vertex(-1, 1, ca), vertex(1, 1, cb), vertex(1, -1, cc),
+                                 vertex(-1, 1, ca), vertex(1, -1, cb), vertex(-1, -1, cc),
+                                 vertex(-1, 1, ca), vertex(0.5f, 0.75f, cb), vertex(-0.25f, -1, cc)};
+    static_assert(sizeof(Vertex) == 32 && sizeof(vertices) == 640);
+    const Vertex* const corner_cases[2] = {&vertices[11], &vertices[14]};
 
-    std::vector<Pixel> rect_pixels(target_extent * target_extent), quad_pixels(target_extent * target_extent);
+    std::vector<Pixel> rect_pixels(target_extent * target_extent), quad_pixels(target_extent * target_extent),
+        second_pixels(target_extent * target_extent), third_pixels(target_extent * target_extent),
+        skew_pixels(target_extent * target_extent);
+    std::vector<Pixel> dynamic_pixels(rect_pixels.size()), triangle_pixels(rect_pixels.size()),
+        repeated_pixels(rect_pixels.size());
     {
         rt::d3d12::VulkanDeviceInfo info{};
         info.get_instance_proc = d.instance_proc;
@@ -172,8 +185,9 @@ int main() {
         EXPECT(SUCCEEDED(upload->Map(0, nullptr, reinterpret_cast<void**>(&up))));
         std::memcpy(up, vertices, sizeof(vertices));
 
-        // Two V#s over the one vertex buffer: slot 0 the rectangle's three corners, slot 1 the eight quad corners.
-        const D3D12_DESCRIPTOR_HEAP_DESC srv_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2,
+        // V#s over the one vertex buffer: slot 0 the rectangle's three corners, slot 1 the eight quad corners, slots 2 to 4
+        // the three more rectangles.
+        const D3D12_DESCRIPTOR_HEAP_DESC srv_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 5,
                                                        D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
         Ref<ID3D12DescriptorHeap> srv_heap;
         EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&srv_heap_desc, IID_PPV_ARGS(&srv_heap.p))));
@@ -183,9 +197,12 @@ int main() {
         EXPECT(cpu && gpu >= 0x10000 && gpu < (1ull << 32) && step >= 16);
         const std::uint64_t buffer_va = vertex_buffer->GetGPUVirtualAddress();
         EXPECT(buffer_va >= 0x10000);
-        const std::array<std::uint32_t, 4> vsharps[2] = {make_vsharp(buffer_va, 3),
-                                                         make_vsharp(buffer_va + 3 * sizeof(Vertex), 8)};
-        for (unsigned i = 0; i < 2; ++i)
+        const std::array<std::uint32_t, 4> vsharps[5] = {make_vsharp(buffer_va, 3),
+                                                         make_vsharp(buffer_va + 3 * sizeof(Vertex), 8),
+                                                         make_vsharp(buffer_va + 11 * sizeof(Vertex), 3),
+                                                         make_vsharp(buffer_va + 14 * sizeof(Vertex), 3),
+                                                         make_vsharp(buffer_va + 17 * sizeof(Vertex), 3)};
+        for (unsigned i = 0; i < 5; ++i)
             std::memcpy(reinterpret_cast<void*>(cpu + std::uint64_t(i) * step), vsharps[i].data(), 16);
 
         const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
@@ -263,6 +280,12 @@ int main() {
         };
         EXPECT(render_frame(1, rect_pso.p, rect_list, 0, 3, rect_pixels) == 0);
         EXPECT(render_frame(2, quad_pso.p, quad_list, 1, 8, quad_pixels) == 0);
+        EXPECT(render_frame(3, rect_pso.p, rect_list, 2, 3, second_pixels) == 0);
+        EXPECT(render_frame(4, rect_pso.p, rect_list, 3, 3, third_pixels) == 0);
+        EXPECT(render_frame(5, rect_pso.p, rect_list, 4, 3, skew_pixels) == 0);
+        EXPECT(render_frame(6, quad_pso.p, rect_list, 0, 3, dynamic_pixels) == 0);
+        EXPECT(render_frame(7, quad_pso.p, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, 0, 3, triangle_pixels) == 0);
+        EXPECT(render_frame(8, quad_pso.p, rect_list, 0, 3, repeated_pixels) == 0);
         for (auto* r : {&vertex_buffer, &upload, &readback, &target}) r->reset();
         rect_pso.reset();
         quad_pso.reset();
@@ -311,6 +334,80 @@ int main() {
         }
     }
     EXPECT(covered == target_extent * target_extent);
+    // The same triangle-family PSO can select either primitive at draw time. Compare both rectangle draws
+    // to the verified type-19 reference; exclude only the shared diagonal from the triangle coverage check.
+    const Pixel clear_value = {0.5f, 0.125f, 0.25f, 0.5f};
+    for (UINT y = 0; y < target_extent; ++y) {
+        for (UINT x = 0; x < target_extent; ++x) {
+            const auto i = y * target_extent + x;
+            EXPECT(std::memcmp(&dynamic_pixels[i], &rect_pixels[i], sizeof(Pixel)) == 0);
+            EXPECT(std::memcmp(&repeated_pixels[i], &rect_pixels[i], sizeof(Pixel)) == 0);
+            if (x + y + 1 < target_extent)
+                EXPECT(std::memcmp(&triangle_pixels[i], &rect_pixels[i], sizeof(Pixel)) == 0);
+            if (x + y + 1 > target_extent)
+                EXPECT(std::memcmp(&triangle_pixels[i], &clear_value, sizeof(Pixel)) == 0);
+        }
+    }
+
+    // Right angle at the second and at the third vertex: the plane through the three drawn corners, everywhere.
+    const std::vector<Pixel>* const corner_pixels[2] = {&second_pixels, &third_pixels};
+    const char* const corner_names[2] = {"second", "third"};
+    unsigned corner_covered[2] = {0, 0};
+    float corner_worst = 0.0f;
+    for (int which = 0; which < 2; ++which) {
+        const Vertex* t = corner_cases[which];
+        const float x0 = t[0].position[0], y0 = t[0].position[1];
+        const float ax = t[1].position[0] - x0, ay = t[1].position[1] - y0;
+        const float bx = t[2].position[0] - x0, by = t[2].position[1] - y0;
+        const float det = ax * by - ay * bx;
+        for (UINT row = 0; row < target_extent; ++row) {
+            for (UINT col = 0; col < target_extent; ++col) {
+                const float px = 2.0f * (float(col) + 0.5f) / target_extent - 1.0f - x0;
+                const float py = 1.0f - 2.0f * (float(row) + 0.5f) / target_extent - y0;
+                const float s = (px * by - py * bx) / det, r = (ax * py - ay * px) / det;
+                const Pixel& got = (*corner_pixels[which])[row * target_extent + col];
+                bool pixel_ok = true;
+                for (int c = 0; c < 4; ++c) {
+                    const float want = (t[0].color[c] + s * (t[1].color[c] - t[0].color[c]) +
+                                        r * (t[2].color[c] - t[0].color[c])) * scale[c];
+                    const float error = std::fabs(got[c] - want);
+                    corner_worst = std::fmax(corner_worst, error);
+                    if (!(error <= 2e-5f)) pixel_ok = false;
+                }
+                corner_covered[which] += pixel_ok;
+            }
+        }
+        if (corner_covered[which] != target_extent * target_extent) {
+            std::fprintf(stderr, "rect list with the right angle at the %s vertex: %u of %u pixels on the plane\n",
+                         corner_names[which], corner_covered[which], target_extent * target_extent);
+            return 1;
+        }
+    }
+    // Not a right triangle: any consistent corner is fine, but every corner choice makes a parallelogram that holds the
+    // drawn triangle, so each pixel well inside the triangle must be drawn (not the clear colour).
+    const Pixel clear_pixel = {0.5f, 0.125f, 0.25f, 0.5f};
+    unsigned skew_drawn = 0, skew_inside = 0, skew_missing = 0;
+    {
+        const Vertex* t = &vertices[17];
+        const float x0 = t[0].position[0], y0 = t[0].position[1];
+        const float ax = t[1].position[0] - x0, ay = t[1].position[1] - y0;
+        const float bx = t[2].position[0] - x0, by = t[2].position[1] - y0;
+        const float det = ax * by - ay * bx;
+        for (UINT row = 0; row < target_extent; ++row) {
+            for (UINT col = 0; col < target_extent; ++col) {
+                const float px = 2.0f * (float(col) + 0.5f) / target_extent - 1.0f - x0;
+                const float py = 1.0f - 2.0f * (float(row) + 0.5f) / target_extent - y0;
+                const float s = (px * by - py * bx) / det, r = (ax * py - ay * px) / det;
+                const bool drawn = std::memcmp(&skew_pixels[row * target_extent + col], &clear_pixel, sizeof(Pixel)) != 0;
+                skew_drawn += drawn;
+                if (s > 0.02f && r > 0.02f && s + r < 0.98f) {
+                    ++skew_inside;
+                    skew_missing += !drawn;
+                }
+            }
+        }
+    }
+    EXPECT(skew_inside > 1000 && skew_missing == 0);
 
     // Quad list: whole-bit comparison; two quadrants one colour each, the rest the clear colour.
     const Pixel clear_color = {0.5f, 0.125f, 0.25f, 0.5f};
@@ -333,9 +430,11 @@ int main() {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;
     }
-    std::printf("rect list: %u of %u pixels on the colour plane (worst error %g), all four quadrants; quad list: "
-                "%u of %u pixels exact\n",
-                covered, target_extent * target_extent, double(worst), target_extent * target_extent - quad_wrong,
-                target_extent * target_extent);
+    std::printf("rect list: %u of %u pixels on the colour plane (worst error %g), all four quadrants; right angle at "
+                "the second vertex %u and at the third %u of %u (worst error %g); no right angle: %u pixels drawn; "
+                "quad list: %u of %u pixels exact\n",
+                covered, target_extent * target_extent, double(worst), corner_covered[0], corner_covered[1],
+                target_extent * target_extent, double(corner_worst), skew_drawn,
+                target_extent * target_extent - quad_wrong, target_extent * target_extent);
     return 0;
 }

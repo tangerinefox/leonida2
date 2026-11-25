@@ -115,11 +115,17 @@ inline uint32_t align_up(uint32_t value, uint32_t alignment) {
 // the base extent in elements. A slice stores the tail block, then its
 // unpacked mips from smallest to largest.
 inline bool build_texture(const ResourceDesc& desc, Texture& texture) {
+    // Exposure readback uses the explicit linear Series layout, including the
+    // console flag set by its render-target descriptor builder.
+    const bool linear_readback_target = (desc.flags & ~0x300000u) == kRenderTarget &&
+        desc.dimension == kTexture2D && desc.format == DXGI_FORMAT_R32G32B32A32_FLOAT &&
+        desc.layout == (kSwizzled | kLinear) && desc.width == 1 && desc.height == 1 &&
+        desc.depth_or_array == 1 && desc.mips == 1;
     if (desc.dimension < kTexture1D || desc.dimension > kTexture3D ||
         desc.width == 0 || desc.width > 16384 || desc.height == 0 || desc.height > 16384 ||
         (desc.dimension == kTexture1D && desc.height != 1) ||
         desc.depth_or_array == 0 || desc.depth_or_array > 2048 || desc.samples != 1 || desc.quality ||
-        (desc.flags & (kRenderTarget | kDepthStencil)) ||
+        ((desc.flags & (kRenderTarget | kDepthStencil)) && !linear_readback_target) ||
         (desc.layout > 1 && (desc.layout & ~0x1fu) != kSwizzled))
         return false;
 

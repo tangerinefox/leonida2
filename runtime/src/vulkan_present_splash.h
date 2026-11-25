@@ -44,9 +44,20 @@ inline VkResult VulkanPresenter::finish_startup_frame(Frame& frame, std::uint32_
     if (result != VK_SUCCESS) return result;
     const bool ten_bit = format_ == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || format_ == VK_FORMAT_A2R10G10B10_UNORM_PACK32;
     const std::uint32_t rgb = ten_bit ? 0x3fffffffu : 0xffffffu;
+    // Every 8th pixel of every 8th row: the capture is read back from host-visible memory, and reading all of it at
+    // every present while the title's frames are black took 75-90 % of the present thread under Proton and doubled
+    // the title's start-up (speed-3: 2 M pixels a present, under the submit lock). Content smaller than 8x8 pixels
+    // keeps the splash a few frames longer.
     const auto* pixels = reinterpret_cast<const std::uint32_t*>(capture_ptr_);
-    const auto count = std::size_t(extent_.width) * extent_.height;
-    show_title = std::any_of(pixels, pixels + count, [rgb](auto pixel) { return (pixel & rgb) != 0; });
+    show_title = false;
+    for (std::uint32_t y = 0; y < extent_.height && !show_title; y += 8) {
+        const std::uint32_t* row = pixels + std::size_t(y) * extent_.width;
+        for (std::uint32_t x = 0; x < extent_.width; x += 8)
+            if (row[x] & rgb) {
+                show_title = true;
+                break;
+            }
+    }
     VkSubmitInfo ready{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     ready.signalSemaphoreCount = 1;
     ready.pSignalSemaphores = &ready_[image];

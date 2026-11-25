@@ -18,7 +18,9 @@
 #include <span>
 #include "../src/bcpack.h"
 #include "../src/bcpack_stream.h"
+#include "../src/title_geometry_watch.h"
 #include "../src/title_page_watch.h"
+#include "xmem.h"
 #include "dstorage_xs_abi.h"
 #include "dstorage_staging.h"
 #include "file_system.h"
@@ -1356,6 +1358,106 @@ leonida::bcpack::Calibration test_profile() {
     return history;
 }
 
+// Requests whose destination the runtime's own guards keep read-only, written from the queue's worker threads (each
+// through kernel_writes: src/title_page_watch.h):
+//   1. a geometry tile the geometry watch armed (src/title_geometry_watch.h), with the D3D12 layer's opener as far as
+//      that watch goes: a file read, a memory copy and a decompressed (BCPack) publish into it all succeed, and the
+//      tile counts as written (its GPU copy is refilled);
+//   2. an xmem physical page (the stream pool's CPU view) left read-only with no guard to reopen it, with
+//      rt::xmem::reopen_unowned as the unguarder (as gta6rt sets it): the same three requests succeed.
+void test_guarded_destinations(Env& env) {
+    namespace gw = leonida::geometry_writes;
+    namespace kw = leonida::kernel_writes;
+    auto* file = open(env, L"game:/data/b.bin");
+    auto* files = make_queue(env, 0x80, false);
+    auto* memory = make_queue(env, 0x80, false, DSTORAGE_REQUEST_SOURCE_MEMORY, DSTORAGE_PRIORITY_REALTIME);
+    auto* status = make_status(env, 3);
+    const std::vector<uint8_t> source = pattern(4096, 21);
+    const auto& packed = vectors[0];
+    // Each request into `at` (file range, memory copy, BCPack), each of the three after `guard` made the pages
+    // read-only again; the bytes are checked after each.
+    const auto run = [&](uint8_t* at, const std::function<void()>& guard, const char* where) {
+        guard();
+        auto read = file_request(file, 300, at, 4096);
+        files->EnqueueRequest(&read);
+        files->EnqueueStatus(status, 0);
+        files->Submit();
+        check(wait_complete(status, 0), where);
+        check_hr(status->GetHResult(0), S_OK, where);
+        check(std::memcmp(at, env.b.data() + 300, 4096) == 0, where);
+        guard();
+        DSTORAGE_REQUEST copy{};
+        copy.Options.SourceType = DSTORAGE_REQUEST_SOURCE_MEMORY;
+        copy.Source = source.data();
+        copy.Destination = at + 0x1000;
+        copy.SourceSize = copy.DestinationSize = 4096;
+        memory->EnqueueRequest(&copy);
+        memory->EnqueueStatus(status, 1);
+        memory->Submit();
+        check(wait_complete(status, 1), where);
+        check_hr(status->GetHResult(1), S_OK, where);
+        check(std::memcmp(at + 0x1000, source.data(), 4096) == 0, where);
+        guard();
+        DSTORAGE_REQUEST bc{};
+        bc.Options.AsUINT64 = options::kSourceMemory | (packed.codec << options::kBcpackShift);
+        bc.Source = packed.raw.data();
+        bc.SourceSize = static_cast<uint32_t>(packed.raw.size());
+        bc.Destination = at + 0x2000;
+        bc.DestinationSize = static_cast<uint32_t>(packed.plain.size());
+        memory->EnqueueRequest(&bc);
+        memory->EnqueueStatus(status, 2);
+        memory->Submit();
+        check(wait_complete(status, 2), where);
+        check_hr(status->GetHResult(2), S_OK, where);
+        check(std::equal(packed.plain.begin(), packed.plain.end(), at + 0x2000), where);
+    };
+
+    // 1. A geometry tile.
+    auto* tile = static_cast<uint8_t*>(VirtualAlloc(nullptr, gw::tile_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    check(tile != nullptr && packed.plain.size() <= gw::tile_size - 0x2000, "a geometry tile for the destinations");
+    if (tile) {
+        const auto va = reinterpret_cast<uintptr_t>(tile);
+        gw::Cell* cell = gw::acquire(va);
+        kw::set_opener([](uintptr_t from, uintptr_t to) { gw::notify(from, to, gw::Event::open); });
+        const auto version = cell->version.load();
+        run(tile, [&] { gw::arm(va, *cell); }, "a request into an armed geometry tile");
+        check(cell->version.load() != version, "the geometry tile counts as written");
+        kw::set_opener(nullptr);
+        gw::release(va);
+        VirtualFree(tile, 0, MEM_RELEASE);
+    }
+
+    // 2. An xmem physical page read-only with no guard to answer for it.
+    using Reserve = void*(WINAPI*)(void*, SIZE_T, DWORD, ULONGLONG, DWORD);
+    using Allocate = BOOL(WINAPI*)(uint64_t, uint64_t*, uint64_t*);
+    using Free = BOOL(WINAPI*)(uint64_t, const uint64_t*);
+    using Map = void*(WINAPI*)(void*, uint64_t, const uint64_t*);
+    const auto reserve = reinterpret_cast<Reserve>(rt::shims::find("xmem.dll", "XMemVirtualAlloc"));
+    const auto allocate = reinterpret_cast<Allocate>(rt::shims::find("xmem.dll", "XMemAllocatePhysicalPages"));
+    const auto free_pages = reinterpret_cast<Free>(rt::shims::find("xmem.dll", "XMemFreePhysicalPages"));
+    const auto map = reinterpret_cast<Map>(rt::shims::find("xmem.dll", "XMemMapPhysicalPages"));
+    auto* window = reserve ? static_cast<uint8_t*>(reserve(nullptr, 0x10000, MEM_RESERVE | 0x20400000, 0x23,
+                                                           PAGE_READWRITE)) : nullptr;
+    uint64_t page = 0, count = 1;
+    check(window && allocate && allocate(0x280, &count, &page) && map && map(window, 1, &page) == window,
+          "an xmem physical page for the destinations");
+    if (window && count == 1) {
+        for (size_t i = 0; i < 0x10000; i += 0x1000) window[i] = 0;  // committed
+        kw::set_unguarder(&rt::xmem::reopen_unowned);
+        run(window, [&] {
+            DWORD old = 0;
+            VirtualProtect(window, 0x10000, PAGE_READONLY, &old);
+        }, "a request into an xmem page left read-only");
+        kw::set_unguarder(nullptr);
+        map(window, 1, nullptr);
+        free_pages(1, &page);
+    }
+    status->Release();
+    memory->Release();
+    files->Release();
+    file->Release();
+}
+
 void test_extended(Env& env) {
     auto* q = make_queue(env, 0x80, false, DSTORAGE_REQUEST_SOURCE_MEMORY, DSTORAGE_PRIORITY_REALTIME);
     auto* status = make_status(env, 1);
@@ -1566,6 +1668,7 @@ int main() {
     test_stats_timing(env);
     test_stats(env);
     test_extended(env);
+    test_guarded_destinations(env);
     test_zlib(env);  // after test_stats, whose request totals it would change
 
     fs::remove_all(env.root, ec);
