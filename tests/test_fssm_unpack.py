@@ -20,6 +20,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 import fssm_unpack  # noqa: E402
+import shader_stage_manifest  # noqa: E402
 
 TOOL = os.path.join(ROOT, "tools", "fssm_unpack.py")
 S_ENDPGM = b"\x00\x00\x81\xbf"
@@ -569,6 +570,60 @@ class TestMainDirectoryProcessing(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(os.listdir(os.path.join(self.src, "fssm")), ["current.fssm"])
         self.assertTrue(os.path.isfile(os.path.join(self.src, "obsolete.dxbc")))
+
+    def test_program_counts_separate_containers_from_payloads(self):
+        # BL-5: a container is one carved file, a program is one tag-0x0D payload. Five containers, six payloads:
+        # the vertex shader carries two (its ES and VS hardware variants), as 195 of the corpus' containers do.
+        es = make_fssm(version=0x0101, instructions=[(0x100, S_ENDPGM)])
+        vs = make_fssm(version=0x0102, instructions=[(0x100, S_ENDPGM)])
+        one = make_dxbc([(b"DXIL", make_xdat({0x0D: make_xbch(make_fssm())}))])
+        two = make_dxbc([(b"DXIL", make_xdat_list([(0x0D, make_xbch(es)), (0x0D, make_xbch(vs))]))])
+        for name, data in (("vertex", two), ("geometry", one), ("unstaged", one), ("blank", one), ("numbered", one)):
+            with open(os.path.join(self.src, name + ".dxbc"), "wb") as f:
+                f.write(data)
+        index = os.path.join(self.src, "index.json")
+        # Three ways an entry names no stage: no field, an empty one, and one that is not a string.
+        with open(index, "w", encoding="utf-8") as f:
+            json.dump([{"file": "vertex.dxbc", "stage": "vs"}, {"file": "geometry.dxbc", "stage": "gs"},
+                       {"file": "unstaged.dxbc"}, {"file": "blank.dxbc", "stage": ""},
+                       {"file": "numbered.dxbc", "stage": 7}], f)
+        stages = shader_stage_manifest.shader_stages(index, "file", ".dxbc")
+        self.assertEqual(stages, {"vertex": "vs", "geometry": "gs", "unstaged": None, "blank": None, "numbered": None})
+
+        result = subprocess.run([sys.executable, "-I", TOOL, self.src, "--carve-index", index],
+                                capture_output=True, text=True, errors="replace")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("programs: 6 tag-0x0D payloads in 5 containers, 1 containers with more than one "
+                      "(--payload last is the one unpacked)", result.stdout)
+        self.assertIn("  gs: 1 containers, 1 payloads, 0 with more than one", result.stdout)
+        self.assertIn("  vs: 1 containers, 2 payloads, 1 with more than one", result.stdout)
+        # A row the carve index gives no stage is counted, under one heading, not dropped, guessed or split by the
+        # way its stage is missing: three lines for the breakdown, no fourth for "" or 7.
+        self.assertIn("  stage unknown: 3 containers, 3 payloads, 0 with more than one", result.stdout)
+        breakdown = [line for line in result.stdout.splitlines() if line.startswith("  ") and " containers, " in line]
+        self.assertEqual(len(breakdown), 3, breakdown)
+        # The file written for the two-payload container is still one program: the last payload.
+        with open(os.path.join(self.src, "fssm", "vertex.fssm"), "rb") as f:
+            self.assertEqual(f.read(), vs)
+
+        with open(os.path.join(self.src, "fssm_index.json"), encoding="utf-8") as f:
+            rows = json.load(f)
+        counts = fssm_unpack.program_counts(rows, stages)
+        self.assertEqual(counts, {"vs": {"containers": 1, "programs": 2, "multi_payload": 1},
+                                  "gs": {"containers": 1, "programs": 1, "multi_payload": 0},
+                                  None: {"containers": 3, "programs": 3, "multi_payload": 0}})
+
+    def test_program_counts_without_a_carve_index_have_no_stage_breakdown(self):
+        two = make_dxbc([(b"DXIL", make_xdat_list([(0x0D, make_xbch(make_fssm(version=0x0101))),
+                                                   (0x0D, make_xbch(make_fssm(version=0x0102)))]))])
+        with open(os.path.join(self.src, "pair.dxbc"), "wb") as f:
+            f.write(two)
+        result = subprocess.run([sys.executable, "-I", TOOL, self.src], capture_output=True, text=True,
+                                errors="replace")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("programs: 2 tag-0x0D payloads in 1 containers, 1 containers with more than one",
+                      result.stdout)
+        self.assertNotIn("stage unknown", result.stdout)
 
     def test_main_rejects_invalid_fssm_magic(self):
         bad_payload = b"JUNK\x01\x01" + bytes(58)

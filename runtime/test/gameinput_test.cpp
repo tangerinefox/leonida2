@@ -1693,12 +1693,14 @@ void test_haptic_motors(IGameInput* input) {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     // Only virtual pads: no real controller on the test machine may show up.
     for (const char* hint : {SDL_HINT_JOYSTICK_HIDAPI, SDL_HINT_JOYSTICK_RAWINPUT, SDL_HINT_JOYSTICK_WGI,
                              SDL_HINT_JOYSTICK_GAMEINPUT, SDL_HINT_XINPUT_ENABLED, SDL_HINT_JOYSTICK_DIRECTINPUT})
         SDL_SetHintWithPriority(hint, "0", SDL_HINT_OVERRIDE);
     set_env("LEONIDA_GAMEINPUT_THREAD", "0");
+    set_env("LEONIDA_KEYBOARD_PAD", nullptr);
+    set_env("LEONIDA_INPUT_SCRIPT", nullptr);
     set_env("LEONIDA_DS_TRIGGERS", nullptr);
     set_env("LEONIDA_DS_LIGHTBAR", nullptr);
     set_env("LEONIDA_RUMBLE", nullptr);
@@ -1714,6 +1716,38 @@ int main() {
 
     IGameInput* input = nullptr;
     check(create(&input) == S_OK && input, "GameInputCreate returns an instance");
+    if (argc == 2 && std::strcmp(argv[1], "--input-script") == 0) {
+        if (!input) return 1;
+        // Only the X after byte 63 is due now. Its later entry must not cancel it.
+        set_env("LEONIDA_INPUT_SCRIPT",
+                "start@3600,start@3600,start@3600,start@3600,start@3600,start@3600, X@0 \t,x@3600,"
+                "unknown@0,a@,a@x,,a@-0.1,a@nan,a@inf,a@1e999,a@0tail, ,");
+        set_env("LEONIDA_KEYBOARD_PAD", "1");
+        rt::gameinput::set_keyboard_source(fake_key_down, fake_focus);
+        rt::gameinput::set_cursor_source(fake_cursor);
+        g_focus = true;
+        g_keys[VK_BACK] = true;
+        rt::gameinput::reload_config();
+        rt::gameinput::poll();
+        const auto buttons = pad_state(input, nullptr).buttons;
+        const auto expected = GameInputGamepadX | GameInputGamepadB;
+        check((buttons & expected) == expected, "long script: the spaced X after byte 63 and the physical B are held");
+        check((buttons & ~expected) == 0, "malformed script entries hold no extra buttons");
+        g_focus = false;
+        set_env("LEONIDA_INPUT_SCRIPT", "y@0");
+        rt::gameinput::reload_config();
+        rt::gameinput::poll();
+        check(pad_state(input, nullptr).buttons == GameInputGamepadX,
+              "scripted X survives focus loss; reload does not replace it with Y");
+        Sleep(350);
+        g_focus = true;
+        rt::gameinput::poll();
+        check(pad_state(input, nullptr).buttons == GameInputGamepadB,
+              "long script: the timed press ends while the physical key stays held");
+        input->Release();
+        std::printf("%d checks, %d failures\n", g_checks, g_failures);
+        return g_failures ? 1 : 0;
+    }
     check(create(nullptr) == E_POINTER, "GameInputCreate(nullptr) is E_POINTER");
     IUnknown* unk = nullptr;
     check(input->QueryInterface(IID_IGameInput, reinterpret_cast<void**>(&unk)) == S_OK && unk == input,

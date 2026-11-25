@@ -187,6 +187,8 @@ FIXTURES = {
     "ps_w64_a_swizzle": ("A", _a_swizzle, {}),
     "ps_w64_a_bpermute": ("A", _a_bpermute, {}),
     "ps_w64_a_uniform_vote": ("A", _a_uniform_vote, {"VKH_SGPRS": "0,0,0,0,9"}),
+    # SHADER-W64-WQM-UVOTE: the same votes on compares of scalars under s_wqm_b64 exec, exec (the same words)
+    "ps_w64_a_wqm_uniform_vote": ("A", _a_uniform_vote, {"VKH_SGPRS": "0,0,0,0,9"}),
 
     "ps_w64_a_discard": ("A", _a_discard, {}),
     "ps_w64_b_waterfall": ("B", _b_waterfall, {}),

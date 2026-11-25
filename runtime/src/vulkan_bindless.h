@@ -11,8 +11,9 @@
 //   dimension: 0 = 2D, 1 = 2D array, 2 = 3D, 3 = 1D (the translator's STORE_DIMS); class: 0 = float, 1 = uint, 2 = sint.
 //   bindings 20/21: sampled multisample 2D images / 2D arrays, 256 each (runtime SRVs).
 //   bindings 22/23 and 24/25 are their UINT and SINT equivalents on devices supporting those classes.
-// These are the default counts (BindlessFeatures::counts). size_bindings() sizes the 2D, sampler and storage arrays
-// from the device's limits instead; the shaders declare runtime arrays, so any count works for them.
+// These are the default counts (BindlessFeatures::counts). size_bindings() sizes the sampled arrays of every
+// single-sample dimension, the samplers and the storage arrays from the device's limits instead; the shaders declare
+// runtime arrays, so any count works for them.
 //
 // A shader turns a T# or S# into an index through the hash table (descriptor_table.h) and uses that index in
 // whichever binding the instruction calls for: the sampled array of the image's dimension, or one of its storage
@@ -36,6 +37,15 @@
 // table measured 19-46x slower there at 100k entries on an RTX 2060 SUPER (vk_descriptor_bench, D3D-56, #639).
 // flush() takes the command buffer that will use the set: it uploads only the slots that changed, from a mapped
 // staging buffer, and barriers the copy before the draws. The table at creation is empty until that first flush.
+//
+// When device-local memory runs out (a title that fills VRAM), a new generation's table goes to HOST_VISIBLE memory
+// instead: slower lookups beat no table. Released generations are kept as spares (at most max_spares) and reused,
+// pool and buffers, by the next replacing flush, so steady churn allocates nothing. If a generation still cannot be
+// made, flush() rewrites the current table in place when every submission that could read it is done, and otherwise
+// degrades: the descriptors are written, the table keeps its last uploaded contents (keys added since find the
+// fallback, index 0; keys rebound since keep their previous index, whose views stay alive; removed indices are not
+// given out again meanwhile) and the change waits for a later flush. A flush never fails the submission for want of
+// memory (last_flush_degraded(), degraded_flushes()).
 //
 // Not thread-safe: the owner serialises calls.
 
@@ -196,8 +206,13 @@ struct SetLayout {
 };
 
 // What size_bindings() grows to where the device's limits allow. At 32-64 bytes a descriptor the whole set is then
-// 3-6 MiB (93793 descriptors on an RTX 5070).
+// 5-10 MiB (about 160000 descriptors on an RTX 5070).
 inline constexpr std::uint32_t max_2d_images = 65536;
+// The other single-sample dimensions: a title streams far more cube maps and texture arrays (and 1D lookup
+// textures) than the 1024 and 256 of the defaults, each distinct T# of one taking its own index.
+inline constexpr std::uint32_t max_2d_array_images = 16384;
+inline constexpr std::uint32_t max_3d_images = 4096;
+inline constexpr std::uint32_t max_1d_images = 4096;
 inline constexpr std::uint32_t max_storage_indices = 4096;  // in each storage array, at most its dimension's images
 // A full D3D12 shader-visible sampler heap (2048) and room for literal and static S#s, within what the device can
 // create (maxSamplerAllocationCount, at least 4000) less the samplers that are not in the set.
@@ -212,8 +227,9 @@ inline constexpr std::uint32_t growth_headroom = 64;
 // standalone samplers do not, though they count in an update-after-bind pool.
 //   1. The default counts, or as much of them as the device holds: samplers, then storage, then 2D images.
 //   2. The MS pairs that fit beside them (limit_ms_bindings, which may turn classes off).
-//   3. Growth towards the maximums above, in the same order, within maxPerSetDescriptors. That limit only says
-//      what is sure to work (vkGetDescriptorSetLayoutSupport may allow more), so it never shrinks step 1.
+//   3. Growth towards the maximums above, in the same order, then the 2D-array, 3D and 1D images, within
+//      maxPerSetDescriptors. That limit only says what is sure to work (vkGetDescriptorSetLayoutSupport may allow
+//      more), so it never shrinks step 1.
 // A storage array holds the smaller of the storage count and its dimension's images: add_image never gives a
 // storage view an index past the sampled array. The other bindings keep their default counts.
 // layout_supported, when given, answers vkGetDescriptorSetLayoutSupport for set 0 at the counts in its argument:
@@ -243,10 +259,16 @@ inline bool size_bindings(BindlessFeatures& features, const VkPhysicalDeviceLimi
     auto& counts = features.counts;
     counts = default_counts();
     std::uint32_t images = 1, samplers = 1, storage = 1;
+    std::uint32_t arrays = counts[sampled_binding(ImageDimension::dim_2d_array)];
+    std::uint32_t volumes = counts[sampled_binding(ImageDimension::dim_3d)];
+    std::uint32_t lines = counts[sampled_binding(ImageDimension::dim_1d)];
     // Until the end the 2D storage arrays are not capped by the 2D images, which grow after them: capping can only
     // take descriptors away.
     const auto apply = [&](bool final) {
         counts[sampled_binding(ImageDimension::dim_2d)] = images;
+        counts[sampled_binding(ImageDimension::dim_2d_array)] = arrays;
+        counts[sampled_binding(ImageDimension::dim_3d)] = volumes;
+        counts[sampled_binding(ImageDimension::dim_1d)] = lines;
         counts[sampler_binding] = samplers;
         for (std::uint32_t d = 0; d < 4; ++d) {
             const auto dimension = ImageDimension(d);
@@ -305,6 +327,9 @@ inline bool size_bindings(BindlessFeatures& features, const VkPhysicalDeviceLimi
     grow(samplers, std::max(samplers, std::min(max_samplers, creatable)), growth_headroom, set_limit);
     grow(images, std::max(images, max_2d_images), growth_headroom, set_limit);
     grow(storage, std::max(storage, max_storage_indices), growth_headroom, set_limit);
+    grow(arrays, std::max(arrays, max_2d_array_images), growth_headroom, set_limit);
+    grow(volumes, std::max(volumes, max_3d_images), growth_headroom, set_limit);
+    grow(lines, std::max(lines, max_1d_images), growth_headroom, set_limit);
     apply(true);
     return full;
 }
@@ -313,14 +338,18 @@ inline bool size_bindings(BindlessFeatures& features, const VkPhysicalDeviceLimi
 
 class BindlessSet {
 public:
+    // `descriptor_hash` is the finalizer the shaders of this device probe the table with (descriptor_table.h); it is
+    // handed to the table before its first key is inserted, so every insert, lookup and rehash agrees with them.
     BindlessSet(PFN_vkGetDeviceProcAddr get, VkDevice device, const VkPhysicalDeviceMemoryProperties& memory,
-                BindlessFeatures features = {})
-        : device_(device), memory_(memory), features_(features) {
+                BindlessFeatures features = {}, DescriptorHashKind descriptor_hash = DescriptorHashKind::fnv1a)
+        : device_(device), memory_(memory), features_(features), table_(64, descriptor_hash) {
         ok_ = vk_.load(get, device) && create_layout() && create_fallbacks() && create_table_buffers() && fill();
     }
 
     ~BindlessSet() {
         release_retired();
+        for (Generation& spare : spares_) destroy(spare);
+        spares_.clear();
         destroy(table_buffers_);
         if (fallback_sampler_) vk_.vkDestroySampler(device_, fallback_sampler_, nullptr);
         for (const VkImageView view : fallback_views_) vk_.vkDestroyImageView(device_, view, nullptr);
@@ -414,16 +443,20 @@ public:
     void update_image(ImageDimension dimension, std::uint32_t index, VkImageView sampled, VkImageLayout sampled_layout,
                       const StorageViews& storage = {}, std::uint32_t sampled_class = 0) {
         const auto& used = image_used_[std::uint32_t(dimension)];
-        if (index && index < used.size() && used[index])
+        if (index && index < used.size() && used[index] == in_use)
             write_image(dimension, index, sampled, sampled_layout, storage, sampled_class);
     }
 
     // Returns the index to the fallback and frees it. The caller removes the image's keys with erase_key() first.
+    // While the table has changes the GPU's copy lacks (an erased key may still name the index there), the index is
+    // held until a flush has brought the table up to date (one that did not degrade), so that no new image answers
+    // that key; otherwise it is free at once.
     void remove_image(ImageDimension dimension, std::uint32_t index) {
         auto& used = image_used_[std::uint32_t(dimension)];
-        if (!index || index >= used.size() || !used[index]) return;
+        if (!index || index >= used.size() || used[index] != in_use) return;
         write_image(dimension, index, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL, {}, 0);
-        used[index] = 0;
+        used[index] = table_dirty_ ? held : 0;
+        if (table_dirty_) held_images_.push_back({dimension, index});
     }
 
     // 0 when the sampler array is full.
@@ -434,9 +467,10 @@ public:
     }
 
     void remove_sampler(std::uint32_t index) {
-        if (!index || index >= sampler_used_.size() || !sampler_used_[index]) return;
+        if (!index || index >= sampler_used_.size() || sampler_used_[index] != in_use) return;
         write_sampler(index, fallback_sampler_);
-        sampler_used_[index] = 0;
+        sampler_used_[index] = table_dirty_ ? held : 0;
+        if (table_dirty_) held_samplers_.push_back(index);
     }
 
     // T# and S# keys to the indices above: the table of binding 2 (descriptor_table.h). Changes reach the shaders
@@ -479,7 +513,10 @@ public:
     void table_upload_result(bool submitted) {
         if (!upload_in_flight_) return;
         upload_in_flight_ = false;
-        if (submitted) return;
+        if (submitted) {
+            table_on_gpu_ = true;  // the current buffers hold a table the GPU was given
+            return;
+        }
         table_dirty_ = true;
         force_full_upload_ = true;
     }
@@ -488,17 +525,42 @@ public:
     // the set are recorded after it. When flush_replaces_table() was true this starts a new generation (table
     // buffers, descriptor set, binding 2 and every descriptor written so far) and puts the previous one on the retire
     // list, stamped `retire_ticket`: the owner's number for "every submission made so far", which release_retired()
-    // compares with what has completed. False when the new generation cannot be made: the set then still has the
-    // table as of the last flush.
-    bool flush(VkCommandBuffer command_buffer, std::uint64_t retire_ticket = 0) {
+    // compares with what has completed.
+    // When the new generation cannot be made (no memory for its buffers or descriptor pool) and `completed_ticket` is
+    // given, it is asked what has completed: the generations retired up to there are released (to the spares) and
+    // the generation is tried again; when everything up to `retire_ticket` is done, nothing reads the current table
+    // and it is rewritten in place if it is large enough. Failing both, the flush degrades instead of failing: the
+    // descriptors are written in place, as on a flush that does not replace the table (add_image writes new indices,
+    // which no key of the GPU's table reaches; remove_image writes the fallback, and the index stays held until a
+    // flush that does not degrade), the table keeps what it had, and its changes wait for a later flush
+    // (last_flush_degraded()). False only without a command buffer, when nothing can be recorded.
+    bool flush(VkCommandBuffer command_buffer, std::uint64_t retire_ticket = 0,
+               const std::function<std::uint64_t()>& completed_ticket = {}) {
+        if (!command_buffer) return false;
         bool replaced = false;
         bool written = true;
         const bool must_replace = flush_replaces_table();
+        last_flush_degraded_ = false;
         if (table_dirty_ || !table_uploaded_) written = upload_table(command_buffer, retire_ticket, replaced);
+        if (!written && must_replace && completed_ticket) {
+            const std::uint64_t completed = completed_ticket();
+            if (!retired_.empty()) {
+                release_retired(completed);
+                written = upload_table(command_buffer, retire_ticket, replaced);
+            }
+            if (!written && completed >= retire_ticket) written = rewrite_table_in_place(command_buffer);
+        }
         last_flush_replaced_ = replaced;
-        // The new generation could not be made: the current set is the one running work reads, so its descriptors are
-        // not written in place either. The pending writes and the table's changes stay for the next flush.
-        if (!written && must_replace) return false;
+        // Degrading keeps what the current buffers hold, so only once they hold a table that reached the queue: a
+        // first flush under full memory, or one after a failed submission of the only upload, has nothing on the GPU
+        // (word 0 is the probe mask) and refuses as before (review of #64).
+        if (!written && must_replace && !table_on_gpu_) return false;
+        if (!written && must_replace) {
+            // The current set is the one running work reads, and the table's changes may move or rebind live keys:
+            // they stay for a later flush, and keys added since find the fallback until then.
+            ++degraded_flushes_;
+            last_flush_degraded_ = true;
+        }
         for (const Pending& pending : pending_) {
             if (pending.binding >= shadow_.size() || pending.index >= shadow_[pending.binding].size()) continue;
             shadow_[pending.binding][pending.index] = pending.info;
@@ -521,17 +583,29 @@ public:
         }
         pending_.clear();
         pending_slots_.clear();
-        return written;
+        if (!last_flush_degraded_) {
+            // The table this flush leaves on the GPU names no removed index any more: they can be given out again.
+            for (const auto& [dimension, index] : held_images_) image_used_[std::uint32_t(dimension)][index] = 0;
+            for (const std::uint32_t index : held_samplers_) sampler_used_[index] = 0;
+            held_images_.clear();
+            held_samplers_.clear();
+        }
+        return true;
     }
 
-    // Frees the generations (table buffers and descriptor set) that flush() retired with a ticket up to `completed`.
-    // The default frees all of them: when nothing submitted before the last flush() still runs.
+    // Releases the generations (table buffers and descriptor set) that flush() retired with a ticket up to
+    // `completed`: up to max_spares of them, large enough for the table, are kept for the next replacing flush to
+    // reuse; the others are freed. The default releases all of them: when nothing submitted before the last flush()
+    // still runs.
     void release_retired(std::uint64_t completed = UINT64_MAX) {
         std::size_t kept = 0;
         for (auto& generation : retired_) {
             if (generation.ticket <= completed) {
-                destroy(generation.buffers);
-                if (generation.pool) vk_.vkDestroyDescriptorPool(device_, generation.pool, nullptr);
+                if (spares_.size() < max_spares && generation.pool && generation.buffers.staging.mapped &&
+                    generation.buffers.table.size >= table_.size_bytes())
+                    spares_.push_back(generation);
+                else
+                    destroy(generation);
             } else {
                 retired_[kept++] = generation;
             }
@@ -548,11 +622,32 @@ public:
     std::uint64_t generations_made() const { return generations_made_; }
     std::size_t retired_count() const { return retired_.size(); }
 
+    // Released generations kept for reuse, and how many replacing flushes reused one instead of allocating. One: the
+    // current generation and a spare are the two a replacing flush has at its peak anyway (the new one, and the one
+    // retired until its work completes), and a grown table can be large (64 MiB at a million slots).
+    static constexpr std::size_t max_spares = 1;
+    std::size_t spare_count() const { return spares_.size(); }
+    std::uint64_t spares_reused() const { return spares_reused_; }
+    // Flushes that could not make the generation they needed and kept the previous table (see flush()), and whether
+    // the last one did; flushes that rewrote the table in place instead, every submission being done.
+    std::uint64_t degraded_flushes() const { return degraded_flushes_; }
+    bool last_flush_degraded() const { return last_flush_degraded_; }
+    std::uint64_t in_place_rewrites() const { return in_place_rewrites_; }
+    // Table buffers placed in HOST_VISIBLE memory because the DEVICE_LOCAL allocation failed.
+    std::uint64_t table_host_fallbacks() const { return table_host_fallbacks_; }
+    // What the last generation that could not be made failed to get: "table buffer", "staging buffer" or
+    // "descriptor set" (nullptr before any failure), and the Vulkan result of that call.
+    const char* last_failure() const { return last_failure_; }
+    VkResult last_failure_result() const { return last_failure_result_; }
+    // Bytes of the current table buffer (the table grows by doubling its slots: size_bytes() of table()).
+    std::size_t table_buffer_bytes() const { return table_buffers_.table.size; }
+
 private:
     struct Functions {
 #define LEONIDA_BINDLESS_FUNCTIONS(X)                                                                          \
     X(vkCreateDescriptorSetLayout) X(vkDestroyDescriptorSetLayout) X(vkCreateDescriptorPool)                   \
-    X(vkDestroyDescriptorPool) X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets) X(vkCreateBuffer)         \
+    X(vkDestroyDescriptorPool) X(vkResetDescriptorPool) X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets)  \
+    X(vkCreateBuffer)                                                                                          \
     X(vkDestroyBuffer) X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory) X(vkAllocateMemory)              \
     X(vkFreeMemory) X(vkMapMemory) X(vkCreateImage) X(vkDestroyImage) X(vkGetImageMemoryRequirements)          \
     X(vkBindImageMemory) X(vkCreateImageView) X(vkDestroyImageView) X(vkCreateSampler) X(vkDestroySampler)     \
@@ -583,12 +678,20 @@ private:
         VkDeviceMemory memory = VK_NULL_HANDLE;
         void* mapped = nullptr;
         std::size_t size = 0;
+        bool device_local = false;  // the memory is DEVICE_LOCAL
     };
 
     // The table and the mapped staging copy the CPU writes before vkCmdCopyBuffer moves the changes.
     struct TableBuffers {
         TableBuffer table;    // DEVICE_LOCAL when the device has it; what binding 2 names
         TableBuffer staging;  // HOST_VISIBLE | HOST_COHERENT
+    };
+
+    struct Generation {  // what a replaced table leaves for release_retired()
+        TableBuffers buffers;
+        VkDescriptorPool pool = VK_NULL_HANDLE;  // owns the descriptor set
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        std::uint64_t ticket = 0;
     };
 
     struct Pending {
@@ -598,6 +701,9 @@ private:
     };
 
     static constexpr std::uint32_t dimensions = 6, classes = 3;
+    // image_used_ and sampler_used_: 0 free, in_use, or held (removed while the table was dirty: free after the next
+    // flush that does not degrade).
+    static constexpr std::uint8_t in_use = 1, held = 2;
 
     // The first free index in [begin, end), marked used; 0 when there is none.
     static std::uint32_t allocate(std::vector<std::uint8_t>& used, std::uint32_t begin, std::uint32_t end) {
@@ -645,19 +751,33 @@ private:
         pool_info.maxSets = 1;
         pool_info.poolSizeCount = pool_size_count_;
         pool_info.pPoolSizes = pool_sizes_.data();
-        if (vk_.vkCreateDescriptorPool(device_, &pool_info, nullptr, &pool) != VK_SUCCESS) {
+        if (const VkResult result = vk_.vkCreateDescriptorPool(device_, &pool_info, nullptr, &pool);
+            result != VK_SUCCESS) {
             pool = VK_NULL_HANDLE;
+            note_failure("descriptor set", result);
             return false;
         }
+        if (allocate_set(pool, set)) return true;
+        vk_.vkDestroyDescriptorPool(device_, pool, nullptr);
+        pool = VK_NULL_HANDLE;
+        return false;
+    }
+
+    bool allocate_set(VkDescriptorPool pool, VkDescriptorSet& set) const {
         VkDescriptorSetAllocateInfo set_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
         set_info.descriptorPool = pool;
         set_info.descriptorSetCount = 1;
         set_info.pSetLayouts = &layout_;
-        if (vk_.vkAllocateDescriptorSets(device_, &set_info, &set) == VK_SUCCESS) return true;
-        vk_.vkDestroyDescriptorPool(device_, pool, nullptr);
-        pool = VK_NULL_HANDLE;
+        const VkResult result = vk_.vkAllocateDescriptorSets(device_, &set_info, &set);
+        if (result == VK_SUCCESS) return true;
         set = VK_NULL_HANDLE;
+        note_failure("descriptor set", result);
         return false;
+    }
+
+    void note_failure(const char* what, VkResult result) const {
+        last_failure_ = what;
+        last_failure_result_ = result;
     }
 
     // Writes every descriptor written so far (the shadow) into the current set, one update per run of written
@@ -753,36 +873,53 @@ private:
         return vk_.vkCreateSampler(device_, &sampler, nullptr, &fallback_sampler_) == VK_SUCCESS;
     }
 
-    bool create(TableBuffer& out, std::size_t bytes, bool device_local, bool* got_device_local = nullptr) const {
+    // device_local: the table (DEVICE_LOCAL, else HOST_VISIBLE when the device has no such type or that heap is out
+    // of memory); otherwise the mapped staging buffer (HOST_VISIBLE | HOST_COHERENT).
+    bool create(TableBuffer& out, std::size_t bytes, bool device_local) {
+        constexpr VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        const char* what = device_local ? "table buffer" : "staging buffer";
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = bytes;
         info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                      (device_local ? VK_BUFFER_USAGE_TRANSFER_DST_BIT : VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
         TableBuffer made;
         made.size = bytes;
-        if (vk_.vkCreateBuffer(device_, &info, nullptr, &made.buffer) != VK_SUCCESS) return false;
+        if (const VkResult result = vk_.vkCreateBuffer(device_, &info, nullptr, &made.buffer); result != VK_SUCCESS) {
+            made.buffer = VK_NULL_HANDLE;
+            note_failure(what, result);
+            return false;
+        }
         VkMemoryRequirements requirements{};
         vk_.vkGetBufferMemoryRequirements(device_, made.buffer, &requirements);
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocation.allocationSize = requirements.size;
-        allocation.memoryTypeIndex =
-            device_local ? memory_type(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
-                         : memory_type(requirements.memoryTypeBits,
-                                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        if (device_local && allocation.memoryTypeIndex == 0xffffffffu)
-            allocation.memoryTypeIndex = memory_type(requirements.memoryTypeBits,
-                                                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        if (got_device_local)
-            *got_device_local = allocation.memoryTypeIndex != 0xffffffffu &&
-                                (memory_.memoryTypes[allocation.memoryTypeIndex].propertyFlags &
+        const auto allocate = [&](std::uint32_t type) {
+            if (type == 0xffffffffu) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+            allocation.memoryTypeIndex = type;
+            const VkResult result = vk_.vkAllocateMemory(device_, &allocation, nullptr, &made.memory);
+            if (result != VK_SUCCESS) made.memory = VK_NULL_HANDLE;
+            return result;
+        };
+        const std::uint32_t local = device_local
+                                        ? memory_type(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+                                        : 0xffffffffu;
+        VkResult result = device_local ? allocate(local) : allocate(memory_type(requirements.memoryTypeBits, host));
+        if (result != VK_SUCCESS && device_local) {
+            const std::uint32_t fallback = memory_type(requirements.memoryTypeBits, host);
+            if (fallback != local) {
+                result = allocate(fallback);
+                if (result == VK_SUCCESS && local != 0xffffffffu) ++table_host_fallbacks_;
+            }
+        }
+        if (result == VK_SUCCESS) {
+            made.device_local = (memory_.memoryTypes[allocation.memoryTypeIndex].propertyFlags &
                                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
-        bool ready = allocation.memoryTypeIndex != 0xffffffffu &&
-                     vk_.vkAllocateMemory(device_, &allocation, nullptr, &made.memory) == VK_SUCCESS &&
-                     vk_.vkBindBufferMemory(device_, made.buffer, made.memory, 0) == VK_SUCCESS;
-        if (ready && !device_local)
-            ready = vk_.vkMapMemory(device_, made.memory, 0, VK_WHOLE_SIZE, 0, &made.mapped) == VK_SUCCESS;
-        if (!ready) {
+            result = vk_.vkBindBufferMemory(device_, made.buffer, made.memory, 0);
+        }
+        if (result == VK_SUCCESS && !device_local)
+            result = vk_.vkMapMemory(device_, made.memory, 0, VK_WHOLE_SIZE, 0, &made.mapped);
+        if (result != VK_SUCCESS) {
+            note_failure(what, result);
             destroy(made);
             return false;
         }
@@ -801,17 +938,55 @@ private:
         destroy(buffers.table);
     }
 
+    void destroy(Generation& generation) const {
+        destroy(generation.buffers);
+        if (generation.pool) vk_.vkDestroyDescriptorPool(device_, generation.pool, nullptr);  // frees the set
+        generation.pool = VK_NULL_HANDLE;
+        generation.set = VK_NULL_HANDLE;
+    }
+
+    // A generation for a table of `bytes`: a spare when one is large enough (its pool reset for a fresh set), else
+    // new buffers and a new pool. Spares too small for the table are freed: the table never shrinks.
+    bool make_generation(std::size_t bytes, TableBuffers& buffers, VkDescriptorPool& pool, VkDescriptorSet& set) {
+        std::size_t kept = 0;
+        bool found = false;
+        for (Generation& spare : spares_) {
+            if (spare.buffers.table.size < bytes || spare.buffers.staging.size < bytes) {
+                destroy(spare);
+                continue;
+            }
+            if (!found && vk_.vkResetDescriptorPool(device_, spare.pool, 0) == VK_SUCCESS &&
+                allocate_set(spare.pool, set)) {
+                buffers = spare.buffers;
+                pool = spare.pool;
+                found = true;
+                ++spares_reused_;
+                continue;
+            }
+            spares_[kept++] = spare;
+        }
+        spares_.resize(kept);
+        if (found) return true;
+        TableBuffers made;
+        if (!create(made.table, bytes, true) || !create(made.staging, bytes, false) || !make_set(pool, set)) {
+            destroy(made);
+            return false;
+        }
+        buffers = made;
+        return true;
+    }
+
     bool create_table_buffers() {
         const std::size_t bytes = table_.size_bytes();
         TableBuffers made;
-        bool device_local = false;
-        if (!create(made.table, bytes, true, &device_local) || !create(made.staging, bytes, false)) {
+        if (!create(made.table, bytes, true) || !create(made.staging, bytes, false)) {
             destroy(made);
             return false;
         }
         table_buffers_ = made;
-        table_device_local_ = device_local;
+        table_device_local_ = made.table.device_local;
         table_uploaded_ = false;  // the first flush() uploads it, in the command buffer that will use it
+        table_on_gpu_ = false;
         table_dirty_ = existing_entries_changed_ = false;
         return true;
     }
@@ -829,15 +1004,11 @@ private:
             TableBuffers larger;
             VkDescriptorPool pool = VK_NULL_HANDLE;
             VkDescriptorSet set = VK_NULL_HANDLE;
-            bool device_local = false;
-            if (!create(larger.table, bytes, true, &device_local) || !create(larger.staging, bytes, false) ||
-                !make_set(pool, set)) {
-                destroy(larger);
-                return false;
-            }
-            table_device_local_ = device_local;
+            if (!make_generation(bytes, larger, pool, set)) return false;
+            table_device_local_ = larger.table.device_local;
             retired_.push_back({table_buffers_, pool_, set_, retire_ticket});
             table_buffers_ = larger;
+            table_on_gpu_ = false;  // until this generation's upload is submitted (table_upload_result)
             pool_ = pool;
             set_ = set;
             write_table_binding(table_buffers_.table.buffer);
@@ -890,6 +1061,25 @@ private:
         table_dirty_ = existing_entries_changed_ = false;
         table_uploaded_ = true;
         force_full_upload_ = false;
+        return true;
+    }
+
+    // The whole table into the current generation's buffers, for a flush whose new generation could not be made,
+    // once every submission that could read the current table is done (flush()). False when the table outgrew them.
+    bool rewrite_table_in_place(VkCommandBuffer command_buffer) {
+        const std::size_t bytes = table_.size_bytes();
+        if (bytes > table_buffers_.table.size || bytes > table_buffers_.staging.size || !table_buffers_.staging.mapped)
+            return false;
+        table_.take_changes();  // all of it goes
+        // Nothing still runs that copies from the staging buffer or reads the table.
+        table_.write_to_buffer(table_buffers_.staging.mapped);
+        copy_table_range(command_buffer, 0, bytes);
+        record_table_barrier(command_buffer);
+        upload_in_flight_ = true;
+        table_dirty_ = existing_entries_changed_ = false;
+        table_uploaded_ = true;
+        force_full_upload_ = false;
+        ++in_place_rewrites_;
         return true;
     }
 
@@ -1026,25 +1216,30 @@ private:
     bool fallbacks_ready_ = false;
     std::array<std::vector<std::uint8_t>, dimensions> image_used_;
     std::vector<std::uint8_t> sampler_used_;
+    std::vector<std::pair<ImageDimension, std::uint32_t>> held_images_;  // removed, not yet free (remove_image)
+    std::vector<std::uint32_t> held_samplers_;
     std::vector<Pending> pending_;
     std::unordered_map<std::uint64_t, std::size_t> pending_slots_;  // binding and index -> place in pending_
-    DescriptorTable table_{64};
+    DescriptorTable table_;  // 64 slots, and the device's hash kind, from the constructor
     TableBuffers table_buffers_;
     bool table_uploaded_ = false;  // the table's current contents are in table_buffers_.table
+    bool table_on_gpu_ = false;    // an upload into the current table buffers reached the queue (degrading is safe)
     bool table_device_local_ = false;
     bool table_dirty_ = false;    // the table differs from the buffer
     bool existing_entries_changed_ = false;  // ... and not only by entries added
     bool upload_in_flight_ = false;   // a copy is recorded, not yet known to have reached the queue
     bool force_full_upload_ = false;  // the last submit failed: rebuild the whole table on the next flush
-    struct Generation {  // what a replaced table leaves for release_retired()
-        TableBuffers buffers;
-        VkDescriptorPool pool = VK_NULL_HANDLE;  // owns the descriptor set
-        VkDescriptorSet set = VK_NULL_HANDLE;
-        std::uint64_t ticket = 0;
-    };
     std::vector<Generation> retired_;
+    std::vector<Generation> spares_;  // released generations kept for reuse (release_retired)
     std::uint64_t generations_made_ = 0;
     bool last_flush_replaced_ = false;
+    bool last_flush_degraded_ = false;
+    std::uint64_t spares_reused_ = 0;
+    std::uint64_t degraded_flushes_ = 0;
+    std::uint64_t in_place_rewrites_ = 0;
+    std::uint64_t table_host_fallbacks_ = 0;
+    mutable const char* last_failure_ = nullptr;
+    mutable VkResult last_failure_result_ = VK_SUCCESS;
     std::array<VkDescriptorPoolSize, bindless::bindings.size()> pool_sizes_{};
     std::uint32_t pool_size_count_ = 0;
     // Every descriptor written to the set (the table's binding aside), to fill the next generation's set.

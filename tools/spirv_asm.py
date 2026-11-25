@@ -29,6 +29,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
+from report_paths import same_report_path  # noqa: E402
 from spirv_asm_tables import (  # noqa: E402
     BIT_ENUMS, GLSL_STD_450, INSTRUCTIONS, NONSEMANTIC_DEBUGPRINTF,
     NONSEMANTIC_SHADER_DEBUGINFO_100, VALUE_ENUMS,
@@ -689,6 +690,8 @@ def main(argv=None) -> int:
     ap.add_argument("--target-env", default="vulkan1.2", choices=sorted(TARGET_ENV_VERSION),
                     help="target SPIR-V / Vulkan environment (default: vulkan1.2)")
     args = ap.parse_args(argv)
+    if same_report_path(args.src, args.out):
+        ap.error("output must not overwrite the source")
     try:
         with open(args.src, encoding="utf-8", newline="") as f:
             text = f.read()

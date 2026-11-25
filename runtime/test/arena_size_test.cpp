@@ -29,7 +29,10 @@ int request_without_limits() {
     CHECK(decide_arena_size("1", none).bytes == 16 * MiB);
     CHECK(decide_arena_size("0", none).bytes == 16 * MiB);
     CHECK(decide_arena_size("lots", none).bytes == 16 * MiB);
+    CHECK(decide_arena_size("-5", none).bytes == 16 * MiB);
+    CHECK(decide_arena_size("-99999999999999999999", none).bytes == 16 * MiB);
     CHECK(decide_arena_size("99999", none).bytes == 4095 * MiB);
+    CHECK(decide_arena_size("99999999999999999999", none).bytes == 4095 * MiB);
     const ArenaSize s = decide_arena_size("3000", none);
     CHECK(s.bytes == 3000 * MiB && s.requested == 3000 * MiB && s.capped == arena_cap_none);
     return 0;

@@ -375,9 +375,10 @@ section 3.5a), and the console list has methods well past the PC tail: 71, 73, 8
 FSR DLL.
 
 Slot 148 matters beyond the builder: the address it returns is written by the CPU and passed unchanged to the GPU
-as a root SRV address, so console upload memory has the same address for the CPU and the GPU. A replacement must
-return memory whose CPU pointer is also a valid GPU address (for this layer: inside the arena of
-[d3d12_vulkan.md §3.3](d3d12_vulkan.md)).
+as a root SRV address, so console upload memory has the same address for the CPU and the GPU. On a PC the two
+address spaces differ, so `d3d12_xs_device.cpp` carves a bump arena out of persistently-mapped UPLOAD-heap
+buffers: the title writes the mapped memory and the six root descriptor setters and the IA/SO view setters
+translate the CPU pointer to the chunk's buffer device address before forwarding.
 
 The function at `0xd580` uses the 71/73 pair instead of the slot-146 barrier when the byte at RVA `0xd773c` is set.
 That byte is one of seven bools at `0xd7738`–`0xd773e` in zero-initialised `.bss`. The only accesses to them in
@@ -764,6 +765,12 @@ Queues and fences are wrapped the same way.
   object implements but the proxy does not model is logged once and refused.
 - **The refused tail.** A slot past the public chain, up to the end of the proxy's own table (128 queue and
   64 fence slots, every one a thunk), logs its first four argument words once and returns `E_NOTIMPL`.
+- **Fence slot 12.** The one served slot past the chain. The retail executable calls it as
+  `(value, descriptor, flags)` and reads the return as a pointer to the fence's 64-bit completed value: it
+  compares that value with `~0` (device removed) and subtracts the value it waits for. The proxy returns a
+  per-fence mirror. Completion events refresh it immediately. A 10 ms wait timeout also refreshes it if the
+  fence rewinds below the pending event's threshold. Slot 12 and the CPU `Signal` (10) refresh it synchronously.
+  The descriptor's second word is a code pointer, which is not called.
 - **The guard region.** Each table sits at the end of the first page of a 64 KiB reservation, and the rest
   of that reservation is never committed. A slot past the table therefore faults on the vtable read itself,
   inside the reservation, and a vectored handler logs the slot before the fault goes on. A vtable read that
@@ -830,7 +837,7 @@ command object.
 | Item | Why it is blocked |
 |---|---|
 | `PresentX` | No slot, signature, plane struct or swapchain/plane parameters. Prior art gives only names, the 2-plane/8-view limits and four flag names. |
-| `CreateCommandQueueX` | No slot or parameter layout; only the UMD message and an inferred shape. |
+| `CreateCommandQueueX` | No slot or parameter layout; only the UMD message and an inferred shape. The retail title calls device slot 48 as (desc, riid, out) with a 32-byte desc (#6954), which differs from the (pDesc, pShaderQueueParams, riid, out) shape inferred above. |
 | `SuspendX` / `ResumeX` | No slot or signature. |
 | Xbox queue/list/fence/allocator slot deviations | No runtime binary and no game executable; the package has no queue, fence or allocator client, and its only command-list client is the BVH builder. |
 | Builder's list field `+0x350` | Read once (`0x1d877`) and not explained by the inline buffer of section 3.5a, which covers `+0x18`, `+0x28`, `+0x30`, `+0x140`, `+0x141`, `+0x344` and `+0x544`. |

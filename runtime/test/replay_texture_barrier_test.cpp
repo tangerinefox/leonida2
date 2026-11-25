@@ -3,6 +3,9 @@
 //   - A range in one layout is one piece: emit makes no heap allocation for it.
 //   - A range whose mips are in different layouts is one piece for each mip: all of them are in the same call,
 //     each with its own old layout.
+//   - A barrier into UNDEFINED from a defined layout keeps each piece's layout (Vulkan has no transition into
+//     UNDEFINED) and the tracker's; a piece that was never used records nothing, and the next barrier, from
+//     UNDEFINED, discards as before.
 // vkCmdPipelineBarrier2 is a function that records its barriers. No Vulkan loader, GPU or game data.
 #ifndef VK_NO_PROTOTYPES
 #define VK_NO_PROTOTYPES
@@ -68,6 +71,20 @@ void VKAPI_CALL record_barrier2(VkCommandBuffer, const VkDependencyInfo* info) {
         g_barriers.push_back(info->pImageMemoryBarriers[i]);
 }
 
+// What zero-filling an image that was never used calls: its own layout changes and the clear. Counted, not recorded.
+std::uint32_t g_fill_calls = 0;
+
+void VKAPI_CALL count_barrier(VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags,
+                              std::uint32_t, const VkMemoryBarrier*, std::uint32_t, const VkBufferMemoryBarrier*,
+                              std::uint32_t, const VkImageMemoryBarrier*) {
+    ++g_fill_calls;
+}
+
+void VKAPI_CALL count_clear(VkCommandBuffer, VkImage, VkImageLayout, const VkClearColorValue*, std::uint32_t,
+                            const VkImageSubresourceRange*) {
+    ++g_fill_calls;
+}
+
 int failures = 0;
 void expect(bool ok, const char* what) {
     if (!ok) {
@@ -95,7 +112,11 @@ int main() {
     image.aspects = VK_IMAGE_ASPECT_COLOR_BIT;
     image.width = image.height = 64;
     image.mip_levels = mips;
-    const auto resolve = [&](ResourceId r) { return r == id ? &image : nullptr; };
+    // A second image that nothing has used yet: the tracker has it in UNDEFINED.
+    constexpr ResourceId unused_id = 2;
+    ResourceBinding unused = image;
+    unused.image = reinterpret_cast<VkImage>(std::uintptr_t(0x2000));
+    const auto resolve = [&](ResourceId r) { return r == id ? &image : r == unused_id ? &unused : nullptr; };
 
     ReplayFunctions vk{};
     vk.pipeline_barrier2 = record_barrier2;
@@ -168,6 +189,119 @@ int main() {
                    "stages and access of each barrier");
             expect(tracker.layout(id, mip) == attachment, "the tracker has the new layout for each mip");
         }
+    }
+
+    // 3. Into UNDEFINED from a defined layout (the retail title ends a depth buffer's use this way before its memory
+    //    is aliased, #984): Vulkan has no transition into UNDEFINED, so each mip keeps the layout it is in and the
+    //    barrier only orders the accesses. The tracker keeps those layouts.
+    const auto kept = [&](std::uint32_t mip) { return mip == 1 ? transfer_src : attachment; };
+    {
+        for (std::uint32_t mip = 0; mip < mips; ++mip)
+            tracker.set(id, {VK_IMAGE_ASPECT_COLOR_BIT, mip, 1, 0, 1}, kept(mip));
+        g_barriers.clear();
+        g_calls = 0;
+        CommandList list;
+        expect(list.barrier(TextureBarrier{y::render_target, y::none, a::render_target, a::no_access,
+                                           l::render_target, l::undefined, id, all, 0}) &&
+                   list.close(),
+               "record a barrier into UNDEFINED");
+        PreparedList prepared;
+        expect(prepare(list, resolve, vk, prepared) == ReplayResult::success, "prepare a barrier into UNDEFINED");
+        emit(prepared, cb, vk, &tracker);
+        expect(g_calls == 1 && g_barriers.size() == mips, "into UNDEFINED: one call with a barrier for each mip");
+        for (const VkImageMemoryBarrier2& b : g_barriers) {
+            expect(b.newLayout != VK_IMAGE_LAYOUT_UNDEFINED, "no transition into VK_IMAGE_LAYOUT_UNDEFINED");
+            expect(b.oldLayout == b.newLayout && b.oldLayout == kept(b.subresourceRange.baseMipLevel),
+                   "into UNDEFINED: each mip keeps its own layout");
+            expect(b.srcStageMask != 0 && b.srcAccessMask != 0, "into UNDEFINED: the earlier accesses are ordered");
+        }
+        for (std::uint32_t mip = 0; mip < mips; ++mip)
+            expect(tracker.layout(id, mip) == kept(mip), "into UNDEFINED: the tracker keeps the layout");
+    }
+
+    // 4. The discard flag changes nothing there: a release has nothing to discard into.
+    {
+        g_barriers.clear();
+        g_calls = 0;
+        CommandList list;
+        expect(list.barrier(TextureBarrier{y::render_target, y::none, a::render_target, a::no_access,
+                                           l::render_target, l::undefined, id, all, texture_barrier_discard}) &&
+                   list.close(),
+               "record a barrier into UNDEFINED with the discard flag");
+        PreparedList prepared;
+        expect(prepare(list, resolve, vk, prepared) == ReplayResult::success,
+               "prepare a barrier into UNDEFINED with the discard flag");
+        emit(prepared, cb, vk, &tracker);
+        expect(g_calls == 1 && g_barriers.size() == mips, "into UNDEFINED with discard: a barrier for each mip");
+        for (const VkImageMemoryBarrier2& b : g_barriers)
+            expect(b.oldLayout == b.newLayout && b.oldLayout == kept(b.subresourceRange.baseMipLevel),
+                   "into UNDEFINED with discard: each mip keeps its own layout");
+        for (std::uint32_t mip = 0; mip < mips; ++mip)
+            expect(tracker.layout(id, mip) == kept(mip), "into UNDEFINED with discard: the tracker keeps the layout");
+    }
+
+    // 5. Without a tracker the layout kept is the one the barrier names.
+    {
+        g_barriers.clear();
+        g_calls = 0;
+        CommandList list;
+        expect(list.barrier(TextureBarrier{y::render_target, y::none, a::render_target, a::no_access,
+                                           l::render_target, l::undefined, id, all, 0}) &&
+                   list.close(),
+               "record a barrier into UNDEFINED for an untracked replay");
+        PreparedList prepared;
+        expect(prepare(list, resolve, vk, prepared) == ReplayResult::success,
+               "prepare a barrier into UNDEFINED for an untracked replay");
+        emit(prepared, cb, vk, nullptr);
+        expect(g_calls == 1 && g_barriers.size() == 1 && g_barriers[0].oldLayout == attachment &&
+                   g_barriers[0].newLayout == attachment,
+               "into UNDEFINED without a tracker: the named layout is kept");
+    }
+
+    // 6. An image nothing has used is released without a Vulkan call: there is no access to order, and it is not
+    //    zero-filled first, as it would be on its way into any other layout. It stays in UNDEFINED.
+    {
+        tracker.track(unused_id, unused, VK_IMAGE_LAYOUT_UNDEFINED);
+        vk.pipeline_barrier = count_barrier;
+        vk.clear_color_image = count_clear;
+        g_barriers.clear();
+        g_calls = 0;
+        CommandList list;
+        expect(list.barrier(TextureBarrier{y::render_target, y::none, a::render_target, a::no_access,
+                                           l::render_target, l::undefined, unused_id, all, 0}) &&
+                   list.close(),
+               "record a barrier into UNDEFINED for an unused image");
+        PreparedList prepared;
+        expect(prepare(list, resolve, vk, prepared) == ReplayResult::success,
+               "prepare a barrier into UNDEFINED for an unused image");
+        emit(prepared, cb, vk, &tracker);
+        expect(g_calls == 0 && g_barriers.empty(), "an unused image is released without a barrier");
+        expect(g_fill_calls == 0, "an unused image is not zero-filled to be released");
+        for (std::uint32_t mip = 0; mip < mips; ++mip)
+            expect(tracker.layout(unused_id, mip) == VK_IMAGE_LAYOUT_UNDEFINED, "an unused image stays in UNDEFINED");
+        vk.pipeline_barrier = nullptr;
+        vk.clear_color_image = nullptr;
+    }
+
+    // 7. After a release D3D12 has the next barrier start from UNDEFINED: one barrier that discards from whatever
+    //    layouts the mips are in (case 3 left them in two), and the tracker has the new layout.
+    {
+        g_barriers.clear();
+        g_calls = 0;
+        CommandList list;
+        expect(list.barrier(TextureBarrier{y::none, y::render_target, a::no_access, a::render_target, l::undefined,
+                                           l::render_target, id, all, 0}) &&
+                   list.close(),
+               "record the barrier that follows a release");
+        PreparedList prepared;
+        expect(prepare(list, resolve, vk, prepared) == ReplayResult::success,
+               "prepare the barrier that follows a release");
+        emit(prepared, cb, vk, &tracker);
+        expect(g_calls == 1 && g_barriers.size() == 1 && g_barriers[0].oldLayout == VK_IMAGE_LAYOUT_UNDEFINED &&
+                   g_barriers[0].newLayout == attachment,
+               "after a release: one barrier from UNDEFINED into the new layout");
+        for (std::uint32_t mip = 0; mip < mips; ++mip)
+            expect(tracker.layout(id, mip) == attachment, "after a release: the tracker has the new layout");
     }
 
     if (failures) return 1;

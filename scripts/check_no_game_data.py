@@ -21,7 +21,8 @@ under a budget per checked file (64 MiB expanded, 10,000 members), so a zip bomb
 reported as archives that can't be checked.
 
 Prints one line per match, `<path>: <format>` (`<format> in <archive> (<member>)` for a match inside an archive), and
-exits 1 if there is any. Standard library only, no game files.
+exits 1 if there is any. It exits 2 when a file cannot be read or git cannot list the tracked files (outside a
+repository, or git not installed). Standard library only, no game files.
 """
 import bz2
 import gzip
@@ -41,6 +42,7 @@ MAGICS = (
     ("RPF9 archive", 0, b"9FPR"),
     ("RPF9 archive", 0, b"RPF9"),
     ("TTPF texture pool", 0, b"TTPF"),
+    ("local BCPack predictor profile", 0, b"BCPHIST1"),
     ("RAGE resource", 0, b"RSC7"),
     ("RAGE resource", 0, b"RSC8"),
     ("RAGE resource", 0, b"RSCC"),
@@ -257,6 +259,14 @@ def tracked_files(root):
     return [os.path.join(root, p) for p in out.decode("utf-8", "surrogateescape").split("\0") if p]
 
 
+def git_error(e):
+    """One line on why git could not list the files: the first line git printed, or the OS error."""
+    if isinstance(e, subprocess.CalledProcessError):
+        lines = (e.stderr or b"").decode("utf-8", "replace").splitlines()
+        return next((line.strip() for line in lines if line.strip()), f"exit status {e.returncode}")
+    return e.strerror or str(e)
+
+
 def check(paths, unreadable=None):
     """[(path, format)] for every regular file in `paths` that starts like game data.
 
@@ -285,7 +295,14 @@ def display(path):
 
 
 def main(argv):
-    paths = argv or tracked_files(os.getcwd())
+    if argv:
+        paths = argv
+    else:
+        try:
+            paths = tracked_files(os.getcwd())
+        except (OSError, subprocess.CalledProcessError) as e:
+            print(f"check_no_game_data: cannot list the tracked files with git: {git_error(e)}", file=sys.stderr)
+            return 2  # not 1: that is the 'game data found' code
     unreadable = []
     found = check(paths, unreadable)
     for path, name in found:

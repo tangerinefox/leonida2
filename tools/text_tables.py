@@ -20,8 +20,8 @@ Conversation data pairs a dialogue key with its line labels as ``<ROOT>AU_<XXXX>
 labels has the audio waves ``<key>_01`` .. ``<key>_<N>`` (the stream names ``awc_names.py`` matches): wave ``_01``
 speaks the first label. Joining a label's hash to the string tables gives each wave its subtitle in every language.
 
-The tables carry no language field. Each table's language is guessed from its script (kana, hangul, CJK, Cyrillic)
-or, for Latin scripts, from distinctive letters and common words, and is ``xx`` when nothing decides it. Spanish and
+The tables carry no language field. Each table's language is guessed from its script (kana, hangul, CJK, Cyrillic,
+Arabic) or, for Latin scripts, from distinctive letters and common words, and is ``xx`` when nothing decides it. Spanish and
 Chinese ship two variants each; markers split them into ``es-ES``/``es-419`` and ``zh-Hant``/``zh-Hans`` (the plain
 code when a table has no marker).
 
@@ -96,7 +96,8 @@ ES_ES = set("vosotros vosotras os vuestro vuestra vuestros vuestras habéis hac�
 ES_419 = set("ustedes carro celular ahorita chamba güey wey platicar chido neta pinche cuate computadora manejar "
              "órale acá chingar chingada pendejo mande güera".split())
 SCRIPTS = (("ja", re.compile(r"[\u3040-\u30ff]")), ("ko", re.compile(r"[\uac00-\ud7af]")),
-           ("zh", re.compile(r"[\u4e00-\u9fff]")), ("ru", re.compile(r"[\u0400-\u04ff]")))
+           ("zh", re.compile(r"[\u4e00-\u9fff]")), ("ru", re.compile(r"[\u0400-\u04ff]")),
+           ("ar", re.compile(r"[\u0600-\u06ff]")))
 LATIN_WORD = re.compile(r"[a-zà-ÿąćęłńóśźż]+")
 UNKNOWN = "xx"
 

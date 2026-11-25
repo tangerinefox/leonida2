@@ -335,6 +335,12 @@ class TypesAndMasksTest(unittest.TestCase):
 
         with self.assertRaisesRegex(spv.InterfaceError, "nonzero Component"):
             nested.location_masks(1)
+        mat2 = spv.AggregateType("matrix", (vec2,), 2)
+        with self.assertRaisesRegex(spv.InterfaceError, "matrix cannot start at a nonzero Component"):
+            mat2.location_masks(2)
+        arr_mat = spv.AggregateType("array", (mat2,), 2)
+        with self.assertRaisesRegex(spv.InterfaceError, "matrix cannot start at a nonzero Component"):
+            arr_mat.location_masks(2)
 
     def test_aggregate_type_expansion_limits(self):
         f32 = spv.NumericType("f", 32)
@@ -786,6 +792,49 @@ class TypeAndConstantResolutionTest(unittest.TestCase):
         b.variable(spv.STORAGE_OUTPUT, t, location=0)
         with self.assertRaisesRegex(spv.InterfaceError, "cyclic or excessively deep"):
             b.reflect()
+
+        # Cached intermediate type at exact MAX_TYPE_DEPTH boundary (31 + 32 + 1 == 64) still passes.
+        b_exact = SpirvBuilder("vs")
+        t = b_exact.float_type(32)
+        for _ in range(31):
+            t = b_exact.array(t, 1)
+        mid_exact = t
+        for _ in range(spv.MAX_TYPE_DEPTH - 32):
+            t = b_exact.array(t, 1)
+        b_exact.variable(spv.STORAGE_OUTPUT, mid_exact, location=0)
+        b_exact.variable(spv.STORAGE_OUTPUT, t, location=1)
+        self.assertEqual(len(b_exact.reflect().outputs), 2)
+
+        # Cached intermediate types must not allow total depth to exceed MAX_TYPE_DEPTH or cause RecursionError.
+        b_cached = SpirvBuilder("vs")
+        t = b_cached.float_type(32)
+        for _ in range(40):
+            t = b_cached.array(t, 1)
+        mid = t
+        for _ in range(40):
+            t = b_cached.array(t, 1)
+        b_cached.variable(spv.STORAGE_OUTPUT, mid, location=0)
+        b_cached.variable(spv.STORAGE_OUTPUT, t, location=1)
+        with self.assertRaisesRegex(spv.InterfaceError, "cyclic or excessively deep"):
+            b_cached.reflect()
+
+        # Struct whose members build a long chain of cached types must raise InterfaceError, not RecursionError.
+        b_chain = SpirvBuilder("vs")
+        t = b_chain.float_type(32)
+        chain = []
+        for _ in range(spv.MAX_TYPE_DEPTH + 10):
+            t = b_chain.array(t, 1)
+            chain.append(t)
+        s = b_chain.struct_type(*chain)
+        b_chain.variable(spv.STORAGE_OUTPUT, s, location=0)
+        with self.assertRaisesRegex(spv.InterfaceError, "cyclic or excessively deep"):
+            b_chain.reflect()
+
+        # Matrix at nonzero Component is rejected during module reflection as well.
+        b_mat = SpirvBuilder("vs")
+        b_mat.variable(spv.STORAGE_OUTPUT, b_mat.matrix(2, 2, 32), location=0, component=2)
+        with self.assertRaisesRegex(spv.InterfaceError, "matrix cannot start at a nonzero Component"):
+            b_mat.reflect()
 
 
 class EntryPointSelectionTest(unittest.TestCase):

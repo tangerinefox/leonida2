@@ -59,7 +59,8 @@ The first boot with the executable settles most of this: the dry-run report show
 - **Factory**: one object for the process, never freed (its reference count does not drop below one).
   `SetDebugFlags` and `SetCpuAffinity` are stored only (a console core mask means nothing on the host).
   `SetStagingBufferSize` accepts 0, 16, 20, 24, 28 and 32 MiB, fails with `E_DSTORAGE_INVALID_STAGING_BUFFER_SIZE`
-  otherwise and with `E_DSTORAGE_STAGING_BUFFER_LOCKED` while a queue or file exists; there is no staging buffer.
+  otherwise and with `E_DSTORAGE_STAGING_BUFFER_LOCKED` while a queue or file exists. This records the
+  console setting. Host transform scratch is allocated on demand.
   `GetStats` reports the counts the shim keeps (queues per priority, requests, bytes, files, errors, zlib
   inflates: `TotalDecompressionRequestCount` grows when a zlib request's inflate starts, which is after its checks
   passed and its source was read, `PendingDecompressionRequestCount` is the inflates running, and
@@ -92,16 +93,12 @@ The first boot with the executable settles most of this: the dry-run report show
      (`E_DSTORAGE_INVALID_FILE_HANDLE`);
   3. reserved option bits (`E_DSTORAGE_RESERVED_FIELDS`), then the source type against the queue's
      (`E_DSTORAGE_INVALID_SOURCE_TYPE`);
-  4. BCPack mode above 7, swizzle mode above 4 (`_INVALID_BCPACK_MODE`, `_INVALID_SWIZZLE_MODE`), then BCPack or
-     swizzle, with or without zlib, then physical pages (`E_NOTIMPL`, logged once: later PRs);
-  5. an `IntermediateSize` (`_INVALID_INTERMEDIATE_SIZE`: it is the size between the inflate and the BCPack decode,
-     so only a zlib + BCPack request has one), a `DestinationSize` other than `SourceSize` without zlib, or not
-     larger than `SourceSize` with it (`_INVALID_DESTINATION_SIZE`: the rule `dstorageerr.h` gives for that code,
-     and what `DSTORAGE_REQUEST` says of `DestinationSize`), more than 1 GiB in total, then a buffer over 32 MiB
-     (`_REQUEST_TOO_LARGE` for both: `DSTORAGE_REQUEST` allows a buffer over 32 MiB only with 64 KiB or 2 MiB pages,
-     which are not implemented yet; the source is never larger than the destination here, so the destination's
-     limit covers it), then a zlib file request whose `FileOffset` is not 16-byte aligned (`_INVALID_FILE_OFFSET`,
-     as `DSTORAGE_REQUEST` requires);
+  4. a BCPack mode above 7 or swizzle mode above 4. BC2 is reserved here for a future decoder (`E_NOTIMPL`);
+  5. a nonzero `IntermediateSize` is required only for combined zlib and BCPack. Compressed
+     requests require a larger output than source, complete BC blocks and complete swizzle groups.
+     Raw requests require equal source and destination sizes. File offsets used for decompression
+     must be 16-byte aligned. The total memory bound is 1 GiB, with ordinary buffers limited to
+     32 MiB apiece. Page lists can exceed the 32 MiB bound;
   6. a null destination, a null source (memory) or a null file (`E_INVALIDARG`), a closed file (`_FILE_NOT_OPEN`);
   7. a zero size: a success that touches no memory (an assumption: the reference does not say);
   8. a range past the end of the file (`E_DSTORAGE_END_OF_FILE`), then a destination or source the process cannot
@@ -114,8 +111,7 @@ The first boot with the executable settles most of this: the dry-run report show
   buffer and inflated there by the runtime's RFC 1950 inflater (`leonida::zlib_inflate` in
   `runtime/src/shader_library.h`, the one the shader library uses for XBCH blobs). The result is copied to
   `Destination` only when it is exactly `DestinationSize` bytes, so a stream that fails leaves the destination as it
-  was, and a memory source inside its own destination (in-place loading) inflates correctly. Both buffers are at
-  most 32 MiB (step 5). Step 5 also means a stream of stored blocks only, which is larger than what it holds, is
+  was, and a memory source inside its own destination (in-place loading) inflates correctly. For ordinary destinations, step 5 also means a stream of stored blocks only, which is larger than what it holds, is
   refused with `_INVALID_DESTINATION_SIZE` before it is read, as the documented rule implies. The stream is a zlib
   stream: the two header bytes, the deflate blocks (stored, fixed and
   dynamic Huffman), the Adler-32 of the result. Bytes after the Adler-32 are not read, so a `SourceSize` rounded up
@@ -152,21 +148,66 @@ The first boot with the executable settles most of this: the dry-run report show
   worker; later enqueues are dropped and recorded as `E_DSTORAGE_QUEUE_CLOSED`. The last `Release` closes the same
   way, so a queue released with requests in flight finishes them first.
 
-## Not done yet (later PRs)
+## Streamed texture requests
 
-- **BCPack** (`BcpackMode`; `tools/bcpack.py` is the reference decoder), then **swizzle** (`SwizzleMode`). The
-  decode order is DEFLATE, BCPack, swizzle; with both zlib and BCPack `IntermediateSize` is the size between them
-  (the inflate's output, the BCPack decoder's input), and `FileOffset` must be 16-byte aligned. Each becomes a stage
-  after `inflate_request`'s inflate and before its destination write, so the request checks above stay where they
-  are.
-- **Physical pages** (`SourceIsPhysicalPages`, `DestinationIsPhysicalPages`): arrays of 64 KiB page numbers from
-  `XMemAllocatePhysicalPages`; needs the `xmem` shim to translate a page number to the address it mapped.
-- **GPU memory**: the console API has no GPU destinations of its own (memory is unified, so a destination is an
-  address). An address inside memory the Vulkan layer backs will need its write routed to that memory. The destination
-  is written in two places, both in `execute_request` (`read_file_range` for a file source, `guarded_move` for a
-  memory source), so that change stays inside the request path.
-- **Parallel reads**: the worker reads one request at a time. Overlapped reads with in-order retirement of
-  notifications would keep the order guarantee.
+- Two adjacent file-backed transforms can read and decode concurrently into private buffers. A queue has
+  one ordered publisher. Mutable memory inputs, page-list resolution, status slots, events, fences, and
+  overlapping destinations retain their enqueue order. At most two helpers run across all queues and each
+  assisted request has a 16 MiB eligibility limit. A shared 64 MiB window covers private source,
+  intermediate, output and page-number buffers across queues. Each transform releases its previous input
+  and each request releases the final buffer at retirement. A valid request larger than the window runs
+  alone, bounded by the ABI maximum of two 1 GiB payloads. Raw buffer reads use no private staging.
+  With tracing enabled, `ds-staging` reports the process peak reservation and return to zero. The figure
+  excludes title destinations, allocator overhead and fixed decoder stacks. `LEONIDA_DSTORAGE_WORKERS=1`
+  restores serial execution.
+  Inflate expands LZ matches in bulk and batches Adler-32 reductions. `LEONIDA_DSTORAGE_FAST_INFLATE=0`
+  selects the original bytewise path. BCPack indexes the entropy model by the high slot byte.
+  `LEONIDA_DSTORAGE_FAST_BCPACK=0` selects the scalar bucket search.
+- With `LEONIDA_DSTORAGE_TRACE=1`, `tools/dstorage_census.py <trace>` totals retirements, errors and bytes
+  by shape, plus microseconds spent reading, inflating, decoding BC blocks, unshuffling, publishing and
+  notifying. `--from-file story000` starts the measurement at the first story archive request and counts
+  every subsequent retirement across queues. Stage times can overlap. Each failure reports its process-wide count
+  for that HRESULT even with request tracing disabled.
+- The worker inflates zlib to `IntermediateSize` when BCPack follows, rebuilds standard BC blocks, then
+  applies the optional DirectStorage macro-unshuffle. Each stage validates its entire output before a destination
+  write. Typed zlib errors propagate through the combined path.
+- `runtime/src/bcpack.cpp` ports the interleaved rANS and strict block rebuilders from `tools/bcpack.py` for
+  BC1, BC3, BC4, BC5, BC6H and BC7. The predictor window holds 256 blocks. The build generates the lookup
+  tables from the existing codec modules. Damaged streams and missing predictors or inconsistent blocks
+  exceeding the reference tolerance give `E_DSTORAGE_DECOMPRESSION_ERROR`. BC2 has no reference decoder.
+  The runtime accepts the reference's fitted BC1/3/4/5 predictors for streamed art.
+  `LEONIDA_DSTORAGE_FITTED=0` requires confirmed entries. Fitted blocks can differ from console output.
+  The runtime stage of `make_game.py` generates `<work>/shaders/bcpack/history.bcph` locally.
+  The loader finds it relative to the shader folder selected by `LEONIDA_SHADERS` or the packaged
+  `shader_path.txt`. `LEONIDA_DSTORAGE_HISTORY` overrides the path; a value of `0` disables external history.
+  The load diagnostic reports BC6H row coverage and BC7 endpoint/index field coverage. Standalone generation:
+
+  ```sh
+  python3 -I tools/build_dstorage_history.py <game-root> --out <work>/shaders/bcpack/history.bcph
+  ```
+
+  The fitter follows the physical block offset of packed 2D mips, including those that start past the first
+  256 blocks of a stream. It combines adjacent mips from the same layer with full-stream index anchor
+  and shared-p-bit constraints. A shared p-bit can relate low red endpoint bits even when its sibling
+  mip supplies only the leading bits. These local fits preserve the recorded precision and exact reference
+  bits. A profile can still lack endpoint values or exceed the reference consistency tolerance. Such a request reports a decompression error before publication.
+- The four swizzle modes interleave stripes from request-wide component planes into 16 KiB (mode 1) or
+  32 KiB (modes 2–4) groups. The enum names give the successive stripe widths. The shipped BC4 sample
+  separates its endpoint planes from indices across the inflated source. The title's compute shader does
+  the within-group shuffle and the stored blocks already follow the texture layout.
+  [Microsoft texture shuffling sample](https://learn.microsoft.com/en-us/samples/microsoft/xbox-gdk-samples/directstoragetextureshuffling/)
+- Physical destinations and memory sources use 64 KiB pages with byte offsets in the first page.
+  The worker reads the page list after submit, resolves and commits every page before copying, and holds
+  xmem's map lock through the transfer. A successful scatter notifies the texture refill tracker at
+  each mapped VA. Ordinary GPU alias destinations use the paired CPU view. Raw file writes into title
+  memory go through the shared kernel-write helper, which pins each kernel write, commits first-touch pages
+  on an access error and retries once. The superseded `LEONIDA_DSTORAGE_PIN_FILE_READS` switch is retired.
+- `LEONIDA_DSTORAGE_EXTENDED=0` restores the old refusal for page lists, BCPack and nonzero swizzle.
+  `LEONIDA_DSTORAGE_TRACE=1` logs each retired request, worker timestamp, options, source file/range, sizes, destination,
+  cancellation and HRESULT. Queue pointers connect those lines to status slots, fences and events.
+  Failures always log the full request. An access violation also records the CPU mapping and protection.
+  With startup tracing enabled, `dstorage_failure` events share its clock with title exceptions.
+  Pool fill lines report whether a successful texture upload used any nonzero detiled bytes.
 
 ## Tests
 
@@ -181,9 +222,13 @@ synthetic streams only: two made with Python's `zlib` (level 9: one dynamic-Huff
 fixed-Huffman block) from text the test rebuilds, and stored-block streams the test builds, one of them a stored
 block followed by the dynamic one. They are read from a file and from memory (also in place); a bad header, a
 preset dictionary, a reserved block type, a truncated stream, an Adler-32 mismatch, a stream shorter and one longer
-than `DestinationSize`, a stored stream larger than its result, an unaligned offset, an `IntermediateSize`, zlib with
-BCPack or swizzle (`E_NOTIMPL`), an unreadable source and an unwritable destination each get their code, a failed
+than `DestinationSize`, a stored stream larger than its result, an unaligned offset, an invalid `IntermediateSize`, an unreadable source and an unwritable destination each get their code, a failed
 stream leaves its destination untouched, and the decompression statistics count them.
+
+The extended tests encode hand-built lane symbols with `tests/test_bcpack.py`. All six modes are compared
+byte-for-byte with the Python decoder through the queue, both bare and zlib-wrapped. Additional cases cover
+truncation, all four swizzle patterns across three groups, an invalid second page, late page-list updates,
+a decode crossing two reversed pages, both CPU refill ranges, gather, and event/status ordering.
 
 ## Sources and licences
 

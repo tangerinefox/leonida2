@@ -401,6 +401,8 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.limit is not None and a.limit < 1:
         ap.error("--limit must be at least 1")
+    if a.entry is not None and a.limit is not None:
+        ap.error("--limit cannot be combined with --entry")
     try:
         report = pi.inspect(a.cache)
     except (OSError, ValueError) as e:

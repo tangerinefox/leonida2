@@ -58,6 +58,13 @@ in the image.
   `insertq`/`extrq` are bit-field operations on the low quadword. `cpu_emulation_test` checks each form against the
   CPU on a host that has it and against the handler on one that does not (an i7-10700K: all four lacking, all checks
   pass).
+- The CLZERO routine is too hot for the #UD path: one exception and two `VirtualQuery` calls per 64-byte line. On an
+  i9-13900K the routine held one thread at ~99% for the whole boot (sampled: `VirtualQuery` under
+  `cpu_emulation::apply`) and the title presented ~3 frames a second. On a CPU without CLZERO the loader therefore
+  rewrites the routine's loops before any image code runs (`runtime/src/clzero_patch.h`): each of the two loop shapes
+  (6 + 4 sites) jumps to a stub within 2 GiB of the image that zeroes the line with eight 8-byte stores and keeps the
+  loop's registers and flags. Same boot afterwards: 164,946 PresentX in 300 s against 869 in 420 s, no CLZERO left on
+  the #UD path. `LEONIDA_CLZERO_PATCH=0` keeps the emulation; `clzero_patch_test` runs both shapes on any CPU.
 - The CPUID sites see the host's vendor, family and features, not the console's. What the game does with the
   answers is not measured here.
 

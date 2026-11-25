@@ -7,6 +7,7 @@ This happened to ``d3d12_indirect_rt_test``; the only intentional exception is
 """
 import os
 import re
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -70,10 +71,24 @@ class CTestRegistrationTest(unittest.TestCase):
         wrong = whole_test_skips_not_77(self.cmake, ROOT / "runtime")
         self.assertEqual(wrong, [], f"SKIP followed by a return code other than 77: {wrong}")
 
+    def test_a_named_skip_code_counts_by_its_value(self):
+        cmake = ("add_executable(a_test test/a_test.cpp)\nadd_test(NAME a COMMAND a_test)\n"
+                 "set_tests_properties(a PROPERTIES SKIP_RETURN_CODE 77)\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "test" / "a_test.cpp"
+            src.parent.mkdir()
+            for value, want in (("77", []), ("0", [("test/a_test.cpp:3", "kSkip")])):
+                src.write_text(f"constexpr int kSkip = {value};\nstd::printf(\"SKIP: none\\n\");\nreturn kSkip;\n",
+                               encoding="utf-8", newline="\n")
+                self.assertEqual(whole_test_skips_not_77(cmake, Path(tmp)), want, value)
+            src.write_text('std::printf("SKIP: none\\n");\nreturn kUnknown;\n', encoding="utf-8", newline="\n")
+            self.assertEqual(whole_test_skips_not_77(cmake, Path(tmp)), [("test/a_test.cpp:2", "kUnknown")])
+
 
 def whole_test_skips_not_77(cmake_text, runtime_dir):
     """[(source:line, code)] for a SKIP print directly followed by `return N;` (N != 77) in the sources of a test
-    registered with SKIP_RETURN_CODE 77. A SKIP print with no return right after it skips one section, not the test."""
+    registered with SKIP_RETURN_CODE 77. A SKIP print with no return right after it skips one section, not the test.
+    A named code (`return kSkip;`) counts by the value of its `constexpr int` in the same source."""
     skip_tests = set(re.findall(r"set_tests_properties\(\s*([A-Za-z0-9_]+)\s+PROPERTIES[^)]*SKIP_RETURN_CODE\s+77",
                                 cmake_text))
     commands = dict(re.findall(r"add_test\(\s*NAME\s+([A-Za-z0-9_]+)\s+COMMAND\s+\"?([A-Za-z0-9_]+)", cmake_text))
@@ -87,12 +102,14 @@ def whole_test_skips_not_77(cmake_text, runtime_dir):
             path = runtime_dir / src
             if not path.is_file():
                 continue
-            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            text = path.read_text(encoding="utf-8", errors="replace")
+            named = dict(re.findall(r"\bconstexpr\s+int\s+(\w+)\s*=\s*(\d+)\s*;", text))
+            lines = text.splitlines()
             for i, line in enumerate(lines):
                 if not re.search(r'(printf|puts)\(\s*"SKIP', line):
                     continue
                 after = re.match(r"\s*return\s+(\w+)\s*;", lines[i + 1]) if i + 1 < len(lines) else None
-                if after and after.group(1) != "77":
+                if after and named.get(after.group(1), after.group(1)) != "77":
                     wrong.append((f"{src}:{i + 2}", after.group(1)))
     return wrong
 

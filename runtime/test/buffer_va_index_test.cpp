@@ -73,6 +73,14 @@ void fixed_cases() {
     index.insert(0x3000, 0, 4);
     check(index.size() == 2 && at(index, 0) == 0 && at(index, 0x3000) == 0, "a null VA or an empty range is not indexed");
 
+    // The padding of an old title window can contain the next index view's start.
+    // Replay needs one backing from that start through the last index, even when the view grows.
+    Index windows;
+    windows.insert(0x10000, 0x10000, 1);
+    check(windows.covers(0x1fff0, 16) && !windows.covers(0x1fff0, 18), "whole view must fit in its window");
+    windows.insert(0x10000, 0x20000, 2);
+    check(windows.covers(0x1fff0, 18) && !windows.covers(0x1fff0, UINT64_MAX), "grown window and an oversized view");
+
     // Aliasing placed buffers: a long one with two short ones inside it. The nearest start that holds the VA wins.
     Index alias;
     alias.insert(0x10000, 0x10000, 10);  // [0x10000, 0x20000)

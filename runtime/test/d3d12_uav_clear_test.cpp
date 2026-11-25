@@ -74,6 +74,10 @@ int conversion_checks() {
     EXPECT((element(VK_FORMAT_R4G4B4A4_UNORM_PACK16, true, floats(1.0f, 0, 0, 0)) == V{0x00, 0xf0}));
     EXPECT((element(VK_FORMAT_R4G4B4A4_UNORM_PACK16, true, floats(0, 0, 0, 1.0f)) == V{0x0f, 0x00}));
     EXPECT((element(VK_FORMAT_R4G4B4A4_UNORM_PACK16, true, floats(0, 1.0f, 0.2f, 0)) == V{0x30, 0x0f}));
+    // B5G6R5, B5G5R5A1 and B4G4R4A4 as ClearUnorderedAccessViewFloat leaves them on WARP.
+    EXPECT((element(VK_FORMAT_R5G6B5_UNORM_PACK16, true, floats(0.25f, 0.75f, 0.4f, 0.6f)) == V{0xec, 0x45}));
+    EXPECT((element(VK_FORMAT_A1R5G5B5_UNORM_PACK16, true, floats(0.25f, 0.75f, 0.4f, 0.6f)) == V{0xec, 0xa2}));
+    EXPECT((element(VK_FORMAT_A4R4G4B4_UNORM_PACK16, true, floats(0.25f, 0.75f, 0.4f, 0.6f)) == V{0xb6, 0x94}));
     // Half floats round to nearest even; too large is infinity; tiny values become subnormals.
     EXPECT((element(VK_FORMAT_R16_SFLOAT, true, floats(1.0f, 0, 0, 0)) == V{0x00, 0x3c}));
     EXPECT((element(VK_FORMAT_R16_SFLOAT, true, floats(-2.0f, 0, 0, 0)) == V{0x00, 0xc0}));

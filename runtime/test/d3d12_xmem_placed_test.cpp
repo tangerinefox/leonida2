@@ -1,7 +1,8 @@
 // Xbox device slot 133 (CreatePlacedResourceX) on xmem physical pages that were mapped but never touched. xmem
 // commits physical pages on first touch, so such a range is still reserved when the title places a buffer on it, and
 // the Vulkan layer's import (rt::d3d12::create_buffer_at_host_address) refuses reserved pages and answers with its
-// fallback buffer, which the CPU's writes never reach. With rt::xmem::commit_physical_range registered as the slot's
+// fallback buffer: a shadow that copies only committed pages, so a reserved page reads as zeros and a write to it
+// faults. With rt::xmem::commit_physical_range registered as the slot's
 // pages hook (rt::d3d12_xs::set_placed_at_va_pages_hook, as gta6rt does), the pages are committed first: the buffer's
 // GPU VA is the window itself and a GPU copy reads what the CPU writes there afterwards.
 // Needs VK_EXT_external_memory_host (skipped otherwise). No shaders or game data.
@@ -113,12 +114,15 @@ int run(ID3D12Device* real, void* device) {
     desc.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x1);  // the Xbox row-major word
     const auto window_va = reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(window);
 
-    // Without the hook the reserved pages are refused and the fallback answers.
+    // Without the hook the reserved pages are refused and the fallback answers. Its GPU VA is the title's address
+    // either way: the imported buffer is bound to the window (create_host_buffer: va_ = start), and the shadow keeps
+    // that VA too so the descriptors and views the title builds from it still find the buffer (89261c7ed,
+    // d3d12_existing_heap_test.cpp). The reserved state is what shows the import refused these pages.
     rt::d3d12_xs::set_placed_at_va_pages_hook(nullptr);
     {
         Ref<ID3D12Resource> fallback;
         EXPECT(place(device, window, desc, &fallback.p) == S_OK && fallback.p);
-        EXPECT(fallback->GetGPUVirtualAddress() != window_va);
+        EXPECT(fallback->GetGPUVirtualAddress() == window_va);
         EXPECT(state_is(window, MEM_RESERVE));
     }
     std::printf("%s: untouched physical pages without the hook: still reserved, fallback buffer\n", who);

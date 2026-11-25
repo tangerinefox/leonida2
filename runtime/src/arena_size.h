@@ -60,7 +60,10 @@ struct ArenaSize {
 //     invalid Vulkan, while one under 16 MiB is only small (and no conformant device reports under 1 GiB).
 inline ArenaSize decide_arena_size(const char* env, const ArenaLimits& limits, VkDeviceSize allocation_overhead = 0) {
     VkDeviceSize megabytes = kArenaDefaultMiB;
-    if (env && *env) megabytes = std::clamp<VkDeviceSize>(std::strtoull(env, nullptr, 10), kArenaMinMiB, kArenaMaxMiB);
+    // Signed, so "-5" clamps to the floor (strtoull wraps it to a huge value, which clamps to the maximum).
+    if (env && *env)
+        megabytes = VkDeviceSize(std::clamp<long long>(std::strtoll(env, nullptr, 10), (long long)kArenaMinMiB,
+                                                       (long long)kArenaMaxMiB));
     ArenaSize size;
     size.requested = size.bytes = megabytes * kArenaMiB;
     VkDeviceSize by_buffer = size.requested, by_allocation = size.requested;

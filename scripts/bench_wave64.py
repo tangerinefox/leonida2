@@ -44,7 +44,13 @@ def build(work, name, emulate, llvm_mc):
     r = subprocess.run([sys.executable, "-I", BUILD_PY, out, name], env=env, capture_output=True, text=True)
     if r.returncode:
         sys.exit(r.stdout + r.stderr)
-    return os.path.join(out, "spirv", name + ".spv")
+    spv = os.path.join(out, "spirv", name + ".spv")
+    if not os.path.isfile(spv):
+        mode = "emulated" if emulate else "native"
+        message = f"{name}: {mode} build did not produce a SPIR-V module"
+        reason = (r.stdout + r.stderr).strip()
+        sys.exit(f"{message}\n{reason}" if reason else message)
+    return spv
 
 
 def segments(spv: str) -> tuple[int, int] | None:

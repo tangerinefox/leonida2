@@ -113,7 +113,12 @@ def main():
     dest_dir = os.path.dirname(dest) or root
     fd, temp = tempfile.mkstemp(dir=dest_dir, prefix=".types-", suffix=".tmp")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+        try:
+            f = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
+        except BaseException:
+            os.close(fd)
+            raise
+        with f:
             json.dump(out, f, indent=1)
             f.flush()
             os.fsync(f.fileno())
@@ -121,6 +126,7 @@ def main():
         os.replace(temp, dest)
     except BaseException:
         try:
+            os.chmod(temp, 0o600)
             os.unlink(temp)
         except OSError:
             pass

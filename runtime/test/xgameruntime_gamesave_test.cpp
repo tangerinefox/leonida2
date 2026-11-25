@@ -10,6 +10,7 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -360,6 +361,94 @@ int main() {
         if (manual) XTaskQueueCloseHandle(manual);
         std::filesystem::remove_all(root / L"local-user" / L"first", ec);
         std::filesystem::remove_all(root / L"local-user" / L"second", ec);
+    }
+
+    // ---- a failed commit leaves the container as it was ----
+    // Another process holds blob "b" open without FILE_SHARE_DELETE, so replacing it fails in the middle of the
+    // update, after "a" was already replaced. The update must fail, undo what it already did, and leave no temporary
+    // or backup files. Closing the handle makes the same update succeed.
+    {
+        const HRESULT out_of_local = static_cast<HRESULT>(0x80830003);   // E_GS_OUT_OF_LOCAL_STORAGE
+        struct Edit {
+            const char* name;
+            const char* data;   // nullptr: delete
+        };
+        auto submit = [&](Handle container, std::vector<Edit> edits) -> HRESULT {
+            Handle u = nullptr;
+            HRESULT hr = at<Create>(save, 23)(save, container, nullptr, &u);
+            for (const Edit& e : edits) {
+                if (FAILED(hr)) break;
+                hr = e.data ? at<Write>(save, 25)(save, u, e.name, reinterpret_cast<const uint8_t*>(e.data),
+                                              std::strlen(e.data))
+                            : at<ByName>(save, 26)(save, u, e.name);
+            }
+            if (SUCCEEDED(hr)) hr = at<Submit>(save, 27)(save, u);
+            at<Close>(save, 24)(save, u);
+            return hr;
+        };
+        auto read_blob = [&](const std::filesystem::path& dir, const wchar_t* file) {
+            std::ifstream f(dir / file, std::ios::binary);
+            return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        };
+        auto file_count = [](const std::filesystem::path& dir) {
+            std::error_code count_ec;
+            int n = 0;
+            for (const auto& e : std::filesystem::directory_iterator(dir, count_ec)) {
+                (void)e;
+                ++n;
+            }
+            return n;
+        };
+
+        Handle rc = nullptr;
+        check(at<Create>(save, 16)(save, provider, "rollback", &rc) == S_OK && rc, "CreateContainer for the rollback checks");
+        const std::filesystem::path rollback_dir = root / L"local-user" / L"rollback";
+
+        // Case A: a write whose rename is blocked after an earlier write was applied.
+        check(submit(rc, {{"a", "OLD_A"}, {"b", "OLD_B"}}) == S_OK, "seed blobs a and b");
+        HANDLE hold = CreateFileW((rollback_dir / L"b").c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                  OPEN_EXISTING, 0, nullptr);
+        check(hold != INVALID_HANDLE_VALUE, "another handle holds blob b open");
+        check(submit(rc, {{"a", "NEW_A"}, {"b", "NEW_B"}}) == out_of_local, "an update whose rename of b is blocked fails");
+        check(read_blob(rollback_dir, L"a") == "OLD_A" && read_blob(rollback_dir, L"b") == "OLD_B",
+              "a failed update leaves a and b with their old contents");
+        check(file_count(rollback_dir) == 2, "a failed update leaves no temporary or backup files");
+        CloseHandle(hold);
+        check(submit(rc, {{"a", "NEW_A"}, {"b", "NEW_B"}}) == S_OK, "the same update succeeds once b is free");
+        check(read_blob(rollback_dir, L"a") == "NEW_A" && read_blob(rollback_dir, L"b") == "NEW_B" && file_count(rollback_dir) == 2,
+              "the successful update leaves only the new contents");
+
+        // Case B: a delete that sorts before a blocked write must not be applied.
+        check(submit(rc, {{"a", "OLD_A"}, {"b", "OLD_B"}}) == S_OK, "reseed blobs a and b");
+        hold = CreateFileW((rollback_dir / L"b").c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                           0, nullptr);
+        check(hold != INVALID_HANDLE_VALUE, "another handle holds blob b open again");
+        check(submit(rc, {{"a", nullptr}, {"b", "NEW_B"}}) == out_of_local, "a mixed update with a blocked write fails");
+        check(std::filesystem::exists(rollback_dir / L"a") && read_blob(rollback_dir, L"a") == "OLD_A" && read_blob(rollback_dir, L"b") == "OLD_B",
+              "the delete of a is not applied when the write of b fails");
+        check(file_count(rollback_dir) == 2, "the mixed failed update leaves no temporary or backup files");
+        CloseHandle(hold);
+
+        // Case C: the plain success path, a write and a delete.
+        check(submit(rc, {{"a", "FINAL_A"}, {"b", nullptr}}) == S_OK, "a write and a delete succeed together");
+        check(read_blob(rollback_dir, L"a") == "FINAL_A" && !std::filesystem::exists(rollback_dir / L"b") && file_count(rollback_dir) == 1,
+              "the successful write and delete leave only the written blob");
+
+        // Case D: scratch files of a commit that died midway. A temporary is dropped; a backup may be the only copy of
+        // a blob's old contents, so neither an update of another blob nor a failed update of two rollback_dir removes it.
+        std::ofstream(rollback_dir / L"b~", std::ios::binary) << "HALF_B";
+        std::ofstream(rollback_dir / L"b~b~", std::ios::binary) << "KEPT_B";
+        check(submit(rc, {{"a", "NEXT_A"}}) == S_OK, "an update of a with scratch files of b present");
+        check(!std::filesystem::exists(rollback_dir / L"b~") && read_blob(rollback_dir, L"b~b~") == "KEPT_B",
+              "a stale temporary is removed and a kept backup is not");
+        hold = CreateFileW((rollback_dir / L"a").c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                           0, nullptr);
+        check(hold != INVALID_HANDLE_VALUE, "another handle holds blob a open");
+        check(submit(rc, {{"a", "X"}, {"b", "Y"}}) == out_of_local, "an update that fails at a, before b is reached");
+        CloseHandle(hold);
+        check(read_blob(rollback_dir, L"b~b~") == "KEPT_B", "the failed update keeps the backup it did not write");
+
+        at<Close>(save, 17)(save, rc);
     }
 
     at<Close>(save, 6)(save, provider);

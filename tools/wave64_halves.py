@@ -10,7 +10,8 @@ there is no partner half to exchange values with (compute and mesh shaders have 
                                             "uniform_readlane": {id(ins), ...}}
 
     A  nothing wave-wide is consumed except votes that only skip lane-masked work, votes on a wave-uniform compare
-       (a v_cmp of untainted scalars and constants with EXEC the launch mask: every half votes as the wave does),
+       (a v_cmp of untainted scalars and constants with EXEC the launch mask, or its whole quads after
+       `s_wqm_b64 exec, exec` when no VGPR is compared: every half votes as the wave does),
        whole-quad masks and per-lane arithmetic: exact as translated, on any subgroup size.
     B  also uses a wave-wide idiom whose result is invariant by construction: a waterfall loop, a wave-aggregated
        atomic (ballot count, one atomic from the first lane, rank), a v_readfirstlane / v_readlane of a value that
@@ -448,6 +449,7 @@ class Analysis:
         u = a["u"] & b["u"]
         ua = (a["ua"] & b["ua"]) if a["x"] == b["x"] else u
         return {"t": t, "g": g, "x": x, "xg": a["xg"] if a["xg"] == b["xg"] else None, "f": a["f"] and b["f"],
+                "q": a["q"] and b["q"], "qr": a["qr"] or b["qr"],
                 "u": u, "ua": ua, "l": {k: v for k, v in a["l"].items() if b["l"].get(k) == v},
                 "r": self.union_map(a["r"], b["r"]), "b": self.union_map(a["b"], b["b"])}
 
@@ -456,13 +458,14 @@ class Analysis:
         return {k: a.get(k, frozenset()) | b.get(k, frozenset()) for k in set(a) | set(b)}
 
     def entry(self):
-        return {"t": {}, "g": {}, "x": ("e",), "xg": None, "f": True, "u": frozenset(), "ua": frozenset(), "l": {},
-                "r": {}, "b": {}}
+        return {"t": {}, "g": {}, "x": ("e",), "xg": None, "f": True, "q": False, "qr": False, "u": frozenset(),
+                "ua": frozenset(), "l": {}, "r": {}, "b": {}}
 
     # ---- the transfer function ----
     def block(self, n, st, ev):
-        st = {"t": dict(st["t"]), "g": dict(st["g"]), "x": st["x"], "xg": st["xg"], "f": st["f"], "u": st["u"],
-              "ua": st["ua"], "l": dict(st["l"]), "r": dict(st["r"]), "b": dict(st["b"])}
+        st = {"t": dict(st["t"]), "g": dict(st["g"]), "x": st["x"], "xg": st["xg"], "f": st["f"], "q": st["q"],
+              "qr": st["qr"], "u": st["u"], "ua": st["ua"], "l": dict(st["l"]), "r": dict(st["r"]),
+              "b": dict(st["b"])}
         for i, ins in enumerate(self.blocks[n]):
             self.step(n, i, ins, st, ev)
         return st
@@ -850,6 +853,8 @@ class Analysis:
             vr = a[1]["r"] if a[1].get("k") == "vgpr" else None
             if vr is not None and vr in st["u"]:
                 idiom("readfirstlane-uniform")
+                if not st["f"]:
+                    self.read_past_launch(st)
                 put(a[0], tv)
             elif vr is not None and vr in st["ua"]:
                 # Uniform over active lanes only: if a half has EXEC == 0 here, v_readfirstlane returns lane 0's
@@ -875,6 +880,7 @@ class Analysis:
                 idiom("readlane-uniform")
                 if ev is not None:
                     ev["uniform_readlane"].add(id(ins))
+                self.read_past_launch(st)
                 put(a[0], self.rd(st, ins, a[1]))
             elif vr is not None and a[2].get("k") == "imm" and (vr, a[2]["v"] & 63) in st["l"] \
                     and ((a[2]["v"] & 63) < 32 or vr in self.pure_spill_vgprs):
@@ -971,9 +977,11 @@ class Analysis:
                 elif r and r[0] in st["g"] and st["g"][r[0]][0] in ("mask", "elect", "wfmask", "uvote"):
                     tag = st["g"][r[0]]
             elif op == "s_and_b64" and not t_src and all(
-                    (_regs(x) == ["exec"] and st["f"]) or (_regs(x) and all(st["g"].get(r) == UVOTE for r in _regs(x)))
+                    (_regs(x) == ["exec"] and (st["f"] or st["q"]))
+                    or (_regs(x) and all(st["g"].get(r) == UVOTE for r in _regs(x)))
                     for x in srcs) and any(_regs(x) != ["exec"] for x in srcs):
-                # a uniform compare ANDed with EXEC while EXEC is the launch mask (LLVM: s_and_b64 vcc, exec, s[..])
+                # a uniform compare ANDed with EXEC while EXEC is the launch mask or its whole quads (LLVM:
+                # s_and_b64 vcc, exec, s[..]); either way the result is no lane or a set with a lane in every half
                 tag = UVOTE
             put(dests[0], t_src, tag)
             if not op.startswith(("s_mov", "s_cselect")):     # those leave SCC as it was: no vote on their dest
@@ -1202,8 +1210,14 @@ class Analysis:
         """Whether a v_cmp writes a wave-uniform lane mask: EXEC is the launch mask and every source is the same in
         every lane (an immediate, a scalar that is no lane mask, a VGPR written from those with EXEC the launch mask)
         and carries no taint, so the mask is every launch lane or none, in the wave and in each half alike. A value
-        read with v_readfirstlane from a varying VGPR is tainted (waterfall-scalar), so it is not one."""
-        if tj or uses or not st["f"] or not srcs:
+        read with v_readfirstlane from a varying VGPR is tainted (waterfall-scalar), so it is not one.
+
+        SHADER-W64-WQM-UVOTE: the same holds while EXEC is the whole quads of the launch mask (st["q"]) when every
+        source is an immediate or a scalar: the mask is every lane of EXEC or none, and EXEC has a lane in every
+        half that runs, because a quad never straddles the halves and a half that runs has a launch lane. A VGPR is
+        refused there even when st["u"] calls it uniform: it was written under the launch mask, and the helper lanes
+        EXEC now includes never got that value, so they compare whatever they hold."""
+        if tj or uses or not (st["f"] or st["q"]) or not srcs:
             return False
         for x in srcs:
             k = x.get("k")
@@ -1211,10 +1225,18 @@ class Analysis:
                 continue
             if self.rd(st, ins, x) or self.is_mask(ins, x):
                 return False
-            if k == "sgpr" or (k == "vgpr" and all(r[1] in st["u"] for r in _regs(x))):
+            if k == "sgpr" or (k == "vgpr" and st["f"] and all(r[1] in st["u"] for r in _regs(x))):
                 continue
             return False
         return True
+
+    @staticmethod
+    def read_past_launch(st):
+        """A scalar was read from a lane of a uniform VGPR (st["u"]: written under the launch mask) that the launch
+        mask may not have written: v_readfirstlane while EXEC is not the launch mask, v_readlane at any time. The
+        tiers treat that scalar as uniform; SHADER-W64-WQM-UVOTE does not build on it, so from here on EXEC is never
+        again "the whole quads of the launch mask" on this path."""
+        st["q"], st["qr"] = False, True
 
     def cmp_tag(self, st, ins, op, srcs, t_src, idiom):
         """(tag, taint) of the lane mask a v_cmp / v_cmpx writes. The two recognised comparisons: a waterfall
@@ -1222,11 +1244,17 @@ class Analysis:
         against 0 (the first lane of the mask the rank counts)."""
         T = st["t"]
         tag, tj = None, t_src
+        # A waterfall needs equality of the entire unmodified descriptor word.
+        # Floating equality merges the two signed zeros. Halfword comparisons and
+        # SDWA/DPP can select lanes whose original descriptor words differ, too.
+        whole_word = (op in ("v_cmp_eq_i32", "v_cmp_eq_u32")
+                      and not ins["op"].endswith(("_sdwa", "_dpp")) and not ins.get("mods")
+                      and not any(x.get("abs") or x.get("neg") for x in srcs))
         if "_eq_" in op and len(srcs) == 2:
             for sc, vv in ((srcs[0], srcs[1]), (srcs[1], srcs[0])):
                 r = _regs(sc)
                 g = st["g"].get(r[0]) if r else None
-                if g and g[0] == "wfs" and vv.get("k") == "vgpr" and vv["r"] == g[1] and not vv.get("neg"):
+                if whole_word and g and g[0] == "wfs" and vv.get("k") == "vgpr" and vv["r"] == g[1]:
                     tag, tj = ("wfmask", g[1]), self.rd(st, ins, vv) | (T.get(r[0], 0) & ~WFS)
                     idiom("waterfall")
                 elif g and g[0] == "rank" and sc.get("k") == "vgpr" and vv.get("k") == "imm" and vv["v"] == 0 and                         (T.get(r[0], 0) & ~TAG_BITS) == 0:
@@ -1237,6 +1265,11 @@ class Analysis:
         T = st["t"]
         site = ("n", n, i)
         old = st["x"]
+        # SHADER-W64-WQM-UVOTE: `s_wqm_b64 exec, exec` while EXEC is the launch mask leaves the whole quads of the
+        # launch mask (helper lanes on); every other write to EXEC ends that
+        quads = st["f"] and not st["qr"] and op == "s_wqm_b64" and len(a) == 2 and not _half(a[0]) \
+            and all(x.get("k") == "special" and x.get("t") == "exec" for x in a)
+        st["q"] = False
         if any(_half(x) for x in dests + srcs) or (op.startswith("s_") and op.endswith("_b32")):
             violation("mask-half")
         if any(op.startswith(p) for p in SAVEEXEC):
@@ -1286,7 +1319,7 @@ class Analysis:
             else:
                 st["x"] = site
                 self.tok[site] = (None, None, False)
-                st["xg"], st["f"] = None, False
+                st["xg"], st["f"], st["q"] = None, False, quads
                 st["ua"] = st["u"]
                 if mt & ~0:
                     for b, name in NAMES.items():
@@ -1381,8 +1414,8 @@ class Analysis:
 
         A VCC that is a wave-uniform compare (UVOTE: every launch lane or none) is no lane vote: each half votes as
         the wave does, so either side may have code of its own and scalars it defines are not stale. EXEC must have
-        been the launch mask at the compare: under a narrowed EXEC a half with no active lane votes no while the
-        wave votes yes."""
+        been the launch mask at the compare (or its whole quads, for a compare of scalars: uniform_cmp): under a
+        narrowed EXEC a half with no active lane votes no while the wave votes yes."""
         # st only for s_cbranch_vccz/vccnz: an SCC vote was taken on the mask as it was then, and VCC may since hold
         # another value (a later v_cmp writes no SCC)
         if reg == "vcc" and st is not None and st["g"].get("vcc") == UVOTE and not st["t"].get("vcc", 0) \

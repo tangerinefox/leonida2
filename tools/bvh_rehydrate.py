@@ -57,6 +57,10 @@ import struct
 import sys
 import tempfile
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
+
+
 FLAG_DEHYDRATED = 0x01000000
 FLAG_UPDATABLE = 0x00040000
 NO_TRANSFORM = 0x007F7F7F
@@ -466,10 +470,13 @@ def _publish(dest, data):
         with tempfile.NamedTemporaryFile(mode="wb", dir=directory, prefix=".bvh_rehydrate-", suffix=".tmp", delete=False) as f:
             temp = f.name
             f.write(data)
+        os.chmod(temp, published_mode(dest))
         os.replace(temp, dest)
     except BaseException:
         if temp is not None:
             with contextlib.suppress(OSError):
+                # The staged file may carry a read-only destination's mode; make it deletable first.
+                os.chmod(temp, 0o600)
                 os.unlink(temp)
         raise
 

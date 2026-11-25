@@ -6,7 +6,7 @@
 //     with a POINT filter (the 16-byte S#);
 //   - a root signature of two descriptor tables, [0] one SRV and [1] one sampler, and SetDescriptorHeaps,
 //     SetGraphicsRootDescriptorTable and DrawIndexedInstanced of a quad (a vertex-index-driven vs_m2.asm, six indices).
-// test/shaders/ps_m2.asm s_loads the T# from the table in s[0:1] and the S# from the table in s[2:3] and image_samples
+// test/shaders/ps_m2.asm s_loads the T# from the table in s8 and the S# from the table in s9 and image_samples
 // with them; the translated shader hashes both and finds their bindless indices in the descriptor hash table (set 0,
 // binding 2), so the pipeline layout holds set 0 and every draw binds it. The PSO is found by the SHA-256 of the FSSM
 // program in the DXBC container, as in the M1.5 test.
@@ -143,11 +143,11 @@ int main() {
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
         Ref<ID3D12Device> device;
         EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device),
-                                                           reinterpret_cast<void**>(&device.p))));
+                                                           reinterpret_cast<void**>(&device.p), /*console_lists=*/false)));
         rt::d3d12::set_device_outer(inner, device.p);
         EXPECT(rt::d3d12::bindless_set(device.p) != VK_NULL_HANDLE);
 
-        // Root signature: [0] a table of one SRV (s0:s1), [1] a table of one sampler (s2:s3).
+        // Root signature: [0] a table of one SRV (s8), [1] a table of one sampler (s9): the console's graphics layout.
         D3D12_DESCRIPTOR_RANGE srv_range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
         D3D12_DESCRIPTOR_RANGE sampler_range{D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, 1, 0, 0, 0};
         D3D12_ROOT_PARAMETER params[2] = {};
@@ -186,7 +186,7 @@ int main() {
         indexed_params[0].DescriptorTable = {1, &indexed_range};
         indexed_params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         indexed_params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        indexed_params[2].Constants = {0, 0, 2};  // s4 = SRV index, s5 = SRV stride in bytes
+        indexed_params[2].Constants = {0, 0, 2};  // s10 = SRV index, s11 = SRV stride in bytes
         D3D12_VERSIONED_ROOT_SIGNATURE_DESC indexed_desc = root_desc;
         indexed_desc.Desc_1_0.NumParameters = 3;
         indexed_desc.Desc_1_0.pParameters = indexed_params;

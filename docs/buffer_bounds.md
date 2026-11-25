@@ -17,6 +17,10 @@ measured natively on AMD GPUs (SHADER-116). The translator reads this field and 
 | 2 disabled | `N == 0` | same | same |
 | 3 raw | `offset + soffset + 4 > N`; `index * stride` moves the address but is not checked | `offset >= N`: differs | `offset + 4 > N`, without `soffset` |
 
+The runtime writes mode 3 for raw SRVs/UAVs, mode 0 for structured views and mode 1 for typed views.
+API-created CBVs mirror the observed inline console descriptor (mode 0, 16-byte rows).
+`LEONIDA_CBV_RAW=1` selects mode 3 with a byte count. Root views carry a GPU VA.
+
 - **RDNA2 follows Mesa's GFX11 column**, not the GFX10 one: of 732 cases, 729 match GFX11 and 696 match GFX10.
   Every GFX10 miss is an access that only partly fits, for example a raw buffer with `N = 3` read at offset 0.
 - **In raw mode `soffset` is part of the checked offset.** The 3 cases that match neither column are raw reads at

@@ -30,6 +30,24 @@ int main() {
     queue_one_destroyed = true;
     if (tickets.completed(query) != 4 || queried_destroyed) return 4;
 
+    // pending_through() must coalesce repeated submissions on the same queue to the highest
+    // timeline value, omit idle queues, and exclude tickets past the requested cutoff.
+    tickets.record(5, 1, 10);
+    tickets.record(6, 2, 20);
+    tickets.record(7, 1, 12);
+    tickets.record(8, 1, 15);
+    tickets.record(9, 2, 25);
+    tickets.queue_idle(2);
+    const auto wait_list = tickets.pending_through(7);
+    if (wait_list.size() != 1 || wait_list[0].first != 1 || wait_list[0].second != 12) return 5;
+
+    // A non-monotonic ticket must not move the completed prefix backward.
+    done[1] = 15;
+    if (tickets.completed(query) != 9) return 6;
+    tickets.record(3, 1, 16);
+    done[1] = 16;
+    if (tickets.completed(query) != 9) return 7;
+
     std::puts("out-of-order queue completion kept the retirement prefix safe");
     return 0;
 }

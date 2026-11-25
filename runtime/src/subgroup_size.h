@@ -61,6 +61,14 @@ inline VkShaderStageFlagBits subgroup_stage_bit(std::string_view stage) {
     return VkShaderStageFlagBits(0);
 }
 
+// A wave64 VS/PS/GS that the translator's partition-invariance analysis (index.json `wave64_graphics`; docs/design.md,
+// "Wave64 graphics") puts in tier A or B: observable results do not change when the GPU cuts the wave into two 32-lane
+// halves, so the device's 32-wide size is exact for it. Tier C and entries without the analysis stay conservative.
+inline bool graphics_partition_invariant(const ShaderEntry& entry) {
+    if (entry.stage != "vs" && entry.stage != "ps" && entry.stage != "gs") return false;
+    return entry.wave64 && (entry.wave64_graphics == "A" || entry.wave64_graphics == "B");
+}
+
 enum class SubgroupOutcome {
     emulated,         // --wave64-emulate: exact on any size, nothing is required
     required,         // the stage asks for `size`

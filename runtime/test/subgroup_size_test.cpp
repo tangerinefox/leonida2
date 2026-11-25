@@ -261,6 +261,32 @@ int main() {
         CHECK(caps.subgroup_size_control && !caps.compute_full_subgroups);
     }
 
+    // --- Partition-invariant wave64 graphics ----------------------------------------------------------------
+    {
+        // The translator's tier (index.json `wave64_graphics`, docs/design.md "Wave64 graphics"): A and B are exact
+        // when the wave is cut into two 32-lane halves, C is not. An entry without the analysis stays conservative.
+        ShaderEntry e = entry("ps", true);
+        CHECK(!graphics_partition_invariant(e));
+        e.wave64_graphics = "A";
+        CHECK(graphics_partition_invariant(e));
+        e.wave64_graphics = "B";
+        CHECK(graphics_partition_invariant(e));
+        e.wave64_graphics = "C";
+        CHECK(!graphics_partition_invariant(e));
+        // Only a wave64 VS/PS/GS carries the analysis; compute, mesh and wave32 entries do not.
+        e = entry("vs", true);
+        e.wave64_graphics = "A";
+        CHECK(graphics_partition_invariant(e));
+        for (const char* stage : {"cs", "ms"}) {
+            e = entry(stage, true);
+            e.wave64_graphics = "A";
+            CHECK(!graphics_partition_invariant(e));
+        }
+        e = entry("ps", false);
+        e.wave64_graphics = "A";
+        CHECK(!graphics_partition_invariant(e));
+    }
+
     std::printf("subgroup size decision: AMD-like, NVIDIA-like, old RADV, limits, create-info chain and query OK\n");
     return 0;
 }

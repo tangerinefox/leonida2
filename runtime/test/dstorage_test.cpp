@@ -15,7 +15,12 @@
 #include <thread>
 #include <vector>
 
+#include <span>
+#include "../src/bcpack.h"
+#include "../src/bcpack_stream.h"
+#include "../src/title_page_watch.h"
 #include "dstorage_xs_abi.h"
+#include "dstorage_staging.h"
 #include "file_system.h"
 #include "shims.h"
 
@@ -176,6 +181,58 @@ IDStorageStatusArrayX* make_status(Env& env, UINT32 capacity) {
 }
 
 // ---- tests ----------------------------------------------------------------------------------------------------------
+
+void test_staging_budget() {
+    using leonida::dstorage::StagingPool;
+    using leonida::dstorage::staging_bytes;
+    DSTORAGE_REQUEST r{};
+    r.SourceSize = 64;
+    r.DestinationSize = 64;
+    check(staging_bytes(r) == 0, "raw buffer copy needs no staging");
+    r.Options.AsUINT64 = options::kSourceMemory | options::kSourcePages;
+    r.SourcePageOffset = 65535;
+    check(staging_bytes(r) == 80, "two source page numbers are charged with the payload");
+    r.Options.AsUINT64 = options::kZlib | (7ull << options::kBcpackShift);
+    r.IntermediateSize = 512;
+    r.DestinationSize = 256;
+    check(staging_bytes(r) == 768, "combined transform charges largest simultaneously live pair");
+    r.Options.AsUINT64 |= 1ull << options::kSwizzleShift;
+    r.DestinationSize = 1024;
+    check(staging_bytes(r) == 2048, "unshuffle holds both complete block images");
+
+    StagingPool pool;
+    constexpr uint64_t limit = StagingPool::limit;
+    {
+        StagingPool::Lease publisher(pool), helper(pool), refused(pool);
+        publisher.acquire(limit - 100);
+        check(!refused.try_pair(101), "helper falls back when either member of pair cannot fit");
+        check(helper.try_pair(100), "helper and publisher reserve the exact remaining budget");
+        check(!refused.try_pair(1), "full pool prevents another helper allocation");
+    }
+    {
+        StagingPool::Lease a(pool), b(pool), c(pool);
+        check(a.try_pair(1) && b.try_pair(1) && !c.try_pair(1), "at most two helpers hold buffers");
+    }
+    std::atomic<bool> waiting{}, entered{};
+    std::thread other;
+    {
+        StagingPool::Lease large(pool), concurrent(pool);
+        large.acquire(limit + 1);
+        check(!concurrent.try_pair(1), "oversize request holds the pool exclusively");
+        other = std::thread([&] {
+            StagingPool::Lease next(pool);
+            waiting = true;
+            next.acquire(limit);
+            entered = true;
+        });
+        while (!waiting) std::this_thread::yield();
+        check(!entered, "ordinary publisher waits while exclusive request holds buffers");
+    }
+    other.join();
+    check(entered, "waiting publisher wakes when exclusive buffers are released");
+    StagingPool::Lease reclaimed(pool);
+    check(reclaimed.try_pair(limit), "pool is entirely reusable after the last publisher");
+}
 
 void test_layout_and_options() {
     DSTORAGE_REQUEST_OPTIONS o{};
@@ -371,6 +428,33 @@ void test_open_paths(Env& env) {
     q->Release();
 }
 
+// Simulate a committed page made read-only by the runtime's D3D shadow tracker.
+void test_shadowed_file_destination(Env& env) {
+    constexpr DWORD size = 4096;
+    void* page = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READONLY);
+    check(page != nullptr, "allocate a watched file destination");
+    if (!page) return;
+    auto* file = open(env, L"game:/data/b.bin");
+    auto* queue = make_queue(env);
+    auto* status = make_status(env, 1);
+    leonida::kernel_writes::set_opener([](uintptr_t begin, uintptr_t end) {
+        DWORD old = 0;
+        VirtualProtect(reinterpret_cast<void*>(begin), end - begin, PAGE_READWRITE, &old);
+    });
+    auto request = file_request(file, 129, page, size);
+    queue->EnqueueRequest(&request);
+    queue->EnqueueStatus(status, 0);
+    queue->Submit();
+    queue->Close();
+    leonida::kernel_writes::set_opener(nullptr);
+    check_hr(status->GetHResult(0), S_OK, "file read to a watched destination");
+    check(std::memcmp(page, env.b.data() + 129, size) == 0, "watched destination received the file range");
+    status->Release();
+    queue->Release();
+    file->Release();
+    VirtualFree(page, 0, MEM_RELEASE);
+}
+
 void test_reads_and_errors(Env& env) {
     IDStorageFileX* b = open(env, L"GAME:\\data\\b.bin");  // 10,000 bytes
     IDStorageFileX* big = open(env, L"GAME:\\data\\big.bin");
@@ -404,10 +488,10 @@ void test_reads_and_errors(Env& env) {
         cases.push_back({r, E_DSTORAGE_INVALID_DESTINATION_SIZE, "zlib with DestinationSize equal to SourceSize"});
         r = file_request(b, 0, few.data(), 8);
         r.Options.BcpackMode = DSTORAGE_BCPACK_MODE_BC1;
-        cases.push_back({r, E_NOTIMPL, "BCPack is not implemented yet"});
+        cases.push_back({r, E_DSTORAGE_INVALID_DESTINATION_SIZE, "BCPack needs a larger output"});
         r = file_request(b, 0, few.data(), 8);
         r.Options.SwizzleMode = DSTORAGE_SWIZZLE_MODE_4K_4K_8K;
-        cases.push_back({r, E_NOTIMPL, "swizzle is not implemented yet"});
+        cases.push_back({r, E_DSTORAGE_INVALID_DESTINATION_SIZE, "partial swizzle group"});
         r = file_request(b, 0, few.data(), 8);
         r.Options.AsUINT64 = 8ull << options::kBcpackShift;
         cases.push_back({r, E_DSTORAGE_INVALID_BCPACK_MODE, "BCPack mode 8"});
@@ -419,7 +503,7 @@ void test_reads_and_errors(Env& env) {
         cases.push_back({r, E_DSTORAGE_RESERVED_FIELDS, "a reserved option bit"});
         r = file_request(b, 0, few.data(), 8);
         r.Options.DestinationIsPhysicalPages = 1;
-        cases.push_back({r, E_NOTIMPL, "physical pages are not implemented yet"});
+        cases.push_back({r, E_INVALIDARG, "unknown physical page"});
         r = file_request(b, 0, few.data(), 8);
         r.IntermediateSize = 4;
         cases.push_back({r, E_DSTORAGE_INVALID_INTERMEDIATE_SIZE, "IntermediateSize without zlib and BCPack"});
@@ -887,8 +971,8 @@ void test_iid_policy_events_and_cancel(Env& env) {
     q->Release();
 }
 
-// Holds the queue's worker inside a copy: the copy's source is a guard page, and this handler waits on the first
-// touch until the test releases it. The guard is gone after that fault, so the copy then goes on.
+// Hold the worker at its first read. PAGE_NOACCESS gives a catchable access violation on Windows and Proton.
+// The handler restores read access before retrying exactly that instruction.
 struct GuardHold {
     uint8_t* page = nullptr;
     HANDLE entered = nullptr;
@@ -898,10 +982,12 @@ GuardHold* g_hold = nullptr;
 
 LONG CALLBACK hold_on_guard(EXCEPTION_POINTERS* x) {
     const EXCEPTION_RECORD* e = x->ExceptionRecord;
-    if (!g_hold || e->ExceptionCode != STATUS_GUARD_PAGE_VIOLATION || e->NumberParameters < 2)
+    if (!g_hold || e->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || e->NumberParameters < 2)
         return EXCEPTION_CONTINUE_SEARCH;
     const auto* address = reinterpret_cast<const uint8_t*>(e->ExceptionInformation[1]);
     if (address < g_hold->page || address >= g_hold->page + 4096) return EXCEPTION_CONTINUE_SEARCH;
+    DWORD old;
+    if (!VirtualProtect(g_hold->page, 4096, PAGE_READWRITE, &old)) return EXCEPTION_CONTINUE_SEARCH;
     SetEvent(g_hold->entered);
     WaitForSingleObject(g_hold->release, 10000);
     return EXCEPTION_CONTINUE_EXECUTION;
@@ -930,7 +1016,7 @@ void test_stats_timing(Env& env) {
     }
     std::memset(hold.page, 0x5A, 4096);
     DWORD old = 0;
-    VirtualProtect(hold.page, 4096, PAGE_READWRITE | PAGE_GUARD, &old);
+    check(VirtualProtect(hold.page, 4096, PAGE_NOACCESS, &old) != FALSE, "arm the first-read barrier");
     std::vector<uint8_t> out(4096, 0);
     DSTORAGE_REQUEST r{};
     r.Options.SourceType = DSTORAGE_REQUEST_SOURCE_MEMORY;
@@ -1122,9 +1208,9 @@ void test_zlib(Env& env) {
         {file.size() - 16, 32, 64, E_DSTORAGE_END_OF_FILE, nullptr, "a zlib source past the end of the file"},
         {at_dynamic, z, 3191, E_DSTORAGE_INVALID_INTERMEDIATE_SIZE, nullptr, "zlib with an IntermediateSize", 0,
          16},
-        {at_dynamic, z, 3191, E_NOTIMPL, nullptr, "zlib and BCPack is not implemented yet",
+        {at_dynamic, z, 3191, E_DSTORAGE_INVALID_DESTINATION_SIZE, nullptr, "zlib plus BCPack needs whole blocks",
          static_cast<uint64_t>(DSTORAGE_BCPACK_MODE_BC1) << options::kBcpackShift, 64},
-        {at_dynamic, z, 3191, E_NOTIMPL, nullptr, "zlib and swizzle is not implemented yet",
+        {at_dynamic, z, 3191, E_DSTORAGE_INVALID_DESTINATION_SIZE, nullptr, "zlib plus swizzle needs complete groups",
          static_cast<uint64_t>(DSTORAGE_SWIZZLE_MODE_4K_4K_8K) << options::kSwizzleShift},
     };
 
@@ -1215,6 +1301,214 @@ void test_zlib(Env& env) {
           "TotalDecompressionRequestCount counts the zlib requests that reached the inflate");
     check(after.DecompressionErrors - before.DecompressionErrors == 8, "DecompressionErrors counts the bad streams");
     check(after.PendingDecompressionRequestCount == 0, "no decompression is pending afterwards");
+
+    // Both file transforms may prepare concurrently, but publish to the same buffer
+    // in enqueue order. The status after an invalid pair must retain its first error.
+    f = open(env, L"GAME:\\data\\zlib.bin");
+    q = make_queue(env, kMinQueueCapacity, false);
+    s = make_status(env, 2);
+    std::vector<uint8_t> overlap(dynamic_plain.size() + 1, 0xee);
+    auto enqueue_zlib = [&](uint64_t at, uint32_t source, uint32_t dest) {
+        auto request = file_request(f, at, overlap.data(), source);
+        request.Options.AsUINT64 = options::kZlib;
+        request.DestinationSize = dest;
+        q->EnqueueRequest(&request);
+    };
+    enqueue_zlib(at_dynamic, z, 3191);
+    enqueue_zlib(at_fixed, 77, 196);
+    q->EnqueueStatus(s, 0);
+    enqueue_zlib(at_check, z, 3191);
+    enqueue_zlib(at_type, 77, 196);
+    q->EnqueueStatus(s, 1);
+    q->Submit();
+    f->Close();
+    check(wait_complete(s, 1), "adjacent file transforms retire before the final status");
+    check_hr(s->GetHResult(0), S_OK, "overlapping file outputs complete in queue order");
+    check_hr(s->GetHResult(1), E_DSTORAGE_ZLIB_PARITY_FAIL, "a pair reports the first failure in enqueue order");
+    auto expected = dynamic_plain;
+    std::copy(fixed_plain.begin(), fixed_plain.end(), expected.begin());
+    expected.push_back(0xee);
+    check(overlap == expected, "ordered publication and failed transforms preserve every destination byte");
+    s->Release();
+    q->Release();
+    f->Release();
+}
+
+struct Vector {
+    unsigned codec;
+    std::span<const uint8_t> raw, plain, wrapped;
+};
+#include "dstorage_vectors.inc"
+
+leonida::bcpack::Calibration test_profile() {
+    leonida::bcpack::Calibration history{};
+    auto& six = history.bc6[255];
+    for (unsigned c = 0; c < 3; ++c) six.ep[8 * c + 1] = 16;
+    six.ep_class = six.ix_class = 3;
+    six.ep_confirmed.fill(16);
+    six.ix_confirmed.fill(4);
+    auto& seven = history.bc7[255];
+    seven.ep.fill(64);
+    seven.ep_bits.fill(8);
+    seven.ep_confirmed.fill(8);
+    seven.ix_bits.fill(4);
+    seven.ix_confirmed.fill(4);
+    return history;
+}
+
+void test_extended(Env& env) {
+    auto* q = make_queue(env, 0x80, false, DSTORAGE_REQUEST_SOURCE_MEMORY, DSTORAGE_PRIORITY_REALTIME);
+    auto* status = make_status(env, 1);
+    auto submit = [&](DSTORAGE_REQUEST& r, HRESULT want) {
+        q->EnqueueRequest(&r);
+        q->EnqueueStatus(status, 0);
+        check_hr(status->GetHResult(0), E_PENDING, "extended request is pending before Submit");
+        q->Submit();
+        check(wait_complete(status, 0), "extended request retires");
+        check_hr(status->GetHResult(0), want, "extended request status");
+    };
+    DSTORAGE_REQUEST r{};
+    for (const auto& v : vectors) {
+        for (bool zlib : {false, true}) {
+            const auto source = zlib ? v.wrapped : v.raw;
+            const size_t bytes = v.plain.size();
+            std::vector<uint8_t> output(bytes+1, 0xA5);
+            r = {};
+            r.Options.AsUINT64 = options::kSourceMemory | (v.codec << options::kBcpackShift) | zlib;
+            r.Source = source.data();
+            r.SourceSize = static_cast<uint32_t>(source.size());
+            r.IntermediateSize = zlib ? static_cast<uint32_t>(v.raw.size()) : 0;
+            r.Destination = output.data();
+            r.DestinationSize = static_cast<uint32_t>(bytes);
+            submit(r, S_OK);
+            check(std::equal(v.plain.begin(), v.plain.end(), output.begin()) && output.back() == 0xA5,
+                  "BC blocks equal the Python decoder, including all mode fields");
+            if (!zlib) {
+                std::fill(output.begin(), output.end(), 0xA5);
+                r.SourceSize /= 2;
+                submit(r, E_DSTORAGE_DECOMPRESSION_ERROR);
+                check(std::all_of(output.begin(), output.end(), [](uint8_t v){return v == 0xA5;}),
+                      "a truncated BCPack stream publishes no bytes");
+            }
+        }
+    }
+    {
+        auto history = test_profile();
+        auto& six = history.bc6[255];
+        auto& seven = history.bc7[255];
+        for (unsigned codec : {6u, 7u}) {
+            const std::span<const uint8_t> raw = codec == 6 ? std::span<const uint8_t>(profile_raw6) : profile_raw7;
+            const uint8_t* first = codec == 6 ? profile_first6 : profile_first7;
+            std::vector<uint8_t> result(512);
+            check(leonida::bcpack::decode(codec, raw, result, false, &history) == leonida::bcpack::Quality::confirmed,
+                  "confirmed local BPTC predictor accepts the stream");
+            bool exact = true;
+            for (size_t j = 0; j < result.size(); ++j) exact &= result[j] == first[j % 16];
+            check(exact, "propagated external BPTC history matches all reference blocks");
+            DSTORAGE_REQUEST from_profile{};
+            from_profile.Options.AsUINT64 = options::kSourceMemory | (uint64_t(codec) << options::kBcpackShift);
+            from_profile.Source = raw.data();
+            from_profile.SourceSize = static_cast<uint32_t>(raw.size());
+            from_profile.Destination = result.data();
+            from_profile.DestinationSize = static_cast<uint32_t>(result.size());
+            std::fill(result.begin(), result.end(), 0xA5);
+            submit(from_profile, S_OK);
+            bool default_exact = true;
+            for (size_t j = 0; j < result.size(); ++j) default_exact &= result[j] == first[j % 16];
+            check(default_exact, "default sidecar next to the shader library supplies exact reference blocks");
+            if (codec == 6) six.ep_class = 1;
+            else seven.ep_confirmed.fill(0);
+            check(leonida::bcpack::decode(codec, raw, result, false, &history) == leonida::bcpack::Quality::failed &&
+                  leonida::bcpack::decode(codec, raw, result, true, &history) == leonida::bcpack::Quality::fitted,
+                  "partially confirmed BPTC profile requires fitted mode");
+        }
+    }
+    std::vector<uint8_t> fitted(512);
+    check(leonida::bcpack::decode(1, fitted_raw, fitted) == leonida::bcpack::Quality::failed,
+          "strict decoding rejects fitted history");
+    check(leonida::bcpack::decode(1, fitted_raw, fitted, true) == leonida::bcpack::Quality::fitted &&
+          std::equal(std::begin(fitted_first), std::end(fitted_first), fitted.begin()),
+          "opt-in fitted history matches the reference and reports its quality");
+
+    // Three groups make an accidental per-64-KiB permutation distinguishable from macro-unshuffle.
+    const std::vector<std::vector<int>> planes = {{1,1,2},{1,1,6},{1,3,1,1,2},{1,3,1,3}};
+    for (unsigned m = 1; m <= 4; ++m) {
+        std::vector<uint8_t> input, expected;
+        for (unsigned c = 0; c < planes[m-1].size(); ++c)
+            for (int group = 0; group < 3; ++group)
+                input.insert(input.end(), planes[m-1][c]*4096, uint8_t(16*group+c));
+        for (int group = 0; group < 3; ++group)
+            for (unsigned c = 0; c < planes[m-1].size(); ++c)
+                expected.insert(expected.end(), planes[m-1][c]*4096, uint8_t(16*group+c));
+        std::vector<uint8_t> output(expected.size());
+        r = {};
+        r.Options.AsUINT64 = options::kSourceMemory | (m << options::kSwizzleShift);
+        r.Source = input.data();
+        r.Destination = output.data();
+        r.SourceSize = r.DestinationSize = static_cast<uint32_t>(output.size());
+        submit(r, S_OK);
+        check(output == expected, "all component stripes reach the corresponding group");
+    }
+
+    const auto alloc = reinterpret_cast<BOOL(WINAPI*)(uint64_t,uint64_t*,uint64_t*)>(
+        rt::shims::find("xmem.dll", "XMemAllocatePhysicalPages"));
+    const auto reserve = reinterpret_cast<void*(WINAPI*)(void*,SIZE_T,DWORD,uint64_t,DWORD)>(
+        rt::shims::find("xmem.dll", "XMemVirtualAlloc"));
+    const auto map = reinterpret_cast<void*(WINAPI*)(void*,uint64_t,const uint64_t*)>(
+        rt::shims::find("xmem.dll", "XMemMapPhysicalPages"));
+    const auto free_pages = reinterpret_cast<BOOL(WINAPI*)(uint64_t,const uint64_t*)>(
+        rt::shims::find("xmem.dll", "XMemFreePhysicalPages"));
+    uint64_t pages[2]{}, count = 2;
+    constexpr size_t page = 65536, offset = page-7;
+    auto* window = static_cast<uint8_t*>(reserve(nullptr, 2*page, MEM_RESERVE | 0x20400000, 0x21, PAGE_READWRITE));
+    const bool allocated = window && alloc(0x280, &count, pages);
+    const bool mapped = allocated && map(window, 2, pages) == window;
+    check(mapped, "two physical pages mapped");
+    if (mapped) {
+        ULONG_PTR scatter[] = {pages[1], 0};
+        const auto& v = vectors[0];
+        r = {};
+        r.Options.AsUINT64 = options::kSourceMemory | options::kDestinationPages | options::kZlib |
+                            (v.codec << options::kBcpackShift);
+        r.DestinationPageArray = scatter;
+        r.DestinationPageOffset = offset;
+        r.DestinationSize = static_cast<uint32_t>(v.plain.size());
+        r.Source = v.wrapped.data();
+        r.SourceSize = static_cast<uint32_t>(v.wrapped.size());
+        r.IntermediateSize = static_cast<uint32_t>(v.raw.size());
+        submit(r, E_INVALIDARG);
+        check(window[page+offset] == 0, "bad final page leaves the first untouched");
+        bool overflow;
+        leonida::title_texel_writes::take(overflow);
+        q->EnqueueRequest(&r);
+        q->EnqueueStatus(status, 0);
+        HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        q->EnqueueSetEvent(event);
+        scatter[1] = pages[0]; // resolved when the worker runs
+        q->Submit();
+        check(WaitForSingleObject(event, 10000) == WAIT_OBJECT_0, "event follows the scatter write");
+        CloseHandle(event);
+        check_hr(status->GetHResult(0), S_OK, "page list resolved after enqueue");
+        check(std::equal(v.plain.begin(), v.plain.begin()+7, window+page+offset) &&
+              std::equal(v.plain.begin()+7, v.plain.end(), window), "scatter is visible through the mapped CPU view");
+        const auto ranges = leonida::title_texel_writes::take(overflow);
+        check(ranges.size() == 2 && ranges[0].first == reinterpret_cast<uintptr_t>(window+page+offset) &&
+              ranges[1].first == reinterpret_cast<uintptr_t>(window), "refill sees both mapped ranges");
+        std::vector<uint8_t> out(v.plain.size());
+        r = {};
+        r.Options.AsUINT64 = options::kSourceMemory | options::kSourcePages;
+        r.SourcePageArray = scatter;
+        r.SourcePageOffset = offset;
+        r.SourceSize = r.DestinationSize = static_cast<uint32_t>(out.size());
+        r.Destination = out.data();
+        submit(r, S_OK);
+        check(std::equal(v.plain.begin(), v.plain.end(), out.begin()), "gather follows the page list and offset");
+        map(window, 2, nullptr);
+    }
+    if (allocated) free_pages(count, pages);
+    if (window) VirtualFree(window, 0, MEM_RELEASE);
+    status->Release();
+    q->Release();
 }
 
 }  // namespace
@@ -1237,12 +1531,31 @@ int main() {
     write_file(env.game / L"data" / L"b.bin", env.b);
     write_file(env.game / L"data" / L"big.bin", env.big);
     rt::fs::configure(env.game, env.overlay);
+    const auto profile = test_profile();
+    std::vector<uint8_t> packed_profile(8 + sizeof profile);
+    std::memcpy(packed_profile.data(), "BCPHIST1", 8);
+    std::memcpy(packed_profile.data() + 8, &profile, sizeof profile);
+    write_file(env.root / L"shaders/bcpack/history.bcph", packed_profile);
+    SetEnvironmentVariableW(L"LEONIDA_DSTORAGE_HISTORY", nullptr);
+    SetEnvironmentVariableW(L"LEONIDA_SHADERS", (env.root / L"shaders/spirv").c_str());
 
+
+    bool entropy_exact = true;
+    for (int width = 1; width <= 8; ++width) {
+        for (int q = 0; q < 16; ++q) {
+            const auto& model = leonida::bcpack::detail::model_for(width, q);
+            for (uint32_t slot = 0; slot < 65536; ++slot)
+                entropy_exact &= model.symbol(slot, true) == model.symbol(slot, false);
+        }
+    }
+    check(entropy_exact, "fast entropy lookup matches scalar division for every slot in all 128 models");
     test_layout_and_options();
+    test_staging_budget();
     test_registry(env);
     test_factory_checks(env);
     test_open_paths(env);
     test_reads_and_errors(env);
+    test_shadowed_file_destination(env);
     test_fence_order_and_events(env);
     test_cancel(env);
     test_auto_submit_and_full_queue(env);
@@ -1252,6 +1565,7 @@ int main() {
     test_iid_policy_events_and_cancel(env);
     test_stats_timing(env);
     test_stats(env);
+    test_extended(env);
     test_zlib(env);  // after test_stats, whose request totals it would change
 
     fs::remove_all(env.root, ec);

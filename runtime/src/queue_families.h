@@ -8,9 +8,22 @@
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
+#include <optional>
 #include <span>
 
 namespace leonida {
+
+constexpr std::uint32_t queue_family_timestamp_bits(std::span<const std::uint32_t> bits, std::uint32_t family) {
+    return family < bits.size() ? bits[family] : 0;
+}
+
+// A copy queue can lease from either family. Caller-owned devices may supply only the graphics queue.
+constexpr bool copy_queue_timestamp_families_supported(std::span<const std::uint32_t> bits,
+                                                       std::uint32_t graphics,
+                                                       std::optional<std::uint32_t> dedicated_copy) {
+    return queue_family_timestamp_bits(bits, graphics) != 0 &&
+           (!dedicated_copy || queue_family_timestamp_bits(bits, *dedicated_copy) != 0);
+}
 
 // Queue families for D3D12's three queue types. Direct needs graphics. Compute prefers a family with compute and no
 // graphics (async compute), copy one with transfer and neither (a DMA engine); each falls back to a more capable

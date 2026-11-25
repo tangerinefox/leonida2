@@ -18,6 +18,7 @@
 // (--overlay, default <game-dir>/overlay) so the package is never modified (shims/file_system.cpp).
 #include <windows.h>
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -27,15 +28,113 @@
 #include <system_error>
 #include <vector>
 
+#include <cstring>
+
+namespace {
+
+// The retail executable (1.0.2.1) runs a hang watchdog thread (function at RVA 0x2215a60): when the game's main loop
+// has not set its "kick" byte (RVA 0x71b6331) for 30 one-second ticks, it calls a crash callback and then writes to
+// address 0 (`movl $0, 0` at RVA 0x2215c35). Under the runtime the game thread can legitimately stall for longer than
+// that, e.g. while the driver compiles pipelines against a cold cache (first boot after a driver update), and the
+// title then kills itself. By default the watchdog stays armed, as on the console. With LEONIDA_TITLE_WATCHDOG=0, and
+// only when that exact trap instruction sits where it does in this build, a runtime thread sets the kick byte twice a
+// second so the title's watchdog never fires.
+constexpr std::uint32_t kWatchdogTrapRva = 0x2215c35;
+constexpr std::uint32_t kWatchdogKickRva = 0x71b6331;
+constexpr unsigned char kWatchdogTrap[] = {0xC7, 0x04, 0x25, 0, 0, 0, 0, 0, 0, 0, 0};  // movl $0, 0x0
+
+void keep_title_watchdog_kicked(std::uint8_t* base) {
+    char value[4]{};
+    if (GetEnvironmentVariableA("LEONIDA_TITLE_WATCHDOG", value, sizeof(value)) != 1 || value[0] != '0') return;
+    MEMORY_BASIC_INFORMATION trap{}, kick{};
+    if (!VirtualQuery(base + kWatchdogTrapRva, &trap, sizeof(trap)) || trap.State != MEM_COMMIT ||
+        std::memcmp(base + kWatchdogTrapRva, kWatchdogTrap, sizeof(kWatchdogTrap)) != 0)
+        return;  // not the build this was measured on: leave the title's watchdog alone
+    const DWORD writable = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    if (!VirtualQuery(base + kWatchdogKickRva, &kick, sizeof(kick)) || kick.State != MEM_COMMIT ||
+        !(kick.Protect & writable))
+        return;
+    volatile std::uint8_t* const byte = base + kWatchdogKickRva;
+    const HANDLE thread = CreateThread(
+        nullptr, 0,
+        [](LPVOID p) -> DWORD {
+            auto* b = static_cast<volatile std::uint8_t*>(p);
+            for (;;) {
+                *b = 1;
+                Sleep(500);
+            }
+        },
+        const_cast<std::uint8_t*>(byte), 0, nullptr);
+    if (thread) {
+        CloseHandle(thread);
+        std::fprintf(stderr, "[rt] loader: keeping the title's hang watchdog kicked (LEONIDA_TITLE_WATCHDOG=0; unset or 1 keeps it armed)\n");
+    }
+}
+
+// LEONIDA_PEEK="0x9e1dac0:3,0x7446510,0x98f828c" (diagnostic): a thread prints the 8-byte values at these RVAs of the
+// title's image (":n" = n consecutive values) every LEONIDA_PEEK_SECONDS (default 10). For answering "what does this
+// global hold at run time" without a debugger: the reverse-engineering notes (docs/re/requests.md) ask for exactly
+// that. Reads are checked; nothing is written.
+void start_title_peek(std::uint8_t* base) {
+    static char spec[1024];
+    const DWORD n = GetEnvironmentVariableA("LEONIDA_PEEK", spec, sizeof(spec));
+    if (!n || n >= sizeof(spec)) return;
+    static std::uint8_t* image = base;
+    const HANDLE thread = CreateThread(
+        nullptr, 0,
+        [](LPVOID) -> DWORD {
+            char seconds[16]{};
+            DWORD period = 10;
+            if (GetEnvironmentVariableA("LEONIDA_PEEK_SECONDS", seconds, sizeof(seconds)) > 0)
+                period = std::max<DWORD>(1, static_cast<DWORD>(std::strtoul(seconds, nullptr, 10)));
+            for (unsigned tick = 0;; ++tick) {
+                std::string line = "[rt] peek t=" + std::to_string(tick * period) + "s:";
+                for (const char* at = spec; *at;) {
+                    char* end = nullptr;
+                    const std::uint64_t rva = std::strtoull(at, &end, 16);
+                    if (end == at) break;
+                    unsigned count = 1;
+                    if (*end == ':') count = static_cast<unsigned>(std::strtoul(end + 1, &end, 10));
+                    char text[40];
+                    std::snprintf(text, sizeof(text), " 0x%llx=", static_cast<unsigned long long>(rva));
+                    line += text;
+                    for (unsigned i = 0; i < count && i < 16; ++i) {
+                        std::uint64_t value = 0;
+                        SIZE_T got = 0;
+                        const bool ok = ReadProcessMemory(GetCurrentProcess(), image + rva + 8ull * i, &value,
+                                                          sizeof(value), &got) && got == sizeof(value);
+                        std::snprintf(text, sizeof(text), ok ? "%s%llx" : "%s?", i ? "," : "",
+                                      static_cast<unsigned long long>(value));
+                        line += text;
+                    }
+                    at = *end == ',' ? end + 1 : end;
+                    if (at == end && *end) break;
+                }
+                std::fprintf(stderr, "%s\n", line.c_str());
+                Sleep(period * 1000);
+            }
+        },
+        nullptr, 0, nullptr);
+    if (thread) CloseHandle(thread);
+}
+
+}  // namespace
+
 #include "base_reservation.h"
 #include "code_hooks.h"
 #include "cpu_emulation.h"
 #include "host_cpu.h"
 #include "mods.h"
 #include "pe_loader.h"
+#include "thread_stacks.h"
+#include "title_page_watch.h"
+#include "title_geometry_watch.h"
 #include "../shims/d3d12_trace.h"
 #include "../shims/d3d12_xs_device.h"
 #include "../shims/file_system.h"
+#ifdef LEONIDA_VULKAN_DEVICE
+#include "../shims/package_splash.h"
+#endif
 #include "../shims/process_shim.h"
 #include "../shims/shims.h"
 #include "../shims/startup_trace.h"
@@ -52,6 +151,16 @@ const char* binding_name(rt::Binding b) {
     }
 }
 
+// Module TLS index 0 for the game's executable (rt::reserve_tls_index0), from the CRT's initializer table: .CRT$XCT
+// runs after the C runtime is set up and before every C++ dynamic initializer of gta6rt (.CRT$XCU), so before any of
+// gta6rt's code can have started a thread. The frames above it (wmainCRTStartup, __scrt_common_main_seh, _initterm)
+// hold no TLS slot address. The result is read again where an image is run.
+void __cdecl reserve_tls_index0_at_start() { rt::reserve_tls_index0(); }
+#pragma section(".CRT$XCT", read)
+extern "C" __declspec(allocate(".CRT$XCT")) void(__cdecl* const gta6rt_reserve_tls_index0)() =
+    reserve_tls_index0_at_start;
+#pragma comment(linker, "/INCLUDE:gta6rt_reserve_tls_index0")
+
 int usage() {
     std::fprintf(stderr,
                  "usage: gta6rt --dry-run <image> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace FILE]\n"
@@ -61,6 +170,17 @@ int usage() {
 }
 
 }  // namespace
+
+#ifdef LEONIDA_VULKAN_DEVICE
+static BOOL WINAPI show_package_window(HWND window, int command) {
+    const BOOL previous = ShowWindow(window, command);
+    const DWORD error = GetLastError();
+    if (command != SW_HIDE && rt::package_splash::paint_window(window))
+        rt::startup_trace::event("package_splash_window");
+    SetLastError(error);
+    return previous;
+}
+#endif
 
 int wmain(int argc, wchar_t** argv) {
     std::filesystem::path image, game_dir, overlay_dir, mods_dir;
@@ -120,6 +240,15 @@ int wmain(int argc, wchar_t** argv) {
         return ec ? p : a;
     };
     game_dir = game_dir.empty() ? absolute_or_same(image).parent_path() : absolute_or_same(game_dir);
+    // An unattended run can select a fresh write root even when its launcher supplies --overlay.
+    if (const DWORD size = GetEnvironmentVariableW(L"LEONIDA_WRITE_DIR", nullptr, 0)) {
+        std::wstring dir(size, 0);
+        const DWORD n = GetEnvironmentVariableW(L"LEONIDA_WRITE_DIR", dir.data(), size);
+        if (n && n < size) {
+            dir.resize(n);
+            overlay_dir = dir;
+        }
+    }
     if (!overlay_dir.empty()) overlay_dir = absolute_or_same(overlay_dir);
     // LEONIDA_SHADERS too: the D3D12 device reads it at the title's first pipeline state, after it may have moved.
     if (const DWORD size = GetEnvironmentVariableW(L"LEONIDA_SHADERS", nullptr, 0)) {
@@ -137,6 +266,18 @@ int wmain(int argc, wchar_t** argv) {
     // GAME: paths read under --game-dir; whatever a title writes lands in the overlay, never in the package.
     if (overlay_dir.empty()) overlay_dir = game_dir / "overlay";
     rt::fs::configure(game_dir, overlay_dir);
+#ifdef LEONIDA_VULKAN_DEVICE
+    if (run) {
+        rt::package_splash::configure(game_dir);
+        if (rt::package_splash::configured()) {
+            const rt::shims::Entry window_imports[] = {
+                {"ext-ms-win-rtcore-ntuser-window-l1-1-0.dll", "ShowWindow", reinterpret_cast<void*>(&show_package_window)},
+                {"user32.dll", "ShowWindow", reinterpret_cast<void*>(&show_package_window)},
+            };
+            rt::shims::Table{window_imports, std::size(window_imports)};
+        }
+    }
+#endif
     // Mods (docs/modding.md): <folder of gta6rt.exe>\mods unless --mods names another. Loaded and reported here;
     // the archetype swaps take effect once the game's archetype lookup is hooked for this executable version.
     if (mods_dir.empty()) {
@@ -168,6 +309,9 @@ int wmain(int argc, wchar_t** argv) {
     rt::d3d12_trace::set_enabled(trace_d3d12);
     // Slot 133 imports the title's pages; xmem commits them on first touch, so they are committed first.
     rt::d3d12_xs::set_placed_at_va_pages_hook(&rt::xmem::commit_physical_range);
+    // So do the file shims' reads, whose kernel writes do not fault them in: on ERROR_NOACCESS (title_page_watch.h).
+    leonida::geometry_writes::aliases.store(&rt::xmem::geometry_aliases);
+    leonida::kernel_writes::set_committer(&rt::xmem::commit_physical_range);
     if (int trace_error = 0; !trace_file.empty() && !rt::startup_trace::open(trace_file.c_str(), &trace_error)) {
         std::fprintf(stderr, trace_error == EEXIST ? "error: the trace file already exists; --trace only creates a new file\n"
                                                    : "error: cannot create the trace file\n");
@@ -186,6 +330,20 @@ int wmain(int argc, wchar_t** argv) {
     try {
         rt::Loader loader(game_dir);
         rt::Module& main_module = loader.load(image);  // maps, binds and installs TLS; runs no image code
+        // An executable with TLS that did not get index 0: its /GA code would read and write the TLS in slot 0, which
+        // is gta6rt's own (or another executable's), so no code of it may run.
+        const auto* main_nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(
+            main_module.base + reinterpret_cast<const IMAGE_DOS_HEADER*>(main_module.base)->e_lfanew);
+        const bool main_is_exe = (main_nt->FileHeader.Characteristics & IMAGE_FILE_DLL) == 0;
+        if ((init || run) && main_is_exe && main_module.tls_slot != rt::kNoTlsIndex && main_module.tls_index != 0) {
+            std::string why;
+            if (rt::reserve_tls_index0(&why)) why = "another mapped executable holds it";
+            std::fprintf(stderr,
+                         "error: %s cannot have module TLS index 0 (%s); code built with /GA would read and write "
+                         "another module's TLS through slot 0, so it is not run\n",
+                         main_module.name.c_str(), why.c_str());
+            return 1;
+        }
         // The mods' archetype swaps (docs/modding.md): hooked here, before any image code runs, when the lookup's RVA
         // for this executable is given. The count of redirected calls shows whether the RVA is the real lookup.
         if (view_mode_getter_rva) {
@@ -272,7 +430,13 @@ int wmain(int argc, wchar_t** argv) {
         }
         std::printf("running %s\n", main_module.name.c_str());
         std::fflush(stdout);
-        const int code = rt::process::run_entry(main_module.base + main_module.entry_rva);
+        keep_title_watchdog_kicked(main_module.base);
+        start_title_peek(main_module.base);
+        int code;
+        {
+            auto stacks = rt::start_thread_stacks();
+            code = rt::process::run_entry(main_module.base + main_module.entry_rva);
+        }
         std::fflush(stdout);
         std::printf("game exited with code %d\n", code);
         rt::shims::report_called_unimplemented();

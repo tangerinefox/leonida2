@@ -148,7 +148,11 @@ program whose kind 0 is too short for word 4 keeps the code heuristic.
   - Measured on RDNA2 hardware (gfx1036, through `tools/hw_oracle`, the instruction given as two raw words): with
     `op_sel` 2 and `op_sel_hi` 5 the result is the dot product with the two 16-bit halves of the second source
     exchanged, in all 5 operand sets (4 of them give another word under the plain rule). So `op_sel` selects halves
-    here as it does for the packed 16-bit ops. The words are in `tests/semantic/test_alu_dot4_i8.py`.
+    here as it does for the packed 16-bit ops. On a gap in LLVM’s listing, the translator decodes this exact
+    unclamped, unnegated form from the original bytes, including its source registers and literal. Other
+    undecodable words retain the reachable-code check. LLVM can also print the default high-half selector for
+    an inline integer second source. If that selector is the only changed bit, the translator preserves the
+    stored low-half replication. The hardware measurements are in `tests/semantic/test_alu_dot4_i8.py`.
 
 ## Kind 7: records
 
@@ -230,7 +234,70 @@ with a blob holding the dword 0, so the DLL creates no compute scratch buffer; w
 Not done here: using kind 0 at run time beyond what the translated module already carries (its thread-group size
 and `RSRC2`).
 
+**Slot 57 (`DeserializeGraphicsPipelineStateX`, graphics FSPX).** At `game_scarlett_master.exe+0x2477578`, the retail
+title calls device slot 57 (`+0x1c8`) with `IID_ID3D12PipelineState` (`{765a30f3-f624-4c6f-a828-ace948622445}`) and a
+104-byte description (`+0x00..+0x60`) populated from the zlib-compressed pipeline library in `shaders.rpf`
+([shader_library.md](shader_library.md): 25,471 graphics records + 2,693 compute records):
+
+| Offset | Field | Measured layout |
+|---|---|---|
+| `+0x00` | `ID3D12RootSignature*` | Root signature pointer |
+| `+0x08`, `+0x10` | `state_blob`, `state_blob_size` | 380..404 B (388 B in 24,797 records; 380 B in depth-only boot PSO 3) |
+| `+0x18`, `+0x20` | `pipeline_blob`, `pipeline_blob_size` | 80..224 B (188 B = `0xbc` in boot PSOs 1..3); holds the `D3D12_INPUT_ELEMENT_DESC` array |
+| `+0x28`, `+0x30` | `prog_a`, `prog_a_size` | First native RDNA2 kind-6 program (448 / 768 B `ps` in boot PSOs 1..2; `0/0` in boot PSO 3) |
+| `+0x38`, `+0x40` | `stage_a`, `stage_a_size` | Stage blob (kind 2, 208 B in boot PSOs 1..2; `0/0` in boot PSO 3) |
+| `+0x48`, `+0x50` | `prog_b`, `prog_b_size` | Second native RDNA2 kind-6 program (384 / 320 B `vs` in boot PSOs 1..3) |
+| `+0x58`, `+0x60` | `stage_b`, `stage_b_size` | Stage blob (kind 2, 752 B in boot PSOs 1..3) |
+
+- **First three boot graphics PSOs (matched in `shaders.rpf` pipeline library):**
+  1. Record 8916 (`2f04ef59bc062cf8`): state 388 B (`0x4005d808`), pipeline blob 188 B (`0xea6f6e56`), `ps` prog 842 (448 B, SHA-256 `9e5ffd2c6c521c03...`), `vs` prog 843 (384 B, SHA-256 `160fbe4368fb1a63...`).
+  2. Record 8917 (`f7808a66fb6b97c1`): state 388 B (`0x4005d808`), pipeline blob 188 B (`0x542385d2`), `ps` prog 844 (768 B, SHA-256 `947014e8b0771be5...`), `vs` prog 845 (320 B, SHA-256 `a2dce0214f82c742...`).
+  3. Record 12511 (`e750e10eacb97b9c`): state 380 B (`0x4005d808`), pipeline blob 188 B (`0xfb724939`), no `ps`, `vs` prog 5636 (320 B, SHA-256 `f6bfddbad6aef3cd...`).
+  In the library, the 448/768 B program at `+0x28` is the pixel shader (`ps`, paired with the 208 B stage blob) and the
+  384/320 B program at `+0x48` is the vertex shader (`vs`, paired with the 752 B stage blob). Programs are looked up by
+  `sha256(program bytes)` in `<shaders>/fspx_gfx/index.json` (`ShaderLibrary::fspx_gfx_size()`, separate from
+  `fspx_size()`), and their `stage` (`"vs"` / `"ps"` / `"ms"`) is taken from the index entry rather than the blob slot.
+- **Measured `pipeline blob` layout (188 B = `0xbc`):**
+  - `+0x00`: u32 per-PSO checksum (`0xea6f6e56` / `0x542385d2` / `0xfb724939`)
+  - `+0x04`: u32 `0x1000` (constant across 2,642 blobs), `+0x08`: `0`, `+0x0c`: `1`
+  - `+0x10`: u32 per-element field-block size (`0x1c` = 28 B = 7 u32 in PSOs 1..2; `0` in PSO 3 where the stride remains 28 B)
+  - `+0x1c`: u32 `0xffffffff`, `+0x24`: `0x00130100` (PSOs 1..2) / `0x00130037` (PSO 3), `+0x28`: `1`
+  - `+0x38`: u32 `0x70` (or `0x6d`) = `4 + n * 28 + sum(len(name) + 1)`
+  - `+0x3c`: u32 `0x0c` (constant across 2,642 blobs)
+  - `+0x4c`: u32 element count (`3` across the library)
+  - `+0x50`: u32 maximum name stride including NUL (`9` or `6`)
+  - `+0x54..`: variable-length element array. Each element is a NUL-terminated ASCII semantic name followed by 7 u32s
+    (28 B): `+0x00` `InputSlot` (`0`), `+0x04` `DXGI_FORMAT` (`6` = `R32G32B32_FLOAT` for `POSITION` at `0x54`/`0x5d`,
+    `28` = `R8G8B8A8_UNORM` for `COLOR` at `0x79`/`0x7f`, `16` = `R32G32_FLOAT` for `TEXCOORD` at `0x9b`/`0xa4`),
+    `+0x08` `SemanticIndex` (`0`), `+0x0c` `AlignedByteOffset` (`0`, `12`, `16`). The stored blob truncates the unused
+    tail of the final 28-byte block by 1..4 bytes (`0xa4 + 28 = 0xc0 > 0xbc` in PSO 1), so the parser bounds-checks
+    every 4-byte read against `blob_size`.
+- **Measured `state blob` (380..388 B) and `stage blob` (kind 2):**
+  - `state blob`: `+0x000` version tag (`0x4005d800` in 15,632 records, `0x4005d808` in 9,159, `0x4005d810` in 6),
+    `+0x004` family (`4` in 12,735 or `6` in 12,062), `+0x02c = 2`, `+0x07c` (`0xcc0010` / `0` / `0xcc0011`),
+    `+0x0f4 = 5`, `+0x0f8 = 1`, `+0x0fc = 0x33333333` (`0.1f`), `+0x100..+0x11c` (`0x00060006` x8), `+0x150 = 0x40`,
+    `+0x158 = 0xffffffff`, `+0x17c = 0x10000a00`. Unidentified offsets are logged once per offset while safe default
+    raster/depth/blend state is used.
+  - `stage blob`: `+0x00 = 2` (graphics stage blob), `+0x04` payload size (`196` in 208 B blobs), `+0x08 = 0x66`,
+    `+0x0c = 0x40 | flags`, followed by records `0x41` (32 B input/output signature), `0x42` (32 B output signature)
+    and `0x43` (20 B: tag + 16 B opaque digest).
+
 ## Translation status
+
+In wave64, VALU compares and carry outputs write both predicate words. Conditional selects and carry inputs
+read the corresponding word for each half-wave. Earlier LLVM listings used wave32 register spellings for these
+operands. The translator uses the dispatch wave size to recover their width in cached listings.
+
+All 29 distinct program and dispatch-state pairs in the measured DLL resolve through the compute pipeline lookup.
+The eight recovered programs pass Vulkan 1.2 SPIR-V validation. The original container and the split pipeline
+parts select the same module. Changing one bit of the supplied state rejects the candidate in all 29 cases.
+
+On an RTX 4070, passes 1, 2, 7, 9, 10, 11 and 12 matched every byte of the 32 MiB reference tensor for one
+workgroup. Five references came from the TuxBox native gfx1036 tensor measurements. The other two came from
+an independent ISA interpreter. The postpass matched all 81,920 reference image components with a maximum
+finite absolute error of 5.96e-8. These checks use deterministic inputs.
+
+### Earlier measurements
 
 With `tools/fspx_unpack.py --disasm` and `tools/rdna2spirv.py` on the 29 programs (`main` at `aa2988cc` with the
 `v_fma_mix*` literal repair in [design.md](design.md), "Printed encodings"):

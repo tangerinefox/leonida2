@@ -67,7 +67,7 @@ and the individual stubs in
 | 4 | `D3D12ConfigureVirtualMemoryX` | console | present (returns `S_OK`) | VM policy; PC/Vulkan owns it. Measured: one pointer argument (a zeroed 32-byte block, dword +4 set to a count); the title only tests the result for failure |
 | 5 | `D3D12CreateDevice` | standard | **absent** | Leonida exports only the Xbox entry point; see §2.3 |
 | 6 | `D3D12CreateRootSignatureDeserializer` | standard | present | forwarded |
-| 7 | `D3D12CreateVersionedRootSignatureDeserializer` | standard | absent | forward if imported |
+| 7 | `D3D12CreateVersionedRootSignatureDeserializer` | standard | present | forwarded, Xbox flags cleared on a copy |
 | 8 | `D3D12EnableExperimentalFeatures` | standard | absent | forward if imported |
 | 9 | `D3D12GetDebugInterface` | standard | absent | forward if imported |
 | 10 | `D3D12SerializeRootSignature` | standard | present | forwarded, flags cleared on a copy |
@@ -222,6 +222,20 @@ the fact; the spelling may be de-branded.
 
 The other 18 function names and all 83 standard GUID names carry no token and can be used as
 published.
+
+**Feature level at device creation (BL-2).** The 24-word `params` block carries no feature level that Leonida
+reads, so the host path of `D3D12XboxCreateDevice` picks the PC `D3D12CreateDevice`'s *minimum* itself. It used to
+ask for `D3D_FEATURE_LEVEL_12_0`, which a comment called the least restrictive floor. That is wrong: the minimum
+refuses every adapter below it, so a host that tops out at 11_x (vkd3d on some Wine/Proton setups) failed with
+`E_INVALIDARG`. `rt::d3d12_xs::create_host_device` now asks for `kHostDeviceFloor` = 11_0, the lowest level D3D12
+creates a device at. The device keeps its highest level, which `D3D12_FEATURE_FEATURE_LEVELS` reports and the run log
+prints ("host device created at minimum feature level 11_0; highest level 12_1" with WARP or the RTX 5070 Ti, driver
+617.42). `xs_proxy_mock_test` drives it with mock hosts that top out at 11_0, 11_1, 12_0, 12_1 and 12_2. Each one is
+created at 11_0, and the Xbox-ABI proxy's slot 13 (`CheckFeatureSupport`) reports that host's own top level. With
+12_0 as the floor, the 11_x hosts fail. The Vulkan-backed device (`LEONIDA_D3D12=vulkan`) takes no feature level. It
+answers `FEATURE_LEVELS` up to 12_1, because it reports no ray tracing tier and no sampler feedback, both of which
+12_2 requires (`docs/d3d12_vulkan.md`). No Wine host was available, so the original 11_x failure is not reproduced
+here; the mock is its stand-in.
 
 ### 2.4 How ordinals 72–99 were recovered
 

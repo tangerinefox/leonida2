@@ -350,6 +350,12 @@ class UsersigTest(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn("graphics PSOs sampled: 1 of 2", p.stdout)
 
+    def test_entry_and_limit_combined_is_a_usage_error(self):
+        p = run(self.path, "--entry", "0", "--limit", "1")
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("--limit cannot be combined with --entry", p.stderr)
+        self.assertEqual(p.stdout, "")
+
     def test_json(self):
         p = run(self.path, "--json")
         self.assertEqual(p.returncode, 0, p.stderr)

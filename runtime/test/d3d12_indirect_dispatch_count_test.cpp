@@ -1,7 +1,9 @@
 // D3D12 ExecuteIndirect with a GPU count buffer and one DISPATCH argument per record.
 // The same synthetic workload runs on native WARP and on the Vulkan layer, with actual GPU readback.
+// Under Wine the WARP runs are skipped (host_wine.h) and the layer is checked against the expected result alone.
 // Set LEONIDA_VK_VALIDATION=1 to enable Vulkan core and synchronization validation.
 #include "vk_test_device.h"
+#include "host_wine.h"
 #include "shader_fixture_path.h"
 #include "d3d12_test_shaders.h"
 #include "../shims/d3d12_com.h"
@@ -177,24 +179,35 @@ std::string module_version(const wchar_t* name) {
 }  // namespace
 
 int main() {
-    using Compile = decltype(&D3DCompile);
-    const HMODULE compiler = LoadLibraryExW(L"d3dcompiler_47.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-    if (!compiler) return 77;
-    const auto compile = reinterpret_cast<Compile>(GetProcAddress(compiler, "D3DCompile"));
-    if (!compile) return 77;
-    Ref<ID3DBlob> native, errors;
-    if (FAILED(compile(native_shader, std::strlen(native_shader), nullptr, nullptr, nullptr,
-                       "main", "cs_5_0", 0, 0, &native.p, &errors.p)) || !native.p)
-        return 1;
-    const auto* native_bytes = static_cast<const std::uint8_t*>(native->GetBufferPointer());
-    const std::vector<std::uint8_t> native_code(native_bytes, native_bytes + native->GetBufferSize());
+    // Wine has no WARP (its host is vkd3d on the GPU), and its D3DCompile has no RWByteAddressBuffer::InterlockedAdd
+    // (E5005 on wine-staging 11.21), so the reference shader did not build and the test ended before the layer ran.
+    // The host runs are skipped there; the layer is still checked against expected().
+    const bool compare_host = !hostwine::host_is_wine();
+    std::vector<std::uint8_t> native_code;
     Ref<IDXGIFactory4> factory;
     Ref<IDXGIAdapter> warp;
     Ref<ID3D12Device> host;
-    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))) ||
-        FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp.p))) ||
-        FAILED(D3D12CreateDevice(warp.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p))))
-        return 77;
+    if (compare_host) {
+        using Compile = decltype(&D3DCompile);
+        const HMODULE compiler = LoadLibraryExW(L"d3dcompiler_47.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (!compiler) return 77;
+        const auto compile = reinterpret_cast<Compile>(GetProcAddress(compiler, "D3DCompile"));
+        if (!compile) return 77;
+        Ref<ID3DBlob> native, errors;
+        if (FAILED(compile(native_shader, std::strlen(native_shader), nullptr, nullptr, nullptr,
+                           "main", "cs_5_0", 0, 0, &native.p, &errors.p)) || !native.p) {
+            std::fprintf(stderr, "D3DCompile of the reference shader failed%s%.*s\n", errors.p ? ": " : "",
+                         errors.p ? int(errors->GetBufferSize()) : 0,
+                         errors.p ? static_cast<const char*>(errors->GetBufferPointer()) : "");
+            return 1;
+        }
+        const auto* native_bytes = static_cast<const std::uint8_t*>(native->GetBufferPointer());
+        native_code.assign(native_bytes, native_bytes + native->GetBufferSize());
+        if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))) ||
+            FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp.p))) ||
+            FAILED(D3D12CreateDevice(warp.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p))))
+            return 77;
+    }
 
     vktest::Device vk;
     vk.request_buffer_device_address = true;
@@ -237,12 +250,13 @@ int main() {
         for (bool update : {false, true}) {
             std::array<UINT, 2> native_result{}, layer_result{};
             const auto want = expected(count, update);
-            if (!run(host.p, native_code, count, update, native_result, false) ||
+            if (!compare_host) native_result = want;  // no host run: the layer alone is held to `want`
+            if ((compare_host && !run(host.p, native_code, count, update, native_result, false)) ||
                 !run(layer.p, container, count, update, layer_result, true) || layer_result != want ||
                 (native_result != want && !(update && native_result == expected(count, update, count)))) {
-                std::fprintf(stderr, "count %u update %d: host %u/%u, layer %u/%u, expected %u/%u\n",
+                std::fprintf(stderr, "count %u update %d: host %u/%u%s, layer %u/%u, expected %u/%u\n",
                              count, int(update), native_result[0], native_result[1],
-                             layer_result[0], layer_result[1], want[0], want[1]);
+                             compare_host ? "" : " (not run)", layer_result[0], layer_result[1], want[0], want[1]);
                 return 1;
             }
             if (native_result != want) {
@@ -262,7 +276,9 @@ int main() {
         std::fprintf(stderr, "validation errors: %u\n", vk.validation_errors());
         return 1;
     }
-    std::printf("counted ExecuteIndirect(DISPATCH): %u native WARP / Vulkan GPU comparisons passed; "
-                "count=0,1,max,>max, nonzero offsets and GPU count overwrite, no validation errors\n", cases);
+    std::printf("counted ExecuteIndirect(DISPATCH): %u %s passed; "
+                "count=0,1,max,>max, nonzero offsets and GPU count overwrite, no validation errors\n", cases,
+                compare_host ? "native WARP / Vulkan GPU comparisons"
+                             : "Vulkan GPU results against the expected values (no WARP runs under Wine)");
     return 0;
 }

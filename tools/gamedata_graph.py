@@ -42,13 +42,16 @@ import json
 import os
 import re
 import sys
+import tempfile
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict, deque
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
+from file_mode import published_mode  # noqa: E402
 import gamedata_xml as gx  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 
 MANIFEST_ROOTS = ("CDataFileMgr__ContentChangeSetDef", "CDataFileMgr__ContentDef")
 MANIFEST_ROOT_SET = frozenset(MANIFEST_ROOTS)
@@ -190,6 +193,7 @@ def resolve_parent_paths(root) -> dict:
     parent_of = {child: parent for parent in root.iter() for child in parent}
     position = {element: index for index, element in enumerate(root.iter())}
     result = {"sites": 0, "xpath_sibling": 0, "resolved": 0, "ambiguous": 0, "links": []}
+    sibling_index = {}
     for element in root.iter():
         value = (element.attrib.get("parentPath") or "").strip()
         if not value:
@@ -201,8 +205,17 @@ def resolve_parent_paths(root) -> dict:
             continue
         result["xpath_sibling"] += 1
         tag, attribute, wanted = match.group(1), match.group(2), match.group(4)
-        hits = [sibling for sibling in container
-                if sibling.tag == tag and sibling.attrib.get(attribute) == wanted]
+        key = (id(container), tag, attribute)
+        by_value = sibling_index.get(key)
+        if by_value is None:
+            by_value = defaultdict(list)
+            for sibling in container:
+                if sibling.tag == tag:
+                    val = sibling.attrib.get(attribute)
+                    if val is not None:
+                        by_value[val].append(sibling)
+            sibling_index[key] = by_value
+        hits = by_value.get(wanted, ())
         if len(hits) == 1:
             result["resolved"] += 1
             result["links"].append((position[element], position[hits[0]]))
@@ -587,11 +600,34 @@ def print_summary(graph: dict) -> None:
           f'{unresolved["include_id_missing"]} missing include id)')
 
 
-def main() -> int:
+def write_json(path: str, graph: dict) -> None:
+    """Atomically write LF-only JSON, preserving file permissions and cleaning up temp files on error."""
+    target = os.path.abspath(path)
+    parent = os.path.dirname(target) or "."
+    payload = (json.dumps(graph, indent=1, allow_nan=False) + "\n").encode("utf-8")
+    fd, tmp_path = tempfile.mkstemp(prefix=".gamedata_graph_", suffix=".tmp", dir=parent)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(payload)
+        os.chmod(tmp_path, published_mode(target))
+        replace_retry(tmp_path, target)
+    except BaseException:
+        try:
+            os.chmod(tmp_path, 0o600)
+        except OSError:
+            pass
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("targets", nargs="+", help="carve directory or XML file(s)")
     parser.add_argument("--json", help="write the aggregate graph summary to this JSON")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     try:
         if args.json:
@@ -629,8 +665,7 @@ def main() -> int:
     print_summary(graph)
     if args.json:
         try:
-            with open(args.json, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(graph, f, indent=1)
+            write_json(args.json, graph)
         except OSError as exc:
             print(f"cannot write {args.json}: {exc.strerror or exc}", file=sys.stderr)
             return 2

@@ -21,6 +21,22 @@ PASS = "import unittest\nimport helper\nclass T(unittest.TestCase):\n    def tes
 FAIL = "import unittest\nclass T(unittest.TestCase):\n    def test_a(self): self.assertEqual(1, 2, 'boom-msg')\n"
 BROKEN = "import no_such_module_anywhere\n"
 HANG = "import time\nprint('before-sleep-marker', flush=True)\ntime.sleep(60)\n"
+RAN0 = ("import unittest\nclass T(unittest.TestCase):\n    def test_a(self):\n"
+        "        print('Ran 0 tests in 0.000s', flush=True)\n")
+RAN0_AT_EXIT = ("import atexit\nimport unittest\natexit.register(lambda: print('Ran 0 tests in 0.000s'))\n"
+                "class T(unittest.TestCase):\n    def test_a(self):\n        pass\n")
+# An atexit handler that writes to stderr after unittest's own summary: the count comes from unittest's result
+# object, so the late line cannot change it.
+ATEXIT_STDERR = ("import atexit\nimport sys\nimport unittest\n"
+                 "atexit.register(lambda: unittest.TextTestRunner(stream=sys.stderr, verbosity=0)"
+                 ".run(unittest.TestSuite()))\n"
+                 "class T(unittest.TestCase):\n    def test_a(self):\n        pass\n")
+LATE_SUMMARY = ("import atexit\nimport sys\nimport unittest\n"
+                "atexit.register(lambda: print('Ran 7 tests in 0.000s', file=sys.stderr))\n"
+                "class T(unittest.TestCase):\n    def test_a(self):\n        pass\n")
+# A test that runs a nested unittest runner: that runner writes its own summary to stderr while the test runs.
+NESTED = ("import sys\nimport unittest\nclass T(unittest.TestCase):\n    def test_a(self):\n"
+          "        unittest.TextTestRunner(stream=sys.stderr, verbosity=0).run(unittest.TestSuite())\n")
 
 
 def suite(tmp, files):
@@ -56,6 +72,39 @@ class RunnerTest(unittest.TestCase):
             self.assertIn("TIMED OUT after 1 s: test_hang", result.stdout)
             self.assertIn("3 files, 4 tests, 1 files failed", result.stdout)
             self.assertNotIn("Traceback", result.stdout + result.stderr)
+
+    def test_the_count_comes_from_unittest_not_from_a_test_line(self):
+        # A test may print a line of the same shape as unittest's own summary. unittest writes its summary to stderr
+        # and a test's own output to stdout, so the count comes from stderr: in the merged output it was whichever
+        # line came first, which depended on stdout buffering.
+        for source in (RAN0, RAN0_AT_EXIT):
+            with self.subTest(source=source.split(chr(10))[0]), tempfile.TemporaryDirectory() as tmp:
+                suite(tmp, {"test_counts.py": source})
+                result = cli(tmp, "-j", "2")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("1 files, 1 tests, 0 files failed", result.stdout)
+                self.assertNotIn("no tests ran", result.stdout)
+
+    def test_the_count_comes_from_unittest_not_from_a_nested_runner(self):
+        # A test that runs a nested unittest runner writes that runner's summary ("Ran 0 tests in ...") to stderr
+        # while the test runs, before unittest writes its own. The count must come from unittest's own summary.
+        with tempfile.TemporaryDirectory() as tmp:
+            suite(tmp, {"test_counts.py": NESTED})
+            result = cli(tmp, "-j", "2")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("1 files, 1 tests, 0 files failed", result.stdout)
+            self.assertNotIn("no tests ran", result.stdout)
+
+    def test_the_count_comes_from_the_result_object_not_from_a_late_summary(self):
+        # A summary written to stderr after unittest's own - an atexit handler that runs a nested runner, or one
+        # that prints a line of that shape - must not change the count: it comes from unittest's result object.
+        for source in (ATEXIT_STDERR, LATE_SUMMARY):
+            with self.subTest(source=source.split(chr(10))[0]), tempfile.TemporaryDirectory() as tmp:
+                suite(tmp, {"test_counts.py": source})
+                result = cli(tmp, "-j", "2")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("1 files, 1 tests, 0 files failed", result.stdout)
+                self.assertNotIn("no tests ran", result.stdout)
 
     def test_serial_timeout_keeps_discover_output_and_names_the_suite(self):
         with tempfile.TemporaryDirectory() as tmp:

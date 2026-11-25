@@ -478,6 +478,11 @@ class SmemBodyEvaluator:
             value = self._value(args[0]) & MASK32
         elif op == "OpShiftLeftLogical" and ty == "%ulong":
             value = (self._value(args[0]) << self._value(args[1])) & MASK64
+        elif op == "OpShiftRightArithmetic" and ty == "%ulong":
+            operand = self._value(args[0])
+            if operand >> 63:
+                operand -= 1 << 64
+            value = (operand >> self._value(args[1])) & MASK64
         elif op == "OpBitwiseOr" and ty == "%ulong":
             value = self._value(args[0]) | self._value(args[1])
         elif op == "OpIAdd" and ty == "%ulong":

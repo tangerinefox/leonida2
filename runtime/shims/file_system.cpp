@@ -41,6 +41,7 @@
 #include "file_system.h"
 #include "shims.h"
 #include "startup_trace.h"
+#include "../src/title_page_watch.h"
 
 namespace rt::fs {
 namespace {
@@ -353,6 +354,10 @@ bool same_entry(const std::vector<std::wstring>& a, const std::vector<std::wstri
 
 std::vector<std::wstring> parent_of(const std::vector<std::wstring>& parts) {
     return parts.empty() ? parts : std::vector<std::wstring>(parts.begin(), parts.end() - 1);
+}
+
+DWORD missing_error(const Roots& r, const std::vector<std::wstring>& parts) {
+    return is_folder(r, parent_of(parts)) ? ERROR_FILE_NOT_FOUND : ERROR_PATH_NOT_FOUND;
 }
 
 // Whether a folder has nothing in the title's view: no overlay entry and no package entry that is not deleted.
@@ -701,6 +706,24 @@ void note_open_failure(const char* api, LPCWSTR name, DWORD error, const void* c
             rt::startup_trace::quote(rt::startup_trace::where(reinterpret_cast<uint64_t>(caller))));
 }
 
+// LOCAL DIAGNOSTIC: gta6rt --trace FILE also records the first 600 successful opens ("file_open": path, access,
+// caller), so the startup trace shows which file the title was working on when it stopped making progress.
+void note_open(const char* api, LPCWSTR name, DWORD access, const void* caller) {
+    if (!rt::startup_trace::enabled()) return;
+    static std::atomic<int> left{600};
+    if (left.fetch_sub(1, std::memory_order_relaxed) <= 0) return;
+    std::string utf8;
+    if (const int n = WideCharToMultiByte(CP_UTF8, 0, name, -1, nullptr, 0, nullptr, nullptr); n > 1) {
+        utf8.resize(static_cast<size_t>(n) - 1);
+        WideCharToMultiByte(CP_UTF8, 0, name, -1, utf8.data(), n, nullptr, nullptr);
+    }
+    rt::startup_trace::event(
+        "file_open",
+        std::string("\"api\":\"") + api + "\",\"path\":" + rt::startup_trace::quote(utf8) + ",\"access\":" +
+            std::to_string(access) + ",\"caller\":" +
+            rt::startup_trace::quote(rt::startup_trace::where(reinterpret_cast<uint64_t>(caller))));
+}
+
 // Reads one byte of every 4 KiB page of [buffer, buffer + size) from user mode, so that pages committed on first
 // touch (xmem's physical-page views: a reserve-only section committed by its vectored handler) are committed before
 // the kernel writes into them. A page that is not valid at all is left for the caller's ReadFile to refuse. No C++
@@ -721,21 +744,6 @@ bool touch_pages(void* buffer, DWORD size) {
     return all;
 }
 
-// ReadFile with one retry for a destination the kernel cannot write yet. The retail title reads into title memory
-// that xmem maps from physical pages committed on first touch; the kernel's write raises no user-mode fault, so
-// ReadFile fails with ERROR_NOACCESS (998), and the title's read loop sleeps 1 ms and retries forever (measured on
-// 1.0.2.1, native Windows). Touching the pages from user mode commits them; the read is then retried once.
-BOOL WINAPI read_file(HANDLE file, LPVOID buffer, DWORD size, LPDWORD read, LPOVERLAPPED overlapped) {
-    if (ReadFile(file, buffer, size, read, overlapped)) return TRUE;
-    if (GetLastError() != ERROR_NOACCESS || !buffer || !size) return FALSE;
-    static std::atomic<bool> logged{false};
-    if (!logged.exchange(true))
-        std::fprintf(stderr, "[rt] fs: ReadFile into uncommitted title memory (ERROR_NOACCESS): committing the "
-                             "destination pages and retrying (logged once)\n");
-    touch_pages(buffer, size);
-    return ReadFile(file, buffer, size, read, overlapped);
-}
-
 HANDLE WINAPI create_file_w(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES attributes,
                             DWORD disposition, DWORD flags, HANDLE template_file) {
     if (!name) {
@@ -753,6 +761,8 @@ HANDLE WINAPI create_file_w(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_
         const DWORD error = GetLastError();
         note_open_failure("CreateFileW", name, error, _ReturnAddress());
         SetLastError(error);
+    } else {
+        note_open("CreateFileW", name, access, _ReturnAddress());
     }
     return h;
 }
@@ -784,6 +794,8 @@ HANDLE WINAPI create_file2(LPCWSTR name, DWORD access, DWORD share, DWORD dispos
         const DWORD error = GetLastError();
         note_open_failure("CreateFile2", name, error, _ReturnAddress());
         SetLastError(error);
+    } else {
+        note_open("CreateFile2", name, access, _ReturnAddress());
     }
     return h;
 }
@@ -1024,10 +1036,7 @@ BOOL WINAPI delete_file_w(LPCWSTR name) {
             removed = true;
         }
     }
-    if (!removed) {
-        SetLastError(ERROR_FILE_NOT_FOUND);
-        return FALSE;
-    }
+    if (!removed) return fail_bool(missing_error(r, parts));
     return TRUE;
 }
 
@@ -1116,7 +1125,7 @@ BOOL WINAPI remove_directory_w(LPCWSTR name) {
     if (r.game.empty() || r.overlay.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
     if (drive_root(name, parts)) return fail_bool(ERROR_ACCESS_DENIED);  // "GAME:" and "T:" themselves stay
     const View v = view(r, parts);
-    if (v.kind == Kind::None) return fail_bool(ERROR_FILE_NOT_FOUND);
+    if (v.kind == Kind::None) return fail_bool(missing_error(r, parts));
     if (v.kind == Kind::File) return fail_bool(ERROR_DIRECTORY);
     if (!empty_in_view(r, parts)) return fail_bool(ERROR_DIR_NOT_EMPTY);
 
@@ -1153,7 +1162,7 @@ BOOL WINAPI move_file_ex_w(LPCWSTR from, LPCWSTR to, DWORD flags) {
     if (r.game.empty() || r.overlay.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
     if (drive_root(from, src) || drive_root(to, dst)) return fail_bool(ERROR_ACCESS_DENIED);
     const View from_view = view(r, src);
-    if (from_view.kind == Kind::None) return fail_bool(ERROR_FILE_NOT_FOUND);
+    if (from_view.kind == Kind::None) return fail_bool(missing_error(r, src));
     const std::filesystem::path overlay_from = disk_path(r.overlay, src), overlay_to = disk_path(r.overlay, dst);
     if (same_entry(src, dst)) {
         // The destination is the source, so it is not "already there". The host succeeds at a move onto the same
@@ -1404,7 +1413,7 @@ BOOL WINAPI set_file_attributes_w(LPCWSTR name, DWORD attributes) {
     if (r.game.empty() || r.overlay.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
     if (parts.empty()) return fail_bool(ERROR_ACCESS_DENIED);
     const View v = view(r, parts);
-    if (v.kind == Kind::None) return fail_bool(ERROR_FILE_NOT_FOUND);
+    if (v.kind == Kind::None) return fail_bool(missing_error(r, parts));
 
     // The attributes belong to the overlay copy: a package file is copied up and a package folder mirrored first,
     // so the package keeps its own attributes and reads, which prefer the overlay, see the new ones.
@@ -1433,14 +1442,40 @@ BOOL WINAPI set_file_attributes_a(LPCSTR name, DWORD attributes) {
 namespace {
 using namespace rt::fs;
 
+// Reads into title memory. The D3D12 layer keeps some of the title's pages read-only between submissions to see
+// which ones the title writes (slot-133 shadow buffers); the kernel fails a read into such a page with
+// ERROR_NOACCESS instead of faulting, so the destination is pinned and opened first (title_page_watch.h).
+//
+// One more retry for a destination the kernel still cannot write. The retail title reads into title memory that
+// xmem maps from physical pages committed on first touch; the kernel's write raises no user-mode fault, so ReadFile
+// fails with ERROR_NOACCESS (998), and the title's read loop sleeps 1 ms and retries forever (measured on 1.0.2.1,
+// native Windows). Touching the pages from user mode commits them; the read is then retried once.
+BOOL WINAPI read_file(HANDLE file, LPVOID buffer, DWORD bytes, LPDWORD read, LPOVERLAPPED overlapped) {
+    if (leonida::kernel_writes::read_file(file, buffer, bytes, read, overlapped)) return TRUE;
+    if (GetLastError() != ERROR_NOACCESS || !buffer || !bytes) return FALSE;
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true))
+        std::fprintf(stderr, "[rt] fs: ReadFile into uncommitted title memory (ERROR_NOACCESS): committing the "
+                             "destination pages and retrying (logged once)\n");
+    touch_pages(buffer, bytes);
+    return leonida::kernel_writes::read_file(file, buffer, bytes, read, overlapped);
+}
+BOOL WINAPI read_file_ex(HANDLE file, LPVOID buffer, DWORD bytes, LPOVERLAPPED overlapped,
+                         LPOVERLAPPED_COMPLETION_ROUTINE routine) {
+    return leonida::kernel_writes::read_file_ex(file, buffer, bytes, overlapped, routine);
+}
+BOOL WINAPI read_file_scatter(HANDLE file, FILE_SEGMENT_ELEMENT segments[], DWORD bytes, LPDWORD reserved,
+                              LPOVERLAPPED overlapped) {
+    return leonida::kernel_writes::read_file_scatter(file, segments, bytes, reserved, overlapped);
+}
+
 // CreateFile, the FindFirstFile family, the attribute queries and DeleteFile arrive through kernel32/kernelbase
 // imports and through the api sets a GDK title is linked against (file-l1-1-0 for the find and attribute calls,
-// file-l1-2-0 and file-l2-1-0 for CreateFile).
+// file-l1-2-0 and file-l2-1-0 for CreateFile; ReadFile and its variants are in file-l1-1-0).
 #define FILE_API(dll)                                                                                    \
     {dll, "CreateFileA", reinterpret_cast<void*>(&create_file_a)},                                       \
         {dll, "CreateFileW", reinterpret_cast<void*>(&create_file_w)},                                   \
         {dll, "CreateFile2", reinterpret_cast<void*>(&create_file2)},                                    \
-        {dll, "ReadFile", reinterpret_cast<void*>(&read_file)},                                          \
         {dll, "FindFirstFileA", reinterpret_cast<void*>(&find_first_file_a)},                            \
         {dll, "FindFirstFileW", reinterpret_cast<void*>(&find_first_file_w)},                            \
         {dll, "FindFirstFileExA", reinterpret_cast<void*>(&find_first_file_ex_a)},                       \
@@ -1470,7 +1505,10 @@ using namespace rt::fs;
         {dll, "CopyFileExW", reinterpret_cast<void*>(&copy_file_ex_w)},                                  \
         {dll, "CopyFile2", reinterpret_cast<void*>(&copy_file2)},                                        \
         {dll, "SetFileAttributesA", reinterpret_cast<void*>(&set_file_attributes_a)},                    \
-        {dll, "SetFileAttributesW", reinterpret_cast<void*>(&set_file_attributes_w)}
+        {dll, "SetFileAttributesW", reinterpret_cast<void*>(&set_file_attributes_w)},                    \
+        {dll, "ReadFile", reinterpret_cast<void*>(&read_file)},                                          \
+        {dll, "ReadFileEx", reinterpret_cast<void*>(&read_file_ex)},                                     \
+        {dll, "ReadFileScatter", reinterpret_cast<void*>(&read_file_scatter)}
 }  // namespace
 
 SHIM_TABLE(file_system,

@@ -12,14 +12,18 @@
 //     bottom-left quadrant (yellow). Each pixel is read back and compared.
 //   - A vertex draw with the mesh PSO, and DispatchMesh with the VS one, fail at execution (ReplayResult::
 //     invalid_draw); a mesh grid beyond D3D12's limits fails at Close; an empty grid records nothing.
+//   - A DISPATCH_MESH command signature is created only with the extension; ExecuteIndirect with it records nothing
+//     yet, so its list closes.
 // The shaders are GLSL written to the translator's contract (test/glsl/ms_draw.mesh, ps_draw.frag, vs_fullscreen.vert).
 // No game data. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
+#include "../shims/d3d12_xs_pso_stream.h"
 #include "../src/shader_library.h"
 
+#include <string_view>
 #include <array>
 #include <cstring>
 
@@ -95,7 +99,10 @@ D3D12_MESH_SHADER_TIER mesh_tier(ID3D12Device* device) {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool pc_only = argc == 2 && std::string_view(argv[1]) == "--pc-stream-only";
+    EXPECT(argc == 1 || pc_only);
+    EXPECT(SetEnvironmentVariableW(L"LEONIDA_XS_STREAM_ENUM", pc_only ? L"0" : L"1"));
     vktest::Device d;
     d.request_mesh_shader = true;
     const auto device_status = d.initialize();
@@ -108,7 +115,10 @@ int main() {
     const auto ms_program = fssm_program({0x4d530001, 0xbf810000});
     const auto ps_program = fssm_program({0x50530001, 0xbf810000});
     const auto vs_program = fssm_program({0x56530002, 0xbf810000});
-    const auto ms_container = shader_container(ms_program), ps_container = shader_container(ps_program);
+    auto ms_container = shader_container(ms_program);
+    const auto ps_container = shader_container(ps_program);
+    // The synthetic container has one part at 36, followed by its eight-byte header.
+    ms_container[36 + 8 + 2] = 13;  // DXIL mesh shader kind
     const auto vs_container = shader_container(vs_program);
     const auto library = std::filesystem::temp_directory_path() / "leonida_mesh_test";
     std::filesystem::create_directories(library);
@@ -152,15 +162,18 @@ int main() {
         return true;
     };
     const auto root_signature = [&](ID3D12Device* device, Ref<ID3D12RootSignature>& root) {
-        // [0] two constants (s0, s1: offset), [1] a root CBV (s2:s3: tint), as in d3d12_draw_test.
-        D3D12_ROOT_PARAMETER params[2] = {};
+        // The mesh fixture reads s0:s1 (offset) and the colour fixture, built as ps_draw_s0.spv, s2:s3 (tint VA).
+        // Select the runtime's packed s0 layout by declaring 25 words: one more than fits above s8.
+        D3D12_ROOT_PARAMETER params[3] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[0].Constants = {0, 0, 2};
         params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         params[1].Descriptor = {1, 0};
+        params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        params[2].Constants = {2, 0, 21};
         D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc{};
         root_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
-        root_desc.Desc_1_0 = {2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+        root_desc.Desc_1_0 = {3, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
         const auto blob = serialize_root_signature(root_desc);
         return !blob.empty() &&
                SUCCEEDED(device->CreateRootSignature(0, blob.data(), blob.size(), IID_PPV_ARGS(&root.p)));
@@ -181,6 +194,11 @@ int main() {
         stream.add(TargetsSubobject{.inner = one_target()});
         Ref<ID3D12PipelineState> pso;
         EXPECT(create(device.p, stream, pso) == E_NOTIMPL && !pso.p);
+        // A DISPATCH_MESH command signature is refused the same way.
+        const D3D12_INDIRECT_ARGUMENT_DESC mesh_arg{D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH};
+        const D3D12_COMMAND_SIGNATURE_DESC mesh_sig{12, 1, &mesh_arg, 0};
+        Ref<ID3D12CommandSignature> sig;
+        EXPECT(device->CreateCommandSignature(&mesh_sig, nullptr, IID_PPV_ARGS(&sig.p)) == E_NOTIMPL && !sig.p);
         root.reset();
         EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
     }
@@ -269,6 +287,53 @@ int main() {
         bounds.DepthBoundsTestEnable = TRUE;
         bad.add(DepthStencil1Subobject{.inner = bounds});
         EXPECT(create(device.p, bad, refused) == E_NOTIMPL && !refused.p);
+
+        // A console stream: its numbering has no gap at 23, so its mesh shader is 24 (the PC's AS) and its
+        // RASTERIZER1 26 (the PC's DEPTH_STENCIL2). An AS without an MS is no PC stream, so the layer reads it with the
+        // console's numbering and makes the mesh PSO. The PC reading of the same bytes alone would refuse it.
+        D3D12_RASTERIZER_DESC1 raster1{};
+        raster1.FillMode = D3D12_FILL_MODE_SOLID;
+        raster1.CullMode = D3D12_CULL_MODE_NONE;
+        raster1.DepthClipEnable = TRUE;
+        for (int with_raster1 = 0; with_raster1 < 2; ++with_raster1) {
+            Stream console;
+            console.add(RootSubobject{.inner = root.p});
+            console.add(Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE(24), D3D12_SHADER_BYTECODE>{.inner = ms});
+            console.add(PsSubobject{.inner = ps}).add(TargetsSubobject{.inner = one_target()});
+            if (with_raster1)
+                console.add(Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE(26), D3D12_RASTERIZER_DESC1>{.inner = raster1});
+            console.add(MaskSubobject{.inner = UINT_MAX});
+            Ref<ID3D12PipelineState> console_pso;
+            using Create = HRESULT(WINAPI*)(ID3D12Device*, const D3D12_PIPELINE_STATE_STREAM_DESC*, REFIID, void**);
+            const auto desc = console.desc();
+            const HRESULT console_hr = reinterpret_cast<Create>(slot(device.p, 86))(device.p, &desc, IID_PPV_ARGS(&console_pso.p));
+            if (pc_only) {
+                EXPECT(FAILED(console_hr) && !console_pso.p);
+            } else {
+                EXPECT(SUCCEEDED(console_hr) && console_pso.p);
+                // Slot 55 must also walk raw 26 as RASTERIZER1 and retain the mesh bytecode after the base is released.
+                using Derive = HRESULT(WINAPI*)(ID3D12Device*, ID3D12PipelineState*, UINT, const void*, REFIID, void**);
+                std::array<std::uint8_t, rt::d3d12_xs::kDerivedRecordSize> record{};
+                const std::uint32_t mask[] = {3, UINT_MAX};
+                std::memcpy(record.data(), mask, sizeof(mask));
+                mesh_pso.reset();
+                EXPECT(SUCCEEDED(reinterpret_cast<Derive>(slot(device.p, 55))(
+                    device.p, console_pso.p, 1, record.data(), IID_PPV_ARGS(&mesh_pso.p))) && mesh_pso.p);
+            }
+        }
+        // Even a known mesh FSSM must not reinterpret type 24 if the container declares another stage.
+        auto as_container = ms_container;
+        as_container[36 + 8 + 2] = 14;  // amplification
+        Stream as_only;
+        as_only.add(RootSubobject{.inner = root.p})
+               .add(AsSubobject{.inner = {as_container.data(), as_container.size()}})
+               .add(PsSubobject{.inner = ps}).add(TargetsSubobject{.inner = one_target()});
+        EXPECT(FAILED(create(device.p, as_only, refused)) && !refused.p);
+        // An MS and an AS in PC numbering stay the PC's (and refused, the layer builds no AS).
+        bad = mesh_stream;
+        bad.add(Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE(24), D3D12_SHADER_BYTECODE>{.inner = ms});
+        EXPECT(create(device.p, bad, refused) == E_NOTIMPL && !refused.p);
+        std::printf("console-numbered mesh streams: %s\n", pc_only ? "refused in PC-only mode" : "both created");
 
         const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
         const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
@@ -399,6 +464,21 @@ int main() {
         list->RSSetViewports(1, &viewport);
         list6->DispatchMesh(4096, 1025, 1);
         EXPECT(list->Close() == E_INVALIDARG);
+        // A DISPATCH_MESH command signature (D3D12_DISPATCH_MESH_ARGUMENTS, 12 bytes) is created; a stride below its
+        // 12 bytes is refused as the PC runtime refuses it. ExecuteIndirect with it records nothing yet (#3777 replays
+        // it), so the list still closes.
+        {
+            const D3D12_INDIRECT_ARGUMENT_DESC mesh_arg{D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH};
+            const D3D12_COMMAND_SIGNATURE_DESC mesh_sig{12, 1, &mesh_arg, 0};
+            const D3D12_COMMAND_SIGNATURE_DESC short_sig{8, 1, &mesh_arg, 0};
+            Ref<ID3D12CommandSignature> sig, short_one;
+            EXPECT(SUCCEEDED(device->CreateCommandSignature(&mesh_sig, nullptr, IID_PPV_ARGS(&sig.p))) && sig.p);
+            EXPECT(device->CreateCommandSignature(&short_sig, nullptr, IID_PPV_ARGS(&short_one.p)) == E_INVALIDARG);
+            EXPECT(SUCCEEDED(list->Reset(allocator.p, mesh_pso.p)));
+            list->SetGraphicsRootSignature(root.p);
+            list->ExecuteIndirect(sig.p, 1, upload.p, 0, nullptr, 0);
+            EXPECT(list->Close() == S_OK);
+        }
         EXPECT(SUCCEEDED(queue->Signal(fence.p, 2)) && SUCCEEDED(fence->SetEventOnCompletion(2, nullptr)));
 
         // D3D-291: pipeline statistics around mesh draws. Query 0 holds a vertex draw, two mesh draws and another

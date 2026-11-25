@@ -368,6 +368,16 @@ int main() {
     const bool native_storage = (e5_props.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
     const bool native_attach = (e5_props.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0;
     const bool rect_clears_supported = !native_storage || native_attach;
+    // An R9G9B9E5 texture that allows render targets is created as B10G11R11 when the GPU cannot attach E5B9G9R9
+    // natively: the layer's console format stand-ins (fa83b2825) render and store in that format instead, so the host
+    // accepts the resource and GetResourceAllocationInfo sizes it.
+    VkFormatProperties b10_props{};
+    d.instance_fn<PFN_vkGetPhysicalDeviceFormatProperties>("vkGetPhysicalDeviceFormatProperties")(
+        d.physical, VK_FORMAT_B10G11R11_UFLOAT_PACK32, &b10_props);
+    const bool target_stand_in = !native_attach &&
+                                 (b10_props.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0 &&
+                                 (b10_props.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0 &&
+                                 (b10_props.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) != 0;
 
     {
         rt::d3d12::VulkanDeviceInfo info{};
@@ -385,6 +395,8 @@ int main() {
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&device.p))));
 
         // 1. CheckFeatureSupport(FORMAT_SUPPORT): typed UAV is advertised; render target and depth-stencil stay off.
+        // The render-target bit is the format's own native support: a texture that allows render targets is still
+        // created where the B10G11R11 stand-in can render it (see the creation loop below).
         D3D12_FEATURE_DATA_FORMAT_SUPPORT fs{DXGI_FORMAT_R9G9B9E5_SHAREDEXP};
         EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs))));
         if (!(fs.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW)) {
@@ -465,7 +477,12 @@ int main() {
                                  D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS}) {
             const auto desc = tex_desc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 16, 16, 1, 1,
                                        DXGI_FORMAT_R9G9B9E5_SHAREDEXP, flags);
-            const bool supported = native_attach && (!(flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) || native_storage);
+            // Creation follows the backing the layer found, not the format's native bits alone: a render target needs
+            // a native attachment or the B10G11R11 stand-in, and unordered access needs a storage image or the
+            // mutable R32_UINT emulation the format support above advertises.
+            const bool supported = (native_attach || target_stand_in) &&
+                                   (!(flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ||
+                                    (fs.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) != 0);
             Ref<ID3D12Resource> target;
             const HRESULT hr = device->CreateCommittedResource(&def_heap, D3D12_HEAP_FLAG_NONE, &desc,
                                                                D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&target.p));

@@ -8,7 +8,8 @@ import ntpath
 import posixpath
 
 
-def shader_stems(path: str, field: str, suffix: str = "") -> set[str]:
+def _stem_rows(path: str, field: str, suffix: str = "") -> list[tuple[str, dict]]:
+    """Each entry of the index as (validated stem, row)."""
     try:
         # utf-8-sig: PowerShell 5.1 and old Notepad write JSON with a UTF-8 BOM.
         with open(path, encoding="utf-8-sig") as f:
@@ -19,7 +20,7 @@ def shader_stems(path: str, field: str, suffix: str = "") -> set[str]:
         raise ValueError(f"{path}: invalid JSON: {exc}") from exc
     if not isinstance(rows, list):
         raise ValueError(f"{path}: expected an array of shader entries")
-    stems = set()
+    out = []
     for row in rows:
         value = row.get(field) if isinstance(row, dict) else None
         if (
@@ -39,5 +40,19 @@ def shader_stems(path: str, field: str, suffix: str = "") -> set[str]:
         stem = value.removesuffix(suffix)
         if not stem or stem in (".", ".."):
             raise ValueError(f"{path}: expected a shader basename in {field!r}")
-        stems.add(stem)
-    return stems
+        out.append((stem, row))
+    return out
+
+
+def shader_stems(path: str, field: str, suffix: str = "") -> set[str]:
+    return {stem for stem, _ in _stem_rows(path, field, suffix)}
+
+
+def shader_stages(path: str, field: str, suffix: str = "") -> dict[str, str | None]:
+    """The stage the index records for each shader, by stem. None where an entry has no stage string: the stage is
+    then unknown, not absent, and the caller says so."""
+    stages = {}
+    for stem, row in _stem_rows(path, field, suffix):
+        stage = row.get("stage")
+        stages[stem] = stage if isinstance(stage, str) and stage else None
+    return stages

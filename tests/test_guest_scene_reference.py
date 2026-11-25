@@ -112,7 +112,9 @@ class GuestSceneReferenceTest(unittest.TestCase):
                    "--shaders", str(root), "--out", str(out)]
             if sys.platform != "win32":
                 cmd += ["--wine", str(bad_loader), "--wine-arg=-a", "--wine-arg=path with spaces/wine"]
-            result = subprocess.run(cmd, capture_output=True, encoding="utf-8", timeout=20)
+            # The runner's "could not launch" line carries the OS error text, which Windows localizes and the child
+            # prints in the ANSI code page (cp1251 on a Russian host): a strict UTF-8 decode would leave stdout None.
+            result = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace", timeout=20)
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
             report = json.loads((out / "report.json").read_text(encoding="utf-8"))
             self.assertIn("could not launch", report["error"])

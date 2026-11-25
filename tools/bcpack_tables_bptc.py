@@ -316,6 +316,19 @@ def load_bc7(history=None):
                 ((v >> (8 - d) << (8 - d)) | (1 << (7 - d))) if 0 < d < 8 else v
                 for v, d in zip(row, depth)
             )
+    # Optional same-stream red parity fits, applied after midpoint fill. Preserve
+    # all leading sibling/reference bits and keep the available precision unchanged.
+    for k, field, low in sec.get("historyEndpointLow2Fits") or ():
+        if not (0 <= k < 256 and field in (0, 4, 8, 12, 16, 20) and 0 <= low < 4):
+            raise ValueError("invalid BC7 low-bit endpoint fit")
+        depth = ep_b[k][field]
+        old = ep[k][field]
+        value = (old & ~3) | low
+        if not 4 <= depth < 8 or (old ^ value) >> (8 - max(depth, ep_cb[k][field])):
+            raise ValueError("BC7 low-bit fit changes a known prefix")
+        row = list(ep[k])
+        row[field] = value
+        ep[k] = tuple(row)
     last_resort = set()
     for item in sec.get("historyEndpointLastResort") or ():
         if len(item) == 4:

@@ -405,6 +405,31 @@ class CarveAndExtraCLITest(unittest.TestCase):
         with open(self.out_json, encoding="utf-8") as f:
             self.assertEqual(json.load(f), previous)
 
+    def test_unreadable_extra_file_preserves_existing_dictionary(self):
+        previous = {"12345678": "keep"}
+        with open(self.out_json, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(previous, f)
+        real_open = open
+
+        def open_extra(path, *args, **kwargs):
+            if os.fspath(path) == self.extra_file:
+                raise PermissionError(errno.EACCES, "synthetic access denied", self.extra_file)
+            return real_open(path, *args, **kwargs)
+
+        command = [TOOL, self.carve_dir, "--extra", self.extra_file, "--out", self.out_json]
+        with (mock.patch.object(hashdict, "open", side_effect=open_extra, create=True),
+              mock.patch.object(sys, "argv", command),
+              mock.patch.object(sys, "stdout", new_callable=io.StringIO),
+              mock.patch.object(sys, "stderr", new_callable=io.StringIO) as stderr):
+            result = hashdict.main()
+
+        self.assertEqual(result, 2)
+        self.assertEqual(stderr.getvalue().splitlines(), [
+            f"ERROR: cannot read --extra input {self.extra_file}: synthetic access denied"
+        ])
+        with open(self.out_json, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), previous)
+
     def test_one_archive_folder_is_harvested_as_that_archive(self):
         # <work>/carve/common (its own index.json, as the gamedata_* tools take it) used to give an empty
         # dictionary with exit 0: only <carve>/<archive>/index.json was looked for.

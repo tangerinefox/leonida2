@@ -404,7 +404,10 @@ int main() {
     CHECK(vulkan_sync(y::split) == VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
     CHECK(vulkan_sync(y::render_target) == VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT);
     CHECK(vulkan_sync(y::copy | y::pixel_shading) ==
-          (VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT));
+          (VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_CLEAR_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT));
+    // SYNC_COPY covers WriteBufferImmediate (vkCmdUpdateBuffer) and ResolveQueryData's zero fill (vkCmdFillBuffer),
+    // which synchronization2 runs in the CLEAR stage, not COPY (D3D-838).
+    CHECK(vulkan_sync(y::copy) == (VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_CLEAR_BIT));
     CHECK(vulkan_sync(y::raytracing) == VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
     CHECK(vulkan_barrier_access(a::no_access) == VK_ACCESS_2_NONE);
     const auto cb_scope = vulkan_barrier_scope(y::pixel_shading, a::constant_buffer);
@@ -427,7 +430,8 @@ int main() {
         widened = scope(y::clear_unordered_access_view, a::copy_source);  // CLEAR only writes
         CHECK(widened.stages & VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT);
         widened = scope(y::copy, a::unordered_access);
-        CHECK(widened.stages == (VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_PRE_RASTERIZATION_SHADERS_BIT |
+        CHECK(widened.stages == (VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_CLEAR_BIT |
+                                 VK_PIPELINE_STAGE_2_PRE_RASTERIZATION_SHADERS_BIT |
                                  VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT));
         // Pairs Vulkan already accepts are left exactly as vulkan_sync / vulkan_barrier_access map them.
         const std::pair<std::uint32_t, std::uint32_t> unchanged[] = {

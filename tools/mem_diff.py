@@ -55,6 +55,14 @@ from spirv_mini_interp import run_fragment  # noqa: E402
 
 MASK32 = 0xFFFFFFFF
 MASK64 = (1 << 64) - 1
+
+
+def host_address(va):
+    """Where an effective VA is in memory: its low 48 bits sign-extended, as the translator adds them to the heap base
+    (Gen.host_addr; docs/design.md, "Heap-relative buffer device addresses"). A V# base with bit 47 set is an offset
+    below the heap, so 0xFFFF_xxxx_xxxx and the 64-bit address 0xFFFF_FFFF_xxxx_xxxx are the same place."""
+    va &= (1 << 48) - 1
+    return (va - (1 << 48) if va >> 47 else va) & MASK64
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
 
 VSHARP = 0          # s[0:3]: the buffer descriptor
@@ -185,12 +193,12 @@ class RefMachine:
     def word(self, addr):
         if addr & 3:
             raise AssertionError(f"reference model: unaligned dword at {addr:#x}")
-        return self.mem.get(addr & MASK64, 0)
+        return self.mem.get(host_address(addr), 0)
 
     def put(self, addr, value):
         if addr & 3:
             raise AssertionError(f"reference model: unaligned dword at {addr:#x}")
-        self.mem[addr & MASK64] = value & MASK32
+        self.mem[host_address(addr)] = value & MASK32
 
     def scalar(self, text):
         text = text.strip()
@@ -374,7 +382,7 @@ def reg_range(kind, first, n):
 
 def _seed_region(rng, memory, base):
     for i in range(WORDS):
-        memory[base + 4 * i] = rng.getrandbits(32)
+        memory[host_address(base + 4 * i)] = rng.getrandbits(32)
 
 
 def _buffer_base(rng):

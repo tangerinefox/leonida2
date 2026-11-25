@@ -64,7 +64,7 @@ an older carve that wrote each resource as one file.
 
 The tables carry no language field. Each table's language is guessed from the first 400 strings:
 
-1. **Script.** Kana is `ja`, hangul is `ko`, CJK is Chinese and Cyrillic is `ru`.
+1. **Script.** Kana is `ja`, hangul is `ko`, CJK is Chinese, Cyrillic is `ru` and Arabic script is `ar`.
 2. **Latin script.** Common words and distinctive letters (`ąćęłńśźż`, `äöüß`, `ãõ`, `ñ¿¡`, ...) score each of `en`,
    `de`, `es`, `fr`, `it`, `pl` and `pt`. No score, or a tie, gives `xx`.
 3. **Variants.** Spanish and Chinese ship two variants each:

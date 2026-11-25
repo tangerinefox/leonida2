@@ -2,7 +2,7 @@
 
 Usage:
     python -I scripts/run_wine_tests.py --tests ctest.json --windows-root D:/a/Leonida/Leonida
-        [--root DIR] [--wine CMD] [--require NAME ...] [--timeout SECONDS] [--summary FILE] [--label TEXT]
+        [--root DIR] [--wine CMD] [--require NAME ...] [--timeout SECONDS] [--jobs N] [--summary FILE] [--label TEXT]
 
 --tests is the output of `ctest --show-only=json-v1` from the Windows build, and --windows-root the checkout it was
 made in (forward slashes, as `cygpath -m` prints it). Paths under it are mapped to --root, the Linux checkout (default:
@@ -16,8 +16,16 @@ Every test is reported. The exit code is 1 if a test named by --require fails or
 others show what does and doesn't work under Wine yet without failing the job.
 --timeout caps each process; a shorter positive CTest TIMEOUT takes precedence for that test.
 Relative executable paths in --wine or WINE are read from the directory where you start this runner.
+
+Each test gets WINEDLLOVERRIDES with winedbg.exe and winemenubuilder.exe disabled, so a crash fails at once instead of
+waiting in the debugger until the timeout; an entry of the caller's or the test's for the same program wins. One
+wineserver is kept alive for the whole run (`wineserver -p`: $WINESERVER, else the one next to the --wine command,
+else the one on PATH) and stopped at the end, instead of a new one starting for every test.
+--jobs N runs N tests at a time. Tests marked RUN_SERIAL run alone, tests sharing a RESOURCE_LOCK never overlap, and
+DEPENDS and fixtures are kept; the report is in the same order as with --jobs 1 (the default).
 """
 import argparse
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from graphlib import CycleError, TopologicalSorter
 import json
 import math
@@ -30,6 +38,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -120,6 +129,97 @@ class DriveMap:
         return False
 
 
+# A crashed test would wait in winedbg until the timeout; winemenubuilder writes file associations and menu entries
+# into the user's profile when a fresh prefix is set up.
+DEFAULT_DLL_OVERRIDES = ("winedbg.exe=d", "winemenubuilder.exe=d")
+
+
+def _override_names(entry: str) -> set[str]:
+    """The programs one WINEDLLOVERRIDES entry ("a,b.exe=n") names, lower case and without .dll/.exe."""
+    names = set()
+    for name in entry.partition("=")[0].split(","):
+        name = name.strip().lower()
+        for suffix in (".dll", ".exe"):
+            if name.endswith(suffix):
+                name = name[:-len(suffix)]
+        if name:
+            names.add(name)
+    return names
+
+
+def merge_dll_overrides(given: str | None) -> str:
+    """WINEDLLOVERRIDES with the defaults added, leaving out a default for a program the given value already names."""
+    entries = [e for e in (given or "").split(";") if e.strip()]
+    named = set().union(*(_override_names(e) for e in entries))
+    return ";".join([d for d in DEFAULT_DLL_OVERRIDES if not _override_names(d) & named] + entries)
+
+
+def find_wineserver(wine: list[str]) -> str | None:
+    """The wineserver the --wine command uses: $WINESERVER, else the one next to it, else the one on PATH."""
+    given = os.environ.get("WINESERVER")
+    if given and shutil.which(given):
+        return shutil.which(given)
+    for part in wine:
+        resolved = shutil.which(part)
+        if resolved and os.path.basename(resolved).lower() in ("wine", "wine64"):
+            for folder in (os.path.dirname(resolved), os.path.dirname(os.path.realpath(resolved))):
+                sibling = shutil.which(os.path.join(folder, "wineserver"))
+                if sibling:
+                    return sibling
+    return shutil.which("wineserver")
+
+
+class KeptServer:
+    """Keeps one wineserver alive for the run instead of one starting and stopping for every test.
+
+    `wineserver -p` starts a persistent server for $WINEPREFIX; `wineserver -k` stops it and the prefix's Wine
+    processes at the end, also after a failure or Ctrl+C. A server still shutting down (wineboot's lingers a few
+    seconds) is waited for first; one that stays (started by hand with -p) is used and left running.
+    The first Wine program a server runs starts the prefix's services, which inherit its output and live as long as
+    the server: `wine wineboot` starts them with no output, or the first test would wait for the end of its output
+    until the timeout.
+    """
+
+    def __init__(self, command: str | None, wine: list[str]):
+        self.command, self.wine, self.started, self.note = command, wine, False, ""
+
+    def _run(self, *flags, timeout=30.0) -> int | None:
+        try:
+            return subprocess.run([self.command, *flags], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL, timeout=timeout).returncode
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+
+    def __enter__(self):
+        if not self.command:
+            self.note = "no wineserver found: each test starts its own"
+            return self
+        code = self._run("-p")
+        if code == 2:                     # one is already running for this prefix
+            if self._run("-w", timeout=15.0) == 0:
+                code = self._run("-p")
+            else:
+                self.note = "a wineserver already runs for this prefix: used and left running"
+                return self
+        self.started = code == 0
+        if not self.started:
+            self.note = f"could not start {self.command} -p: each test starts its own server"
+            return self
+        self.note = "wineserver kept alive for the run"
+        env = dict(os.environ, WINEDLLOVERRIDES=merge_dll_overrides(os.environ.get("WINEDLLOVERRIDES")))
+        try:
+            subprocess.run(self.wine + ["wineboot"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, env=env, timeout=120)
+        except (OSError, subprocess.TimeoutExpired):
+            pass                          # the tests start the services then, as without a kept server
+        return self
+
+    def __exit__(self, *exc):
+        if self.started:
+            self._run("-k")
+        return False
+
+
 def wine_path(path: str) -> str:
     """Wine's Z: drive is the Unix root, so a Windows program reads /x/y as Z:\\x\\y."""
     return "Z:" + os.path.abspath(path).replace("/", "\\")
@@ -194,6 +294,7 @@ def run_test(test: dict, args, wine: list[str], *, failed_setups: tuple[str, ...
         if not key or not equals or "\0" in assignment:
             return "fail", "invalid CTest ENVIRONMENT entry: expected NAME=value"
         env[key] = value
+    env["WINEDLLOVERRIDES"] = merge_dll_overrides(env.get("WINEDLLOVERRIDES"))
     timeout = args.timeout
     if "TIMEOUT" in props:
         try:
@@ -257,17 +358,40 @@ def run_test_process(argv: list[str], *, cwd: str, env: dict[str, str],
 
     # Wine's Windows children and launcher wrappers can outlive the immediate child.
     with subprocess.Popen(argv, **options, start_new_session=True) as proc:
+        with _running_lock:
+            _running.add(proc.pid)
         try:
             out, _ = proc.communicate(timeout=timeout)
         except (subprocess.TimeoutExpired, KeyboardInterrupt):
             # The launcher may have exited while a helper still holds the output pipe.
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            _kill_group(proc.pid)
             proc.wait()
             raise
+        finally:
+            with _running_lock:
+                _running.discard(proc.pid)
         return subprocess.CompletedProcess(argv, proc.returncode, out)
+
+
+# The process groups of the tests running now: with --jobs, Ctrl+C reaches only the main thread, which stops them.
+_running: set[int] = set()
+_running_lock = threading.Lock()
+
+
+def _kill_group(pid: int) -> None:
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def stop_running_tests() -> None:
+    if os.name != "posix":
+        return
+    with _running_lock:
+        pids = list(_running)
+    for pid in pids:
+        _kill_group(pid)
 
 
 def positive_seconds(text: str) -> float:
@@ -280,6 +404,17 @@ def positive_seconds(text: str) -> float:
         raise argparse.ArgumentTypeError("must be a finite number")
     if value <= 0:
         raise argparse.ArgumentTypeError("must be greater than 0")
+    return value
+
+
+def positive_int(text: str) -> int:
+    """--jobs: a whole number of at least 1."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
     return value
 
 
@@ -331,6 +466,48 @@ def read_tests(path: str) -> list[dict] | None:
     return tests
 
 
+def run_parallel(tests: list[dict], order: list[int], before: dict[int, set[int]], jobs: int, run_one, outcomes: dict,
+                 results_by_index: dict, report) -> None:
+    """Run up to `jobs` tests at a time and report them in `order`, as the serial loop does.
+
+    A test starts once the tests it depends on have finished. A RUN_SERIAL test runs alone, and two tests that share
+    a RESOURCE_LOCK never run at the same time.
+    """
+    serial = {index for index, test in enumerate(tests) if truthy(properties(test).get("RUN_SERIAL"))}
+    locks = {index: set(regex_list(properties(test).get("RESOURCE_LOCK", []))) for index, test in enumerate(tests)}
+    waiting, running, held = list(order), {}, set()
+    next_report = 0
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        try:
+            while waiting or running:
+                for index in list(waiting):
+                    if len(running) >= jobs or any(r in serial for r in running.values()):
+                        break
+                    if before[index] - results_by_index.keys() or locks[index] & held:
+                        continue
+                    if index in serial and running:
+                        continue
+                    waiting.remove(index)
+                    held |= locks[index]
+                    running[pool.submit(run_one, index)] = index
+                    if index in serial:
+                        break
+                done, _ = wait(running, return_when=FIRST_COMPLETED)
+                for future in done:
+                    index = running.pop(future)
+                    outcomes[index] = future.result()
+                    results_by_index[index] = outcomes[index][0]
+                    held -= locks[index]
+                while next_report < len(order) and order[next_report] in outcomes:
+                    report(order[next_report])
+                    next_report += 1
+        except BaseException:
+            # Ctrl+C reaches this thread only: stop the tests the workers are waiting on, start no more.
+            pool.shutdown(wait=False, cancel_futures=True)
+            stop_running_tests()
+            raise
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--tests", required=True, help="ctest --show-only=json-v1 output from the Windows build")
@@ -341,6 +518,8 @@ def main() -> int:
     ap.add_argument("--require", action="append", default=[], help="a test that must pass (repeatable)")
     ap.add_argument("--timeout", type=positive_seconds, default=120.0,
                     help="maximum seconds per test; a shorter CTest TIMEOUT applies (default 120)")
+    ap.add_argument("--jobs", type=positive_int, default=1,
+                    help="tests run at a time; RUN_SERIAL and RESOURCE_LOCK are kept (default 1)")
     ap.add_argument("--summary", help="append a Markdown table to this file (e.g. $GITHUB_STEP_SUMMARY)")
     ap.add_argument("--label", help="named in the summary's heading, e.g. the Wine version")
     args = ap.parse_args()
@@ -352,9 +531,12 @@ def main() -> int:
     indices = {name: index for index, name in enumerate(names)}
     setups = fixture_dependencies(tests)
     sorter = TopologicalSorter(setups)
+    before = {index: set(setups[index]) for index in range(len(tests))}
     for index, test in enumerate(tests):
         # DEPENDS controls order. Only failed fixture setups block a consumer.
-        sorter.add(index, *(indices[name] for name in properties(test).get("DEPENDS", []) if name in indices))
+        depends = [indices[name] for name in properties(test).get("DEPENDS", []) if name in indices]
+        sorter.add(index, *depends)
+        before[index].update(depends)
     try:
         order = list(sorter.static_order())
     except CycleError:
@@ -367,18 +549,30 @@ def main() -> int:
     results = {}
     results_by_index: dict[int, str] = {}
     prefix = os.environ.get("WINEPREFIX") or os.path.join(os.path.expanduser("~"), ".wine")
-    with DriveMap(args.windows_root, args.root, prefix) as drive:
+    outcomes: dict[int, tuple[str, str]] = {}
+
+    def run_one(index: int) -> tuple[str, str]:
+        failed_setups = tuple(names[setup] for setup in setups[index] if results_by_index[setup] == "fail")
+        return run_test(tests[index], args, wine, failed_setups=failed_setups)
+
+    def report(index: int) -> None:
+        status, detail = outcomes[index]
+        results[names[index]] = status
+        print(f"[{status.upper()}] {names[index]}", flush=True)
+        if status != "pass":
+            for line in detail.rstrip().splitlines()[-40:]:
+                print(f"    {line}")
+
+    with DriveMap(args.windows_root, args.root, prefix) as drive, KeptServer(find_wineserver(wine), wine) as server:
         print(drive.note, flush=True)
-        for index in order:
-            name = names[index]
-            failed_setups = tuple(names[setup] for setup in setups[index] if results_by_index[setup] == "fail")
-            status, detail = run_test(tests[index], args, wine, failed_setups=failed_setups)
-            results_by_index[index] = status
-            results[name] = status
-            print(f"[{status.upper()}] {name}", flush=True)
-            if status != "pass":
-                for line in detail.rstrip().splitlines()[-40:]:
-                    print(f"    {line}")
+        print(server.note, flush=True)
+        if args.jobs == 1:
+            for index in order:
+                outcomes[index] = run_one(index)
+                results_by_index[index] = outcomes[index][0]
+                report(index)
+        else:
+            run_parallel(tests, order, before, args.jobs, run_one, outcomes, results_by_index, report)
 
     missing = list(dict.fromkeys(n for n in args.require if n not in results))
     failed_required = [n for n in args.require if results.get(n) != "pass"]

@@ -147,7 +147,11 @@ class Insn:
 
 def decode(buf, off: int, base_rva: int) -> Insn | None:
     """Decode the instruction at buf[off] (buf starts at base_rva). None for an invalid or cut-off instruction."""
-    n = len(buf)
+    if off < 0 or off >= len(buf):
+        return None
+    # x86 instructions occupy at most 15 bytes. Bound prefix scanning as well as
+    # operand reads, so a long invalid prefix run cannot rescan the whole tail.
+    n = min(len(buf), off + 15)
     p = off
     p66 = p67 = False
     while p < n and buf[p] in _PREFIXES:
@@ -287,6 +291,10 @@ def writes(i: Insn) -> list[int]:
     op = i.op
     if i.mod is None:
         low = (op & 7) | ((i.rex & 1) << 3)
+        # Without REX, byte-register codes 4..7 mean AH/CH/DH/BH, not
+        # SPL/BPL/SIL/DIL. Their writes invalidate the corresponding parent GPR.
+        if 0xB4 <= op <= 0xB7 and not i.rex:
+            return [low - 4]
         if 0xB0 <= op <= 0xBF or 0x58 <= op <= 0x5F:
             return [low]
         if 0x91 <= op <= 0x97:

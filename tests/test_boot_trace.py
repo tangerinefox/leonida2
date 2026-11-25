@@ -647,6 +647,19 @@ class BootTraceTests(unittest.TestCase):
                 else:
                     self.assertNotIn("more", text)
 
+    def test_counts_only_includes_all_xmem_physical_page_observations(self):
+        self.write(self.startup, [
+            {"kind": "xmem_physical_pages", "api": "private-api", "attributes": "0x20",
+             "pages": 4, "caller": "private-caller"},
+        ] * 3)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(bt.main([self.startup, "--counts-only", "--limit", "1"]), 0)
+        summary = json.loads(out.getvalue())["startup"]
+        self.assertEqual(summary["xmem_physical_pages_count"], 3)
+        self.assertNotIn("xmem_physical_pages", summary)
+        self.assertNotIn("private-", out.getvalue())
+
     def test_xmem_physical_pages_handles_missing_and_malformed_fields(self):
         unknown = {"api": None, "attributes": None, "pages": None, "caller": None}
         nbsp_caller = "fixture\u00a0one.dll+0x20"
@@ -665,6 +678,42 @@ class BootTraceTests(unittest.TestCase):
         self.assertEqual(text.count("    ? attributes ? requested ? pages from ?\n"), 2)
         self.assertIn("    XMemAllocatePhysicalPages attributes 0x10 requested ? pages from fixture.dll+0x50\n", text)
         self.assertIn(f"    XMemAllocatePhysicalPages attributes 0x20 requested 4 pages from {nbsp_caller}\n", text)
+
+    def test_frame_pacing_summary_parsed_formatted_and_kept_in_counts_only(self):
+        self.write_lines(self.d3d12, [
+            "[d3d12-trace] #1 XboxPresentation::PresentX ok",
+            "gta6rt.exe : [rt] present: pacing summary frames=101 samples=100 target_us=16667 "
+            "mean_us=16712.5 drift_us=+45.5 p50_us=16667 p95_us=17100 p99_us=18200 "
+            "latency_samples=101 latency_p50_us=4200 latency_p95_us=6100 latency_p99_us=7900",
+        ])
+        trace = bt.parse_d3d12(self.d3d12)
+        self.assertEqual(trace["ignored_lines"], 0)
+        self.assertEqual(trace["frame_pacing"], {
+            "frames": 101,
+            "samples": 100,
+            "target_us": 16667,
+            "mean_us": 16712.5,
+            "drift_us": 45.5,
+            "p50_us": 16667,
+            "p95_us": 17100,
+            "p99_us": 18200,
+            "latency_samples": 101,
+            "latency_p50_us": 4200,
+            "latency_p95_us": 6100,
+            "latency_p99_us": 7900,
+        })
+        text = bt.format_text(bt.summarize(None, trace), 10)
+        self.assertIn(
+            "frame pacing: 101 frame(s), 100 interval(s), target 16667 us, mean 16712.5 us (drift +45.5 us), "
+            "p50/p95/p99 16667/17100/18200 us; origin-to-present p50/p95/p99 4200/6100/7900 us",
+            text,
+        )
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(bt.main(["--d3d12", self.d3d12, "--counts-only"]), 0)
+        counts = json.loads(out.getvalue())
+        self.assertEqual(counts["d3d12"]["frame_pacing"]["drift_us"], 45.5)
+        self.assertEqual(counts["d3d12"]["frame_pacing"]["p99_us"], 18200)
 
 
 if __name__ == "__main__":

@@ -270,7 +270,8 @@ int run_case(const char* label, std::uint32_t requested, std::uint32_t native, s
     std::mutex mutex;
     leonida::VulkanSwapchain swapchain(get_instance_proc, reinterpret_cast<VkInstance>(1),
                                       reinterpret_cast<VkPhysicalDevice>(2), get_device_proc,
-                                      reinterpret_cast<VkDevice>(3), reinterpret_cast<VkQueue>(4), 0, mutex);
+                                      reinterpret_cast<VkDevice>(3), reinterpret_cast<VkQueue>(4), 0, mutex,
+                                      /*diagnostics=*/nullptr);
     if (!swapchain.create(reinterpret_cast<HWND>(static_cast<std::uintptr_t>(1)), 64, 64,
                           VK_FORMAT_B8G8R8A8_UNORM, requested))
         return fail("VulkanSwapchain::create");
@@ -377,7 +378,8 @@ int run_failed_resize(const char* label, std::uint32_t requested, std::uint32_t 
     std::mutex mutex;
     leonida::VulkanSwapchain swapchain(get_instance_proc, reinterpret_cast<VkInstance>(1),
                                       reinterpret_cast<VkPhysicalDevice>(2), get_device_proc,
-                                      reinterpret_cast<VkDevice>(3), reinterpret_cast<VkQueue>(4), 0, mutex);
+                                      reinterpret_cast<VkDevice>(3), reinterpret_cast<VkQueue>(4), 0, mutex,
+                                      /*diagnostics=*/nullptr);
     if (!swapchain.create(reinterpret_cast<HWND>(static_cast<std::uintptr_t>(1)), 64, 64,
                           VK_FORMAT_B8G8R8A8_UNORM, requested))
         return fail("VulkanSwapchain::create");

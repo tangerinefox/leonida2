@@ -132,7 +132,9 @@ constexpr uint32_t kMaxD3d12Cost = 64;
 //   - vertex/pixel/geometry s8 and mesh s16: a hypothesis from the corpus census only (lowest pointer SGPR per stage);
 //     no signature confirms them, and visibility is not modelled (every parameter takes its place in every stage).
 // A parameter that does not fit goes to the console's spill array behind s[0:1] (compute, section 7) together with
-// every parameter after it; that array is not modelled, so such a signature is refused, never truncated.
+// every parameter after it. For compute that packed spill array (1 dword per 32-bit constant, 2 per root descriptor,
+// 1 per descriptor table, no alignment padding) is modelled in StagePackResult; non-compute stages still refuse spills
+// because their spill pointer SGPR is unmeasured.
 enum class Stage : uint32_t { Vertex = 0, Pixel = 1, Geometry = 2, Compute = 3, Mesh = 4 };
 
 [[nodiscard]] constexpr uint32_t stage_base(Stage stage) noexcept {
@@ -163,19 +165,23 @@ enum class Stage : uint32_t { Vertex = 0, Pixel = 1, Geometry = 2, Compute = 3, 
 }
 
 constexpr uint32_t kNoSgpr = 0xFFFFFFFFu;
+constexpr uint32_t kNoSpill = 0xFFFFFFFFu;
 
 struct StagePackResult {
     bool ok = false;
-    std::string error;            // set when !ok; names the refusing parameter
+    std::string error;                 // set when !ok; names the refusing parameter
     Stage stage = Stage::Compute;
-    uint32_t base = 0;            // stage_base(stage)
-    std::vector<uint32_t> first_sgpr;  // per parameter: its first user SGPR (kNoSgpr when the signature is refused)
-    uint32_t end_sgpr = 0;        // one past the last SGPR used: the RSRC2 USER_SGPR count the layout implies
-    uint32_t d3d12_cost = 0;      // cost against the 64-dword D3D12 limit
+    uint32_t base = 0;                 // stage_base(stage)
+    std::vector<uint32_t> first_sgpr;  // per parameter: its first user SGPR (kNoSgpr when spilled or refused)
+    std::vector<uint32_t> spill_dword; // per parameter: dword offset in s[0:1] spill array (kNoSpill when inline)
+    uint32_t end_sgpr = 0;             // one past the last inline SGPR used: the RSRC2 USER_SGPR count
+    uint32_t spill_dwords = 0;         // total dwords in the packed spill array (0 when nothing spills)
+    uint32_t d3d12_cost = 0;           // cost against the 64-dword D3D12 limit
 };
 
-// Lays the parameters out for `stage` in the console layout. Fails like pack() on more than 64 parameters, a
-// constant parameter of 0 values or the 64-dword cost limit, and on any parameter that would spill.
+// Lays the parameters out for `stage` in the console layout. Fails like pack() on more than 64 parameters, an
+// unknown parameter type, a constant parameter of 0 values, or the 64-dword cost limit. Compute spills any trailing
+// parameters from the first one that does not fit whole into spill_dword; non-compute stages refuse any spill.
 [[nodiscard]] StagePackResult pack_stage(const RootSignature& sig, Stage stage);
 
 // D3D12 cost of one parameter against the 64-dword limit.

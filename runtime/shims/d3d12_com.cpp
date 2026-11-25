@@ -6,20 +6,27 @@
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
 #include "../src/gfx10_descriptors.h"
+#include "../src/title_va_alias.h"
+#include "../src/fsdraw_probe.h"  // LOCAL DIAGNOSTIC
+#include "../src/local_diagnostics.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <set>
+#include <source_location>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -198,6 +205,8 @@ public:
     }
 
     const leonida::CommandList& commands() const { return list_; }
+    // The descriptor tables this recording binds (console VAs), for the scan before a submission.
+    const std::vector<std::pair<std::uint64_t, std::uint32_t>>& tables() const { return tables_; }
     // The pipeline states and root signatures the recording names (it holds a reference to each until Reset).
     const std::vector<IUnknown*>& pinned() const { return held_; }
     UINT front_stencil_ref() const { return front_stencil_ref_; }
@@ -234,6 +243,7 @@ public:
         record_into(command_allocator);
         invalid_ = false;
         calls_.clear();
+        tables_.clear();
         release_held();  // what the old recording used: it was replayed at ExecuteCommandLists
         reset_state(state);  // Reset returns every list state to its default
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) set_initial_pipeline(state);  // reset_state holds it
@@ -411,12 +421,20 @@ public:
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         if (!count) {
             viewport_ = {};
+            viewports_.fill({});
+            viewport_count_ = 0;
+            draw_viewports_stale_ = true;
             return;
         }
         if (!viewports || count > D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE) return check(false);
-        if (count > 1) stub("ID3D12GraphicsCommandList::RSSetViewports (more than one viewport; the first is used)");
-        const D3D12_VIEWPORT& v = viewports[0];
-        viewport_ = {v.TopLeftX, v.TopLeftY, v.Width, v.Height, v.MinDepth, v.MaxDepth};
+        viewports_.fill({});
+        for (UINT i = 0; i < count; ++i) {
+            const D3D12_VIEWPORT& v = viewports[i];
+            viewports_[i] = {v.TopLeftX, v.TopLeftY, v.Width, v.Height, v.MinDepth, v.MaxDepth};
+        }
+        viewport_count_ = count;
+        viewport_ = viewports_[0];
+        draw_viewports_stale_ = true;
     }
 
     void STDMETHODCALLTYPE RSSetScissorRects(UINT count, const D3D12_RECT* rects) override {
@@ -425,11 +443,25 @@ public:
         // With no scissor bound, the rasterizer clips every fragment, as on native D3D12.
         if (!count) {
             scissor_ = {};
+            scissors_.fill({});
+            scissor_count_ = 0;
+            draw_viewports_stale_ = true;
             return;
         }
         if (!rects) return;
-        if (count > 1) stub("ID3D12GraphicsCommandList::RSSetScissorRects (more than one rectangle; the first is used)");
-        scissor_ = {rects[0].left, rects[0].top, rects[0].right, rects[0].bottom};
+        // WARP still closes a list after RSSetScissorRects(17) (d3d12_close_parity), so the call is not an error:
+        // the rectangles past the 16 a pipeline can have are dropped.
+        if (count > D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE) {
+            stub("ID3D12GraphicsCommandList::RSSetScissorRects(more than 16 rectangles; the first 16 are used)");
+            count = D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+        }
+        scissors_.fill({});
+        for (UINT i = 0; i < count; ++i) {
+            scissors_[i] = {rects[i].left, rects[i].top, rects[i].right, rects[i].bottom};
+        }
+        scissor_count_ = count;
+        scissor_ = scissors_[0];
+        draw_viewports_stale_ = true;
     }
 
     // D3D12 reads render-target and depth descriptors here, so their views are copied now.
@@ -486,10 +518,11 @@ public:
         d3d12_trace::record("ID3D12GraphicsCommandList6::DispatchMesh");
         if (x > 65535 || y > 65535 || z > 65535 || std::uint64_t(x) * y * z > (1u << 22)) return check(false);
         if (!graphics_pipeline_ || !graphics_.layout) return check(false);
-        if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;  // as record_draw: nothing is rasterized
-        leonida::Draw draw{graphics_pipeline_, graphics_.data, draw_views(), depth_, {}, 0, viewport_,
+        if (!any_nonempty_viewport()) return;  // as record_draw: nothing is rasterized
+        leonida::Draw draw{graphics_pipeline_, graphics_user_data(), draw_views(), depth_, {}, 0, viewport_,
                            scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, false, x, y, z, 0, 0};
         draw.mesh = true;
+        draw.viewports = draw_viewports();
         check(list_.draw(std::move(draw)));
     }
 
@@ -526,29 +559,49 @@ public:
                 switch (group[g].Type) {
                 case D3D12_BARRIER_TYPE_GLOBAL: {
                     const auto& b = group[g].pGlobalBarriers[i];
-                    check(list_.barrier(leonida::GlobalBarrier{u(b.SyncBefore), u(b.SyncAfter), u(b.AccessBefore),
-                                                               u(b.AccessAfter)}));
+                    if (!list_.barrier(leonida::GlobalBarrier{u(b.SyncBefore), u(b.SyncAfter), u(b.AccessBefore),
+                                                              u(b.AccessAfter)}) &&
+                        reject())
+                        std::fprintf(stderr, "[rt] d3d12:   global barrier sync 0x%x->0x%x access 0x%x->0x%x\n",
+                                     u(b.SyncBefore), u(b.SyncAfter), u(b.AccessBefore), u(b.AccessAfter));
                     break;
                 }
                 case D3D12_BARRIER_TYPE_BUFFER: {
                     const auto& b = group[g].pBufferBarriers[i];
-                    check(list_.barrier(leonida::BufferBarrier{u(b.SyncBefore), u(b.SyncAfter), u(b.AccessBefore),
-                                                               u(b.AccessAfter), resource_id(b.pResource)}));
+                    if (!list_.barrier(leonida::BufferBarrier{u(b.SyncBefore), u(b.SyncAfter), u(b.AccessBefore),
+                                                              u(b.AccessAfter), resource_id(b.pResource)}) &&
+                        reject()) {
+                        std::fprintf(stderr, "[rt] d3d12:   buffer barrier sync 0x%x->0x%x access 0x%x->0x%x offset "
+                                             "0x%llx size 0x%llx\n",
+                                     u(b.SyncBefore), u(b.SyncAfter), u(b.AccessBefore), u(b.AccessAfter),
+                                     static_cast<unsigned long long>(b.Offset), static_cast<unsigned long long>(b.Size));
+                        describe_barrier_resource(b.pResource);
+                    }
                     break;
                 }
                 case D3D12_BARRIER_TYPE_TEXTURE: {
                     const auto& b = group[g].pTextureBarriers[i];
                     const auto& r = b.Subresources;
-                    check(list_.barrier(leonida::TextureBarrier{
-                        u(b.SyncBefore), u(b.SyncAfter), u(b.AccessBefore), u(b.AccessAfter), u(b.LayoutBefore),
-                        u(b.LayoutAfter), resource_id(b.pResource),
-                        {r.IndexOrFirstMipLevel, r.NumMipLevels, r.FirstArraySlice, r.NumArraySlices, r.FirstPlane,
-                         r.NumPlanes},
-                        u(b.Flags)}));
+                    if (!list_.barrier(leonida::TextureBarrier{
+                            u(b.SyncBefore), u(b.SyncAfter), u(b.AccessBefore), u(b.AccessAfter), u(b.LayoutBefore),
+                            u(b.LayoutAfter), resource_id(b.pResource),
+                            {r.IndexOrFirstMipLevel, r.NumMipLevels, r.FirstArraySlice, r.NumArraySlices,
+                             r.FirstPlane, r.NumPlanes},
+                            u(b.Flags)}) &&
+                        reject()) {
+                        std::fprintf(stderr,
+                                     "[rt] d3d12:   texture barrier sync 0x%x->0x%x access 0x%x->0x%x layout %u->%u "
+                                     "mips %u+%u layers %u+%u planes %u+%u flags 0x%x\n",
+                                     u(b.SyncBefore), u(b.SyncAfter), u(b.AccessBefore), u(b.AccessAfter),
+                                     u(b.LayoutBefore), u(b.LayoutAfter), r.IndexOrFirstMipLevel, r.NumMipLevels,
+                                     r.FirstArraySlice, r.NumArraySlices, r.FirstPlane, r.NumPlanes, u(b.Flags));
+                        describe_barrier_resource(b.pResource);
+                    }
                     break;
                 }
                 default:
-                    check(false);
+                    if (reject())
+                        std::fprintf(stderr, "[rt] d3d12:   barrier group type %d\n", int(group[g].Type));
                 }
             }
         }
@@ -616,7 +669,24 @@ public:
         if (!dst || !src) return check(false);
         leonida::CopyTexture copy{location(*dst), x, y, z, location(*src), box != nullptr, {}};
         if (box) copy.box = {box->left, box->top, box->front, box->right, box->bottom, box->back};
-        check(list_.copy_texture(copy));
+        if (!list_.copy_texture(copy) && reject()) {
+            for (const auto* l : {dst, src}) {
+                const char* side = l == dst ? "dst" : "src";
+                if (l->Type != D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
+                    std::fprintf(stderr, "[rt] d3d12:   %s type %d resource %p subresource %u\n", side, int(l->Type),
+                                 static_cast<void*>(l->pResource), l->SubresourceIndex);
+                    continue;
+                }
+                const auto& f = l->PlacedFootprint;
+                std::fprintf(stderr, "[rt] d3d12:   %s footprint resource %p offset 0x%llx format %d %ux%ux%u pitch %u\n",
+                             side, static_cast<void*>(l->pResource), static_cast<unsigned long long>(f.Offset),
+                             int(f.Footprint.Format), f.Footprint.Width, f.Footprint.Height, f.Footprint.Depth,
+                             f.Footprint.RowPitch);
+            }
+            if (box)
+                std::fprintf(stderr, "[rt] d3d12:   at %u,%u,%u box %u,%u,%u-%u,%u,%u\n", x, y, z, box->left, box->top,
+                             box->front, box->right, box->bottom, box->back);
+        }
     }
 
     void STDMETHODCALLTYPE CopyResource(ID3D12Resource* dst, ID3D12Resource* src) override {
@@ -698,6 +768,18 @@ public:
         d3d12_trace::record("ID3D12GraphicsCommandList::ClearRenderTargetView");
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         if (!view.ptr || !color) return check(false);
+        // LOCAL DIAGNOSTIC: what the title clears, and with which colour
+        if (leonida::local_diagnostics()) {
+            static std::atomic<std::uint64_t> clears{0};
+            const std::uint64_t n = ++clears;
+            if (n <= 6 || n % 600 == 0) {
+                const auto& t = *reinterpret_cast<const leonida::TargetView*>(view.ptr);
+                std::fprintf(stderr, "[rt] present-probe: ClearRenderTargetView #%llu resource 0x%llx mip %u layers %u+%u "
+                                     "colour %.3f %.3f %.3f %.3f rects %u\n",
+                             static_cast<unsigned long long>(n), static_cast<unsigned long long>(t.resource), t.mip,
+                             t.first_layer, t.layer_count, color[0], color[1], color[2], color[3], count);
+            }
+        }
         check(list_.clear_render_target(*reinterpret_cast<const leonida::TargetView*>(view.ptr),
                                         {color[0], color[1], color[2], color[3]}, to_rects(count, rects)));
     }
@@ -835,18 +917,35 @@ public:
             return check(false);
         }
         // The record size is checked for every call: D3D12 rejects a signature whose stride cannot hold a record
-        // even when no command runs. The argument span is what the signature can walk, max_command_count * stride:
-        // the host refuses a range that ends past the buffer (`240` with stride `20` in a `256`-byte buffer), and
-        // it checks the offset itself when max_command_count is 0, where the required bytes are none.
+        // even when no command runs.
         const UINT64 record_size =
             kind == leonida::IndirectKind::draw ? sizeof(D3D12_DRAW_ARGUMENTS)
             : kind == leonida::IndirectKind::draw_indexed ? sizeof(D3D12_DRAW_INDEXED_ARGUMENTS)
             : kind == leonida::IndirectKind::dispatch ? sizeof(D3D12_DISPATCH_ARGUMENTS)
+            : kind == leonida::IndirectKind::dispatch_mesh ? sizeof(D3D12_DISPATCH_MESH_ARGUMENTS)
             : 0;
         if (!record_size || stride < record_size || stride % 4 != 0) return check(false);
-        if (argument_buffer_offset > arg_desc.Width ||
-            UINT64(max_command_count) > (arg_desc.Width - argument_buffer_offset) / stride)
-            return check(false);
+        // The argument range is the bytes the commands read: (max_command_count - 1) * stride + record_size, and
+        // nothing when max_command_count is 0. PC D3D12 runtimes do not agree here. Some bound max_command_count *
+        // stride and check the offset at a zero count; others (D3D12Core 10.0.26100.9818, WARP and NVIDIA alike)
+        // accept a last record that fits while its stride runs past the buffer, and any aligned offset at a zero
+        // count. The layer takes the wider rule: it is the one Vulkan's own indirect draws use, no byte outside the
+        // buffer is read, and refusing here drops the whole command list for a call a real runtime runs.
+        // d3d12_execute_indirect_validation_test lists the five cases the runtimes split on.
+        if (max_command_count) {
+            const UINT64 required = UINT64(max_command_count - 1) * stride + record_size;
+            if (argument_buffer_offset > arg_desc.Width || arg_desc.Width - argument_buffer_offset < required)
+                return check(false);
+        }
+        if (kind == leonida::IndirectKind::dispatch_mesh) {
+            // Not replayed yet (#3777 replays it as vkCmdDrawMeshTasksIndirectEXT): nothing is recorded, and the
+            // first such call says so. The list stays valid.
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true, std::memory_order_relaxed))
+                std::fprintf(stderr, "[rt] d3d12: ExecuteIndirect with a DISPATCH_MESH signature is not replayed yet; "
+                                     "nothing was recorded\n");
+            return;
+        }
         leonida::ExecuteIndirect cmd{};
         cmd.kind = kind;
         cmd.stride = stride;
@@ -858,7 +957,7 @@ public:
         if (kind == leonida::IndirectKind::dispatch && max_command_count) {  // the pipeline and root arguments a Dispatch would record
             if (!compute_pipeline_ || !compute_.layout) return check(false);
             cmd.pipeline = compute_pipeline_;
-            cmd.user_data = compute_.data;
+            cmd.user_data = compute_user_data();
         }
         check(list_.execute_indirect(cmd));
     }
@@ -1016,8 +1115,35 @@ private:
         return out;
     }
 
-    void check(bool ok) {
-        if (!ok) invalid_ = true;
+    // Records an invalid call: Close then returns E_INVALIDARG and ExecuteCommandLists refuses the list. The first
+    // rejection at each call site is logged with the method and line, so a failed Close names its cause; reject()
+    // returns true for that first one, when a caller may print the arguments too.
+    bool reject(std::source_location where = std::source_location::current()) {
+        invalid_ = true;
+        static std::array<std::atomic<bool>, 4096> seen{};
+        const std::uint_least32_t line = where.line();
+        if (line < seen.size() && seen[line].exchange(true, std::memory_order_relaxed)) return false;
+        std::string_view method = where.function_name();
+        if (const auto at = method.find("GraphicsCommandList::"); at != std::string_view::npos)
+            method.remove_prefix(at);
+        if (const auto paren = method.find('('); paren != std::string_view::npos) method = method.substr(0, paren);
+        std::fprintf(stderr, "[rt] d3d12: %.*s rejected a call (d3d12_com.cpp:%u): the list's Close returns "
+                             "E_INVALIDARG and ExecuteCommandLists refuses it\n",
+                     int(method.size()), method.data(), unsigned(line));
+        return true;
+    }
+    void check(bool ok, std::source_location where = std::source_location::current()) {
+        if (!ok) reject(where);
+    }
+    static void describe_barrier_resource(ID3D12Resource* resource) {
+        if (!resource) return void(std::fprintf(stderr, "[rt] d3d12:   resource null\n"));
+        const D3D12_RESOURCE_DESC desc = resource->GetDesc();
+        std::fprintf(stderr,
+                     "[rt] d3d12:   resource %p dimension %d format %d %llux%ux%u mips %u samples %u layout %d "
+                     "flags 0x%x\n",
+                     static_cast<void*>(resource), int(desc.Dimension), int(desc.Format),
+                     static_cast<unsigned long long>(desc.Width), desc.Height, desc.DepthOrArraySize, desc.MipLevels,
+                     desc.SampleDesc.Count, int(desc.Layout), unsigned(desc.Flags));
     }
 
     void stop_recording() {
@@ -1240,11 +1366,23 @@ private:
             return;
         const RootArgumentLayout::Parameter* p = parameter(state, index, type);
         if (!p) return;
+        // A root view into the title's own memory (a slot-133 buffer, a constant ring) gets the console VA of a GPU
+        // copy of it, so the shader's heap_base + VA reaches it (src/title_va_alias.h). A descriptor table is in one
+        // of the layer's heaps: kept, and its buffer V#s are rewritten the same way before each submission.
+        // A table in a console descriptor heap is read from the heap's arena copy (console_descriptor_table_va).
+        if (type == rt::rootsig::ParamType::Descriptor)
+            va = leonida::title_va_aliases().resolve(va, kRootViewBytes, leonida::TitleVaAliases::root_view);
+        else
+            va = console_descriptor_table_va(va);
+        if (type != rt::rootsig::ParamType::Descriptor && va && p->table_descriptors &&
+            (tables_.empty() || tables_.back().first != va))
+            tables_.push_back({va, p->table_descriptors});
         const std::uint32_t first = first_dword(state, *p);
         write(state, first, std::uint32_t(va));
-        // In the compute layout a descriptor table is one dword, the 32-bit VA of its first descriptor (the heaps
-        // live below 4 GiB); a root view keeps both halves. The graphics layout gives every address two dwords.
-        if (!(is_compute(state) && type == rt::rootsig::ParamType::Table)) write(state, first + 1, std::uint32_t(va >> 32));
+        // In the console layouts a descriptor table is one dword, the 32-bit VA of its first descriptor (the heaps
+        // live below 4 GiB); a root view keeps both halves. pack()'s graphics layout gives every address two dwords.
+        const bool console = is_compute(state) || state.layout->graphics_console;
+        if (!(console && type == rt::rootsig::ParamType::Table)) write(state, first + 1, std::uint32_t(va >> 32));
     }
 
     D3D12_COMMAND_LIST_TYPE type_;
@@ -1256,6 +1394,7 @@ private:
     RootState compute_;
     RootState graphics_;
     std::uintptr_t compute_pipeline_ = 0;
+    bool unregistered_pipeline_ = false;  // the bound PSO has no pipeline here (a stub): see set_pipeline
     std::uintptr_t graphics_pipeline_ = 0;
     ID3D12DescriptorHeap* cbv_srv_uav_heap_ = nullptr;
     ID3D12DescriptorHeap* sampler_heap_ = nullptr;
@@ -1264,8 +1403,18 @@ private:
     std::uint32_t topology_ = 0;  // D3D_PRIMITIVE_TOPOLOGY_UNDEFINED
     std::array<leonida::VertexBufferView, D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> vertex_buffers_{};
     leonida::IndexBufferView index_{};
+    // SetGraphicsRootDescriptorTable / SetComputeRootDescriptorTable: VA, CBV/SRV/UAV slots the signature declares
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> tables_;
+    // The span a root view may read: D3D12's largest constant buffer (4096 x 16 bytes).
+    static constexpr std::uint64_t kRootViewBytes = 65536;
     leonida::Viewport viewport_{};
     leonida::Rect scissor_{};
+    std::array<leonida::Viewport, D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE> viewports_{};
+    UINT viewport_count_ = 0;
+    std::array<leonida::Rect, D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE> scissors_{};
+    UINT scissor_count_ = 0;
+    std::shared_ptr<const leonida::DrawViewports> draw_viewports_;
+    bool draw_viewports_stale_ = true;
     std::array<leonida::TargetView, D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT> render_targets_{};
     UINT render_target_count_ = 0;
     // One block shared by every draw that keeps the same targets and buffers, rebuilt when either changes, so a
@@ -1321,7 +1470,11 @@ private:
         hold(state);
         compute_pipeline_ = compute_pipeline_id(state);
         graphics_pipeline_ = graphics_pipeline_id(state);
-        if (state && !compute_pipeline_ && !graphics_pipeline_)
+        // A pipeline this device never registered: a LEONIDA_STUB_PIPELINES stub (its translated shader is missing),
+        // or one from another device. Its draws resolve to nothing in replay; its dispatches are no-ops too
+        // (record_dispatch), so the list still closes.
+        unregistered_pipeline_ = state && !compute_pipeline_ && !graphics_pipeline_;
+        if (unregistered_pipeline_)
             stub("ID3D12GraphicsCommandList::SetPipelineState(pipeline from another device)");
     }
 
@@ -1345,13 +1498,13 @@ private:
             if (!cbv_srv_uav_heap_)
                 note_once("draw/dispatch uses CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED with no CBV/SRV/UAV heap bound");
             else
-                note_once("CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED heap base tracked on list (SGPR slot open, section 3.4)");
+                note_once("CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED heap base tracked on list");
         }
         if (layout->flags & D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED) {
             if (!sampler_heap_)
                 note_once("draw/dispatch uses SAMPLER_HEAP_DIRECTLY_INDEXED with no sampler heap bound");
             else
-                note_once("SAMPLER_HEAP_DIRECTLY_INDEXED heap base tracked on list (SGPR slot open, section 3.4)");
+                note_once("SAMPLER_HEAP_DIRECTLY_INDEXED heap base tracked on list");
         }
     }
 
@@ -1368,6 +1521,12 @@ private:
         index_ = {};
         viewport_ = {};
         scissor_ = {};
+        viewports_.fill({});
+        viewport_count_ = 0;
+        scissors_.fill({});
+        scissor_count_ = 0;
+        draw_viewports_.reset();
+        draw_viewports_stale_ = true;
         render_targets_.fill({});
         render_target_count_ = 0;
         draw_views_stale_ = true;
@@ -1378,21 +1537,114 @@ private:
 
     void set_vertex_buffers(UINT start, UINT count, const D3D12_VERTEX_BUFFER_VIEW* views) {
         if (count) draw_views_stale_ = true;
-        for (UINT i = 0; i < count; ++i)
+        for (UINT i = 0; i < count; ++i) {
+            if (views) leonida::title_va_aliases().note(views[i].BufferLocation, leonida::TitleVaAliases::vertex_view);
+            if (views) leonida::title_va_aliases().want_buffer(views[i].BufferLocation, views[i].SizeInBytes);
             vertex_buffers_[start + i] = views ? leonida::VertexBufferView{views[i].BufferLocation, views[i].SizeInBytes,
                                                                           views[i].StrideInBytes}
                                                : leonida::VertexBufferView{};
+        }
     }
 
     void set_index_buffer(const D3D12_INDEX_BUFFER_VIEW* view) {
+        if (view) leonida::title_va_aliases().note(view->BufferLocation, leonida::TitleVaAliases::index_view);
+        if (view) leonida::title_va_aliases().want_buffer(view->BufferLocation, view->SizeInBytes);
         index_ = view ? leonida::IndexBufferView{view->BufferLocation, view->SizeInBytes, u(view->Format)}
                       : leonida::IndexBufferView{};
     }
 
+    // The compiled console ABI appends directly indexed heaps after the explicit root arguments: the resource heap's
+    // 32-bit shader VA, then the sampler heap's, each only when the signature has its flag. `slot` is the first
+    // dword after the arguments (RootArgumentLayout::*_arguments_end). The heaps are snapshotted for each command,
+    // so rebinding a heap cannot change a recorded draw or dispatch.
+    std::array<std::uint32_t, rt::rootsig::kMaxUserSgprs> with_direct_heaps(const RootState& state,
+                                                                             std::uint32_t slot) const {
+        auto data = state.data;
+        const auto flags = state.layout->flags;
+        if ((flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED) && slot < data.size())
+            data[slot++] = static_cast<std::uint32_t>(cbv_srv_uav_base_);
+        if ((flags & D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED) && slot < data.size())
+            data[slot] = static_cast<std::uint32_t>(sampler_base_);
+        return data;
+    }
+
+    static bool direct_heaps_enabled(const char* variable) {
+        const char* v = std::getenv(variable);
+        return !(v && std::string_view(v) == "0");
+    }
+
+    std::array<std::uint32_t, rt::rootsig::kMaxUserSgprs> compute_user_data() const {
+        static const bool enabled = direct_heaps_enabled("LEONIDA_COMPUTE_DIRECT_HEAPS");
+        if (!enabled) return compute_.data;
+        return with_direct_heaps(compute_, compute_.layout->compute_arguments_end);
+    }
+
+    // Graphics: vertex, pixel and geometry shaders share one user-data block and the s8 layout, so the heaps after
+    // the explicit arguments serve every one of those stages (a pixel shader of a signature whose arguments end at
+    // s11 reads the resource heap from s11). A mesh shader reads its arguments from s16, which is not modelled
+    // (RootArgumentLayout, D3D-448): its pixel shader gets the heaps, the mesh stage does not.
+    // LEONIDA_GRAPHICS_DIRECT_HEAPS=0 restores the previous arguments.
+    std::array<std::uint32_t, rt::rootsig::kMaxUserSgprs> graphics_user_data() const {
+        constexpr UINT direct = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED |
+                                D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
+        const RootArgumentLayout& layout = *graphics_.layout;
+        if (!(layout.flags & direct)) return graphics_.data;
+        static const bool enabled = direct_heaps_enabled("LEONIDA_GRAPHICS_DIRECT_HEAPS");
+        if (!enabled) {
+            note_once("graphics direct heaps: off (LEONIDA_GRAPHICS_DIRECT_HEAPS=0), draws keep the explicit "
+                      "arguments only");
+            return graphics_.data;
+        }
+        const std::uint32_t end = layout.graphics_arguments_end;
+        if (end >= rt::rootsig::kMaxUserSgprs) {
+            note_once(layout.graphics_console
+                          ? "graphics direct heaps: not supplied, the explicit arguments fill s8..s31"
+                          : "graphics direct heaps: not supplied, the signature keeps the s0 graphics layout");
+            return graphics_.data;
+        }
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true, std::memory_order_relaxed)) {
+            const bool resource = layout.flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
+            const bool sampler = layout.flags & D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
+            char resource_at[48] = "none", sampler_at[48] = "none";
+            if (resource)
+                std::snprintf(resource_at, sizeof resource_at, "0x%llx at s%u",
+                              static_cast<unsigned long long>(std::uint32_t(cbv_srv_uav_base_)), end);
+            if (sampler && end + (resource ? 1u : 0u) < rt::rootsig::kMaxUserSgprs)
+                std::snprintf(sampler_at, sizeof sampler_at, "0x%llx at s%u",
+                              static_cast<unsigned long long>(std::uint32_t(sampler_base_)),
+                              end + (resource ? 1u : 0u));
+            std::fprintf(stderr,
+                         "[rt] d3d12: graphics direct heaps: resource heap %s, sampler heap %s, after %u dwords of "
+                         "explicit arguments from s8 (first draw; LEONIDA_GRAPHICS_DIRECT_HEAPS=0 restores the "
+                         "old arguments)\n",
+                         resource_at, sampler_at, end - 8);
+        }
+        return with_direct_heaps(graphics_, end);
+    }
+
     void record_dispatch(UINT x, UINT y, UINT z) {
-        if (!compute_pipeline_ || !compute_.layout) return check(false);
+        if (!compute_pipeline_ && unregistered_pipeline_) return;  // a stub pipeline's dispatch: nothing to run
+        if (!compute_pipeline_) return check(false);  // separate lines: the rejection log names which
+        if (!compute_.layout) return check(false);
+        static const bool probe = std::getenv("LEONIDA_COMPUTE_INPUTS") != nullptr;
+        if (probe) {
+            static std::mutex mutex;
+            static std::set<std::tuple<std::uintptr_t, const RootArgumentLayout*, UINT64>> seen;
+            std::lock_guard lock(mutex);
+            if (seen.emplace(compute_pipeline_, compute_.layout, cbv_srv_uav_base_).second) {
+                std::fprintf(stderr, "[rt] compute-layout: pso=%p flags=%x bound-heap=0x%llx shader-heap=0x%llx",
+                             reinterpret_cast<void*>(compute_pipeline_), compute_.layout->flags,
+                             (unsigned long long)cbv_srv_uav_base_,
+                             (unsigned long long)console_descriptor_table_va(cbv_srv_uav_base_));
+                for (const auto& p : compute_.layout->parameters)
+                    std::fprintf(stderr, " (s%u type=%u const=%u slots=%u)", p.compute_offset,
+                                 unsigned(p.type), p.constant_count, p.table_descriptors);
+                std::fputc('\n', stderr);
+            }
+        }
         note_direct_heap_indexing(compute_.layout);
-        check(list_.dispatch({compute_pipeline_, compute_.data, x, y, z}));
+        check(list_.dispatch({compute_pipeline_, compute_user_data(), x, y, z}));
     }
 
     // The views block a draw records. Rebuilt only when the render targets or the bound vertex buffers change.
@@ -1408,16 +1660,117 @@ private:
         return draw_views_;
     }
 
+    bool any_nonempty_viewport() const {
+        for (UINT i = 0; i < viewport_count_; ++i)
+            if (viewports_[i].width > 0.0f && viewports_[i].height > 0.0f) return true;
+        return false;
+    }
+
+    std::shared_ptr<const leonida::DrawViewports> draw_viewports() {
+        if (viewport_count_ <= 1 && scissor_count_ <= 1) return nullptr;
+        if (draw_viewports_stale_) {
+            auto block = std::make_shared<leonida::DrawViewports>();
+            block->viewports = viewports_;
+            block->viewport_count = viewport_count_;
+            block->scissors = scissors_;
+            block->scissor_count = scissor_count_;
+            draw_viewports_ = std::move(block);
+            draw_viewports_stale_ = false;
+        }
+        return draw_viewports_;
+    }
+
     // A draw needs a graphics pipeline, a graphics root signature and a topology.
     void record_draw(bool indexed, UINT count, UINT instances, UINT first, INT base_vertex, UINT first_instance) {
         if (!graphics_pipeline_ || !graphics_.layout || !topology_) return check(false);
         note_direct_heap_indexing(graphics_.layout);
-        // No viewport (never set, or unbound with RSSetViewports(0)) or an empty one: D3D12 rasterizes nothing,
-        // and Vulkan forbids a 0x0 viewport, so the draw is not recorded.
-        if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;
-        leonida::Draw draw{graphics_pipeline_, graphics_.data, draw_views(), depth_, index_, topology_, viewport_,
+        // No viewport (never set, or unbound with RSSetViewports(0)) or every bound viewport empty: D3D12 rasterizes
+        // nothing, and Vulkan forbids a 0x0 viewport, so the draw is not recorded.
+        // LOCAL DIAGNOSTIC: the state each draw is recorded with
+        if (leonida::local_diagnostics()) {
+            static std::atomic<std::uint64_t> draws{0}, skipped{0};
+            const bool skip = !any_nonempty_viewport();
+            const std::uint64_t n = ++draws, k = skip ? ++skipped : skipped.load();
+            if (n <= 8 || n % 1200 == 0)
+                std::fprintf(stderr, "[rt] present-probe: draw #%llu (%s; %llu skipped so far) pso %p rts %u rt0 0x%llx "
+                                     "mip %u viewport %.0fx%.0f at %.0f,%.0f scissor %d,%d-%d,%d count %u x%u\n",
+                             static_cast<unsigned long long>(n), skip ? "SKIPPED: no viewport" : "recorded",
+                             static_cast<unsigned long long>(k), reinterpret_cast<const void*>(graphics_pipeline_),
+                             render_target_count_, static_cast<unsigned long long>(render_targets_[0].resource),
+                             render_targets_[0].mip, viewport_.width, viewport_.height, viewport_.x, viewport_.y,
+                             scissor_.left, scissor_.top, scissor_.right, scissor_.bottom, count, instances);
+            // LOCAL DIAGNOSTIC (fsdraw): the first draw of each pipeline, and one frame's draws every ~300 frames,
+            // with the pipeline's description, the root data and what the bound descriptor tables hold.
+            static std::mutex seen_mutex;
+            static std::set<std::uintptr_t> seen;
+            bool first_seen;
+            {
+                std::lock_guard lock(seen_mutex);
+                first_seen = seen.insert(graphics_pipeline_).second;
+            }
+            const bool fullscreen = render_target_count_ >= 1 && count == 3 && viewport_.width >= 1000;
+            if (fullscreen) leonida::fsdraw::note_target(render_targets_[0].resource);
+            if (first_seen || (n - 1) % 600 < 2 || (n > 2 && n < 9)) {
+                std::fprintf(stderr, "[rt] fsdraw: draw #%llu pso %p%s rt0 0x%llx rts %u depth 0x%llx count %u x%u: %s\n",
+                             static_cast<unsigned long long>(n), reinterpret_cast<const void*>(graphics_pipeline_),
+                             first_seen ? " (first use)" : "", static_cast<unsigned long long>(render_targets_[0].resource),
+                             render_target_count_, static_cast<unsigned long long>(depth_.resource), count, instances,
+                             leonida::fsdraw::pipeline(graphics_pipeline_).c_str());
+                std::fprintf(stderr, "[rt] fsdraw: draw #%llu layout %p user data [%s] cbv heap %p base 0x%llx sampler "
+                                     "base 0x%llx tables %zu\n",
+                             static_cast<unsigned long long>(n), static_cast<const void*>(graphics_.layout),
+                             leonida::fsdraw::hex_words(graphics_.data.data(), graphics_.data.size()).c_str(),
+                             static_cast<const void*>(cbv_srv_uav_heap_),
+                             static_cast<unsigned long long>(cbv_srv_uav_base_),
+                             static_cast<unsigned long long>(sampler_base_), tables_.size());
+                for (std::size_t slot = 0; slot < 2; ++slot) {  // the vertex buffers the blit's VS reads
+                    const auto& vb = vertex_buffers_[slot];
+                    if (!vb.va) continue;
+                    std::uint32_t words[12]{};
+                    bool read = false;
+                    MEMORY_BASIC_INFORMATION mbi{};
+                    if (vb.va < leonida::fsdraw::arena_size()) {
+                        read = leonida::fsdraw::arena_words(vb.va, words, 12);
+                    } else if (VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(vb.va)), &mbi, sizeof mbi) &&
+                        mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) && mbi.Protect) {
+                        std::memcpy(words, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(vb.va)), sizeof words);
+                        read = true;
+                    }
+                    std::fprintf(stderr, "[rt] fsdraw: draw #%llu vb%zu va 0x%llx size %u stride %u: %s [%s]\n",
+                                 static_cast<unsigned long long>(n), slot, static_cast<unsigned long long>(vb.va),
+                                 unsigned(vb.size), unsigned(vb.stride), read ? "read" : "unreadable",
+                                 read ? leonida::fsdraw::hex_words(words, 12).c_str() : "");
+                }
+                D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
+                std::uintptr_t heap_cpu = 0;
+                if (cbv_srv_uav_heap_) {
+                    heap_desc = cbv_srv_uav_heap_->GetDesc();
+                    heap_cpu = cbv_srv_uav_heap_->GetCPUDescriptorHandleForHeapStart().ptr;
+                }
+                char tag[48];
+                std::snprintf(tag, sizeof tag, "draw #%llu", static_cast<unsigned long long>(n));
+                for (const auto& [shader_va, slots] : tables_) {
+                    const std::uint64_t va = leonida::fsdraw::table_origin(shader_va);
+                    const std::uint64_t end = cbv_srv_uav_base_ + std::uint64_t(heap_desc.NumDescriptors) * 32;
+                    const bool in_heap = heap_cpu && va >= cbv_srv_uav_base_ && va + 32 <= end;
+                    const auto* cpu = in_heap ? reinterpret_cast<const std::uint8_t*>(heap_cpu + (va - cbv_srv_uav_base_))
+                                              : nullptr;
+                    const bool console = heap_cpu == std::uintptr_t(cbv_srv_uav_base_);
+                    if (shader_va != va)
+                        std::fprintf(stderr, "[rt] fsdraw: %s table title va 0x%llx is shader va 0x%llx\n", tag,
+                                     static_cast<unsigned long long>(va), static_cast<unsigned long long>(shader_va));
+                    leonida::fsdraw::describe_table(tag, shader_va, slots, cpu,
+                                                    !in_heap ? "none (not in the bound CBV/SRV/UAV heap)"
+                                                    : console ? "console (CPU address = GPU VA, title memory)"
+                                                              : "layer heap (arena)");
+                }
+            }
+        }
+        if (!any_nonempty_viewport()) return;
+        leonida::Draw draw{graphics_pipeline_, graphics_user_data(), draw_views(), depth_, index_, topology_, viewport_,
                            scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, indexed, count, instances,
                            first, base_vertex, first_instance};
+        draw.viewports = draw_viewports();
         check(list_.draw(std::move(draw)));
     }
 };
@@ -1469,12 +1822,14 @@ public:
         context_.enqueue_fence_callback(semaphore, queued, [context, semaphore, queued, value, held = held_] {
             std::uint64_t now = 0;
             bool signaled = false;
-            if (context->vk.vkGetSemaphoreCounterValue(context->device(), semaphore, &now) == VK_SUCCESS &&
+            if (context->observe_result(context->vk.vkGetSemaphoreCounterValue(context->device(), semaphore, &now),
+                                        "vkGetSemaphoreCounterValue (fence callback)") == VK_SUCCESS &&
                 now >= queued && now < value) {
                 VkSemaphoreSignalInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
                 info.semaphore = semaphore;
                 info.value = value;
-                signaled = context->vk.vkSignalSemaphore(context->device(), &info) == VK_SUCCESS;
+                signaled = context->observe_result(context->vk.vkSignalSemaphore(context->device(), &info),
+                                                   "vkSignalSemaphore (fence callback)") == VK_SUCCESS;
             }
             held->fetch_sub(1);
             if (signaled) {
@@ -1644,6 +1999,47 @@ public:
             recorded.push_back(&list->commands());
             graphics.push_back(list);
         }
+        // Buffer V#s the title wrote into a bound table itself may name its own memory: rewritten to a GPU copy's
+        // console VA before the copies are refreshed for this submission (src/title_va_alias.h).
+        {
+            std::map<std::uint64_t, std::uint32_t> tables;  // each table once, with the most slots it was bound with
+            for (const GraphicsCommandList* list : graphics)
+                for (const auto& [table, descriptors] : list->tables())
+                    tables[table] = std::max(tables[table], descriptors);
+            // LOCAL DIAGNOSTIC (fsdraw): poke experiment, LEONIDA_FSDRAW_POKE_CB=1
+            if (leonida::fsdraw::poke_enabled()) {
+                for (const auto& [table, descriptors] : tables) {
+                    const std::uint64_t origin = leonida::fsdraw::table_origin(table);
+                    if (origin != table)
+                        leonida::fsdraw::poke_cb(
+                            reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(origin)));
+                }
+            }
+            // LOCAL DIAGNOSTIC (fsdraw): what the bound tables hold when the lists are submitted
+            if (leonida::local_diagnostics()) {
+                static std::atomic<std::uint64_t> submits{0};
+                const std::uint64_t n = tables.empty() ? 0 : ++submits;
+                if (n && (n <= 6 || n % 300 == 0)) {
+                    char tag[48];
+                    std::snprintf(tag, sizeof tag, "submit #%llu", static_cast<unsigned long long>(n));
+                    for (const auto& [table, descriptors] : tables) {
+                        const std::uint64_t origin = leonida::fsdraw::table_origin(table);
+                        const bool title = origin != table;
+                        leonida::fsdraw::describe_table(
+                            tag, table, descriptors,
+                            title ? reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(origin)) : nullptr,
+                            title ? "title memory (CPU bytes read at the title VA the table was set with)" : "arena or unknown");
+                    }
+                }
+            }
+            if (!tables.empty()) {
+                const auto start = std::chrono::steady_clock::now();
+                for (const auto& [table, descriptors] : tables) leonida::title_va_aliases().scan_table(table, descriptors);
+                leonida::title_va_aliases().note_scan(std::uint64_t(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start)
+                        .count()));
+            }
+        }
         last_result_ = queue_.execute(recorded, [&graphics] { return pin_lists(graphics); });
         d3d12_trace::record(method, last_result_ == leonida::ReplayResult::success ? "ok" : "failed");
         if (last_result_ != leonida::ReplayResult::success)
@@ -1658,7 +2054,7 @@ public:
         for (const auto& command : list.commands().commands()) {
             const auto range = leonida::query_range(command);
             if (range.count && range.type == leonida::d3d12_query::timestamp &&
-                context_.query_heap_type(range.heap) == other)
+                (!timestamp_family_supported() || context_.query_heap_type(range.heap) == other))
                 return false;
         }
         return true;
@@ -1717,14 +2113,18 @@ public:
     }
 
     // Ticks per second of the timestamps EndQuery writes: one tick is timestampPeriod nanoseconds. Every D3D12
-    // queue of the device shares one VkQueue, so they share one frequency. E_FAIL when that queue has no
-    // timestamps (timestampValidBits 0), as D3D12 reports for a queue that does not support them.
+    // device has one timestamp period, but individual queue families may not write timestamps.
     HRESULT STDMETHODCALLTYPE GetTimestampFrequency(UINT64* frequency) override {
         if (!frequency) return E_INVALIDARG;
         const double period = context_.timestamp_period();
-        if (!(period > 0)) return E_FAIL;
+        if (!(period > 0) || !timestamp_family_supported()) return E_FAIL;
         *frequency = static_cast<UINT64>(1e9 / period + 0.5);
         return S_OK;
+    }
+
+    bool timestamp_family_supported() const {
+        // The low-level queue factory also accepts caller-owned queues without a QueueClock.
+        return !clock_.get_device_proc || clock_.timestamp_valid_bits != 0;
     }
 
     // Queue labels, in order with the submissions around them.
@@ -1792,16 +2192,20 @@ private:
         LARGE_INTEGER before{}, after{};
         {
             std::lock_guard submit_lock(context_.submit_mutex());
-            if (vk.vkQueueWaitIdle(vk_queue_) != VK_SUCCESS) return E_FAIL;
+            if (context_.observe_result(vk.vkQueueWaitIdle(vk_queue_), "vkQueueWaitIdle (calibration)") != VK_SUCCESS)
+                return E_FAIL;
             QueryPerformanceCounter(&before);
-            if (vk.vkQueueSubmit(vk_queue_, 1, &submit, VK_NULL_HANDLE) != VK_SUCCESS ||
-                vk.vkQueueWaitIdle(vk_queue_) != VK_SUCCESS)
+            if (context_.observe_result(vk.vkQueueSubmit(vk_queue_, 1, &submit, VK_NULL_HANDLE),
+                                        "vkQueueSubmit (calibration)") != VK_SUCCESS ||
+                context_.observe_result(vk.vkQueueWaitIdle(vk_queue_), "vkQueueWaitIdle (calibration)") != VK_SUCCESS)
                 return E_FAIL;
             QueryPerformanceCounter(&after);
         }
         std::uint64_t stamp = 0;
-        if (stamp_.get_query_pool_results(context_.device(), stamp_.queries, 0, 1, sizeof(stamp), &stamp,
-                                          sizeof(stamp), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS)
+        if (context_.observe_result(stamp_.get_query_pool_results(context_.device(), stamp_.queries, 0, 1,
+                                                                sizeof(stamp), &stamp, sizeof(stamp),
+                                                                VK_QUERY_RESULT_64_BIT),
+                                    "vkGetQueryPoolResults (calibration)") != VK_SUCCESS)
             return E_FAIL;
         if (clock_.timestamp_valid_bits < 64) stamp &= (std::uint64_t(1) << clock_.timestamp_valid_bits) - 1;
         gpu = stamp;
@@ -2021,7 +2425,8 @@ HRESULT set_event_on_multiple_fence_completion(leonida::VulkanContext& context, 
         wait.semaphoreCount = count;
         wait.pSemaphores = semaphores.data();
         wait.pValues = values;
-        const VkResult result = context.vk.vkWaitSemaphores(context.device(), &wait, UINT64_MAX);
+        const VkResult result = context.observe_result(
+            context.vk.vkWaitSemaphores(context.device(), &wait, UINT64_MAX), "vkWaitSemaphores (multiple fences)");
         // Unlike a single fence's blocking SetEventOnCompletion, this path invokes Vulkan directly.
         // A lost device must wake its other registered fence waiters and reject later submissions.
         if (result == VK_ERROR_DEVICE_LOST) {

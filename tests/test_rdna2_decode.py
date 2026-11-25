@@ -382,12 +382,34 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
                 for field in ("op", "args", "mods"):
                     self.assertEqual(reparsed[field], expected[field])
 
+    def test_sopk_imm16_is_sign_extended_for_the_signed_ops_only(self):
+        # SOPK word: 0xB << 28 | op << 23 | sdst << 16 | simm16. The ten signed ops give the 16 bits sign-extended,
+        # the six unsigned compares give them as they are, and the printed line reads back as the same value.
+        signed = {0: "s_movk_i32", 2: "s_cmovk_i32", 3: "s_cmpk_eq_i32", 4: "s_cmpk_lg_i32", 5: "s_cmpk_gt_i32",
+                  6: "s_cmpk_ge_i32", 7: "s_cmpk_lt_i32", 8: "s_cmpk_le_i32", 15: "s_addk_i32", 16: "s_mulk_i32"}
+        unsigned = {9: "s_cmpk_eq_u32", 10: "s_cmpk_lg_u32", 11: "s_cmpk_gt_u32", 12: "s_cmpk_ge_u32",
+                    13: "s_cmpk_lt_u32", 14: "s_cmpk_le_u32"}
+        for table, sign_extends in ((signed, True), (unsigned, False)):
+            for opcode, name in table.items():
+                for simm16 in (0x0001, 0x7FFF, 0x8000, 0xFFFD, 0xFFFF):
+                    with self.subTest(op=name, simm16=hex(simm16)):
+                        code = words(0xB << 28 | opcode << 23 | 5 << 16 | simm16)
+                        ins, = rdna2_decode.decode_bytes(code)["insns"]
+                        want = simm16 - 0x10000 if sign_extends and simm16 & 0x8000 else simm16
+                        self.assertEqual((ins["op"], ins["args"][0]["r"], ins["args"][1]),
+                                         (name, 5, {"k": "imm", "v": want}))
+                        text, bad = rdna2_decode.disasm_bytes(code)
+                        self.assertEqual(bad, 0)
+                        self.assertEqual(shader_ir.parse_line(text.strip())["args"], ins["args"])
+
     def test_parity_with_llvm_mc_on_shader_fixtures(self):
         mc = os.environ.get("LLVM_MC") or shutil.which("llvm-mc") or shutil.which("llvm-mc-18")
         if not mc:
             self.skipTest("llvm-mc not available")
         asms = sorted(glob.glob(os.path.join(ROOT, "runtime", "test", "shaders", "*.asm")))
         self.assertGreater(len(asms), 50)
+        sopk_signed = {"s_movk_i32", "s_cmovk_i32", "s_addk_i32", "s_mulk_i32"} | {
+            f"s_cmpk_{cond}_i32" for cond in ("eq", "lg", "gt", "ge", "lt", "le")}
 
         def norm_op(op):
             for suf in ("_e32", "_e64", "_sdwa", "_dpp"):
@@ -401,7 +423,10 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
                 return (k, a["r"], a.get("n", 1), bool(a.get("neg")), bool(a.get("abs")), bool(a.get("sext")))
             if k == "imm":
                 # LLVM 18 disassembles SOPP branch offsets unsigned (0xfff0), LLVM 21/22 signed (-16).
-                mask = 0xFFFF if op in rdna2_decode._SOPP_BRANCHES else 0xFFFFFFFF
+                # The signed SOPK ops hold 16 bits as well: the decoder gives them sign-extended (s_addk_i32 s52,
+                # -32768; the test above), llvm-mc 23.1.4 prints the same word as 0x8000, and the translator reads
+                # the low 16 bits of either. cs_w32_salu_ext is the first fixture with bit 15 set in one.
+                mask = 0xFFFF if op in rdna2_decode._SOPP_BRANCHES or op in sopk_signed else 0xFFFFFFFF
                 return ("imm", a["v"] & mask, bool(a.get("neg")), bool(a.get("abs")))
             if k == "fimm":
                 return ("fimm", round(a["v"], 6), bool(a.get("neg")), bool(a.get("abs")))

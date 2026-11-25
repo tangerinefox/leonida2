@@ -68,6 +68,11 @@ class TranslateFallbacksTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as spirv:
             return self.shards_in(spirv, fallbacks=fallbacks, jobs=jobs, pre_parts=pre_parts)
 
+    def test_descriptor_hash_build_flag(self):
+        self.assertEqual(make_game.fallback_flags(argparse.Namespace(descriptor_hash="fnv1a")), ())
+        self.assertEqual(make_game.fallback_flags(argparse.Namespace(descriptor_hash="fnv1a_fmix32")),
+                         ("--descriptor-hash=fnv1a_fmix32",))
+
     def test_shards_get_the_fallback_flags(self):
         for args in self.shards(fallbacks=("--no-float-controls", "--bary-fallback")):
             self.assertEqual(args.count("--no-float-controls"), 1, args)

@@ -3,7 +3,7 @@
 Standard library only; no GPU, no LLVM, no SPIRV-Tools, no game files.
 
 ```sh
-python -I scripts/run_semantic_tests.py tests/semantic        # one file per core: 26 s instead of 253 s on 16 cores
+python -I scripts/run_semantic_tests.py tests/semantic        # one file per core: 297 s instead of 2 401 s on 16 cores (Windows 11)
 python -m unittest discover -s tests/semantic -v             # the same tests, one file after another
 python -I scripts/run_semantic_tests.py tests/semantic -j 4 -p 'test_image_*.py'  # a matching subset
 ```

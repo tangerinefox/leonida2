@@ -6,7 +6,8 @@ and embed textures (.png or .dds) directly into glTF materials. A texture
 that cannot be read or decoded is left out of that model and reported (one
 line each, counted in the summary), never dropped silently; a model that
 fails to convert is named with its error. Exit status is 1 only when a
-model failed.
+model failed. A missing input folder or an output path that cannot be created
+exits 2.
 
 Usage:
     python -I tools/batch_glb.py <in_dir> <out_dir> [--jobs N] [--up z|y] [--textures <dir>]
@@ -264,7 +265,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     except (ValueError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
-        return 1
+        return 2
     elapsed = time.monotonic() - t0
 
     for path, err in stats["failures"]:

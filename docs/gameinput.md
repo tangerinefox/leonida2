@@ -125,9 +125,9 @@ owns the game's window, which is the title's, not the shim's.
 
 Keys are read with `GetAsyncKeyState`, which needs no window or message loop (SDL's keyboard is part of its video
 subsystem, which this build leaves out) and works under Wine. With `LEONIDA_KEYBOARD_PAD=1` keys count only while a
-window of this process is in the foreground, so typing in another application presses nothing, and every button,
-stick and trigger is released when focus moves away (the cursor is read afresh when focus returns, so the right
-stick does not jump). `LEONIDA_KEYBOARD_PAD=always` reads them whatever has focus; a console tool such as
+window of this process is in the foreground. Losing focus releases keyboard and mouse input. The cursor is read
+afresh on return so the right stick does not jump. Scripted presses run with or without focus for unattended runs.
+`LEONIDA_KEYBOARD_PAD=always` reads physical input whatever has focus; a console tool such as
   `gameinput_probe` needs it, because its console window belongs to the terminal, not to the tool.
 - Force feedback and haptics run through a fake haptic backend (`rt::gameinput::set_haptic_source`), because SDL's
   virtual joysticks report no haptics: the motor count, axes and effect flags a wheel reports, and a pad without SDL
@@ -302,6 +302,7 @@ line is logged when it takes effect); tracking goes on underneath, so clearing i
 | `LEONIDA_PROMPTS_SWITCH_MS` | `300` | shortest time between two changes of the active input family, 0..2000 ms |
 | `LEONIDA_GAMEINPUT_THREAD` | `1` | `0` stops the background poll thread; only `rt::gameinput::poll()` then reads the pads (tests) |
 | `LEONIDA_KEYBOARD_PAD` | `off` | `1` adds the [keyboard pad](#keyboard-pad), read while this process has focus; `always` reads keys whatever has focus |
+| `LEONIDA_INPUT_SCRIPT` | unset | With the keyboard pad enabled, set comma-separated `button@seconds` entries, e.g. `a@2,a@4,start@6`. The first pad update reads the script once at startup and starts the clock. `reload_config()` does not reread it. Each press lasts 300 ms. Buttons are `a b x y start back lb rb up down left right`. Spaces around entries are allowed. Empty entries, unknown buttons and invalid times (including negative or non-finite values) are counted and ignored. |
 | `LEONIDA_MOUSE_SENSITIVITY` | `1` | scales how far the mouse moves the keyboard pad's right stick, 0.1..10 |
 
 SDL's own hints (`SDL_JOYSTICK_*`, see SDL's `SDL_hints.h`) also apply, for example `SDL_JOYSTICK_HIDAPI_PS5=0` to
@@ -327,8 +328,6 @@ The API surface:
 | `IGameInputReading` | kind, sequence number, timestamp, device, gamepad state, UI navigation state, controller axes and buttons, motion state, raw report (pads opened through HID, see [Raw HID](#raw-hid)) | keyboard, mouse, touch, arcade/flight stick, racing wheel (all return nothing) |
 | `IGameInputDevice` | device info, status, battery, `SetRumbleState`, force-feedback motors with `CreateForceFeedbackEffect`/`IGameInputForceFeedbackEffect`, `IsForceFeedbackMotorPoweredOn`, `SetForceFeedbackMotorGain`, haptic trigger motors with `SetHapticMotorState`, `CreateRawDeviceReport`, `GetRawDeviceFeature`, `SetRawDeviceFeature`, `SendRawDeviceOutput` (pads opened through HID) | `SendRawDeviceOutputWithResponse`, `ExecuteRawDeviceIoControl`, exclusive raw access, power off, input synchronization (no-ops) |
 | `IGameInputRawDeviceReport` | device, report info (kind, id, size), raw data size, get and set raw data | item values (`Get/Set/ResetItemValue`, `ResetAllItems` answer false: no item tables) |
-| `IGameInputReading` | kind, sequence number, timestamp, device, gamepad state, UI navigation state, controller axes and buttons, motion state | raw report, keyboard, mouse, touch, arcade/flight stick, racing wheel (all return nothing) |
-| `IGameInputDevice` | device info, status, battery, `SetRumbleState`, force-feedback motors with `CreateForceFeedbackEffect`/`IGameInputForceFeedbackEffect`, `IsForceFeedbackMotorPoweredOn`, `SetForceFeedbackMotorGain`, haptic trigger motors with `SetHapticMotorState` | raw device I/O, power off, input synchronization (no-ops) |
 | `IGameInputDispatcher` | `Dispatch` (with its quota), `OpenWaitHandle` | |
 
 `CreateAggregateDevice` takes exactly one of the keyboard, mouse, gamepad, arcade stick, flight stick or racing wheel

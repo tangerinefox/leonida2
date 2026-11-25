@@ -406,6 +406,29 @@ class Main(unittest.TestCase):
             self.assertEqual([m["fspx_state_sha256"] for m in metas],
                              [hashlib.sha256(s_a).hexdigest(), hashlib.sha256(s_b).hexdigest()])
 
+    def test_compute_hash_filter_keeps_distinct_states(self):
+        first, second = kind0(), kind0(threads=(32, 1, 1))
+        code = prog(3)
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "lib.bin")
+            with open(src, "wb") as f:
+                f.write(build([], [(i, NONE, 0, NONE) for i in range(3)] + [(0, NONE, 1, NONE)],
+                              [first, second, first], [code, prog(4)]))
+            hashes = os.path.join(tmp, "hashes.txt")
+            with open(hashes, "w", encoding="utf-8", newline="\n") as f:
+                f.write(hashlib.sha256(code).hexdigest() + "\n")
+            out = os.path.join(tmp, "out")
+            rc, _ = self.run_main(src, "--out", out, "--compute-hashes", hashes)
+            self.assertEqual(rc, 0)
+            names = ["lib_cs_00000", "lib_cs_00000_state_1"]
+            with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
+                self.assertEqual([e["file"] for e in json.load(f)], [n + ".dxbc" for n in names])
+            for name, state in zip(names, (first, second)):
+                with open(os.path.join(out, "fspx", name + ".state"), "rb") as f:
+                    self.assertEqual(f.read(), state)
+            with open(os.path.join(out, "library.json"), encoding="utf-8") as f:
+                self.assertEqual([e["program"] for e in json.load(f)["compute"][:3]], [*names, names[0]])
+
     def test_carve_names_sources_and_copies_containers(self):
         with tempfile.TemporaryDirectory() as tmp:
             carve = os.path.join(tmp, "carve")

@@ -107,7 +107,7 @@ UNDEF = _Undef()
 # Operations whose result is undefined when an operand is (they have no side effect and no control).
 _PURE = frozenset({
     "OpBitwiseAnd", "OpBitwiseOr", "OpBitwiseXor", "OpNot", "OpShiftLeftLogical", "OpShiftRightLogical",
-    "OpShiftRightArithmetic", "OpIAdd", "OpISub", "OpIMul", "OpUConvert", "OpBitCount", "OpIEqual",
+    "OpShiftRightArithmetic", "OpIAdd", "OpISub", "OpIMul", "OpUMod", "OpUConvert", "OpBitCount", "OpIEqual",
     "OpINotEqual", "OpSLessThan", "OpULessThan", "OpUGreaterThan", "OpUGreaterThanEqual", "OpCopyObject",
     "OpBitcast",
     "OpBitFieldUExtract", "OpBitFieldSExtract", "OpBitFieldInsert",
@@ -756,6 +756,12 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
         if op == "OpKill":
             killed = True
             break
+        if op == "OpSwitch":
+            key = val(a[0])
+            mask = wmask(id_type[a[0]])
+            target = next((label for literal, label in zip(a[2::2], a[3::2])
+                           if int(literal, 0) & mask == key & mask), a[1])
+            op, a = "OpBranch", [target]
         if op == "OpBranch":
             if a[0] not in labels:
                 raise UnsupportedConstruct(f"unknown branch target {a[0]}")
@@ -988,6 +994,9 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
             values[res] = (val(a[1]) + val(a[2])) & wmask(a[0])
         elif op == "OpISub":
             values[res] = (val(a[1]) - val(a[2])) & wmask(a[0])
+        elif op == "OpUMod":
+            divisor = val(a[2]) & wmask(a[0])
+            values[res] = (val(a[1]) & wmask(a[0])) % divisor if divisor else UNDEF
         elif op == "OpIMul":
             values[res] = (val(a[1]) * val(a[2])) & wmask(a[0])
         elif op == "OpUConvert":

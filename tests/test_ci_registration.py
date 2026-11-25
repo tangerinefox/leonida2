@@ -219,9 +219,13 @@ def defines_a_test(source, require_test_case=False):
     ``unittest discover`` only collects TestCase subclasses, so the semantic job passes
     ``require_test_case=True``: a module with only ``def test_x(): ...`` runs zero cases there even
     though pytest would collect it.
+
+    A TestCase runs the ``test*`` methods it inherits as well as its own (the loader lists them with ``dir()``),
+    so a TestCase with none of its own counts when a class of this module that it derives from defines one: the
+    mixin of ``tests/semantic/test_sub_co_same_operand.py``, shared by one TestCase per wave size.
     """
     tree = ast.parse(source)
-    bases, case_aliases = {}, set()
+    bases, own_tests, case_aliases = {}, {}, set()
     # Recognize bare aliases introduced by a direct import; this is not a general name resolver.
     for node in tree.body:
         if isinstance(node, ast.ClassDef):
@@ -229,6 +233,8 @@ def defines_a_test(source, require_test_case=False):
                 "TestCase" if isinstance(b, ast.Name) and b.id in case_aliases else ast.unparse(b).rsplit(".", 1)[-1]
                 for b in node.bases
             ]
+            own_tests[node.name] = any(isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                                       and item.name.startswith("test") for item in node.body)
             case_aliases.discard(node.name)
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
             for item in node.names:
@@ -258,13 +264,29 @@ def defines_a_test(source, require_test_case=False):
                 stack.append(base)
         return False
 
+    def local_ancestors(name):
+        """The classes of this module `name` derives from, directly or through other classes of this module."""
+        seen, stack = [], [name]
+        while stack:
+            for base in bases[stack.pop()]:
+                if base in bases and base not in seen:
+                    seen.append(base)
+                    stack.append(base)
+        return seen
+
     for node in tree.body:
         if isinstance(node, ast.ClassDef) and is_test_case(node.name):
             if any(isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name.startswith("test")
                    for item in node.body):
                 return True
-            # a mixin imported from another module (tests/semantic/f16_unary_cases.py's UnaryF16) brings its tests
-            if any(b not in bases and b not in ("TestCase", "object") for b in bases[node.name]):
+            # the test* methods of the classes of this module it derives from are its tests too
+            ancestors = local_ancestors(node.name)
+            if any(own_tests[name] for name in ancestors):
+                return True
+            # a mixin imported from another module (tests/semantic/f16_unary_cases.py's UnaryF16) brings its tests,
+            # to the class that names it and to the classes of this module that derive from that one
+            if any(b not in bases and b not in ("TestCase", "object")
+                   for name in [node.name] + ancestors for b in bases[name]):
                 return True
         if not require_test_case and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
                 and node.name.startswith("test"):
@@ -392,6 +414,40 @@ class RepositoryRegistrationTest(unittest.TestCase):
         for kind, source, expected in cases:
             with self.subTest(kind=kind):
                 self.assertEqual(defines_a_test(source, require_test_case=True), expected)
+
+    def test_inherited_tests_count_where_unittest_discover_collects_them(self):
+        # The expectations are the runner's: unittest discover is run on these modules, and the scan has to find a
+        # test in exactly the ones it collects one from.
+        mixin = "class Mixin:\n    def test_one(self): pass\n"
+        cases = (
+            ("mixin_above", "import unittest\n" + mixin + "class Example(Mixin, unittest.TestCase): pass\n", True),
+            ("mixin_two_classes_up", "import unittest\n" + mixin + "class Middle(Mixin): pass\n"
+             "class Example(Middle, unittest.TestCase): pass\n", True),
+            ("mixin_beside_an_empty_case", "import unittest\n" + mixin + "class Base(unittest.TestCase): pass\n"
+             "class Example(Mixin, Base): pass\n", True),
+            ("imported_mixin", "import unittest\nfrom shared_cases import Cases\n"
+             "class Example(Cases, unittest.TestCase): pass\n", True),
+            ("imported_mixin_through_a_local_class", "import unittest\nfrom shared_cases import Cases\n"
+             "class Middle(Cases): pass\nclass Example(Middle, unittest.TestCase): pass\n", True),
+            ("base_without_tests", "import unittest\nclass Helper:\n    def helper(self): pass\n"
+             "class Example(Helper, unittest.TestCase): pass\n", False),
+            ("mixin_no_case_derives_from", "import unittest\n" + mixin
+             + "class Example(unittest.TestCase): pass\n", False),
+            ("mixin_without_a_case", mixin + "class Example(Mixin): pass\n", False),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            sources = [("shared_cases.py", "class Cases:\n    def test_one(self): pass\n")]
+            sources += [(f"test_{kind}.py", source) for kind, source, _ in cases]
+            for name, source in sources:
+                with open(os.path.join(tmp, name), "w", encoding="utf-8", newline="\n") as f:
+                    f.write(source)
+            result = subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", ".", "-v"],
+                                    cwd=tmp, capture_output=True, text=True, timeout=30, check=True)
+        for kind, source, expected in cases:
+            with self.subTest(kind=kind):
+                self.assertEqual(f"(test_{kind}.Example" in result.stderr, expected, result.stderr)
+                self.assertEqual(defines_a_test(source, require_test_case=True), expected)
+        self.assertIn("Ran 5 tests", result.stderr)
 
     def test_every_selected_file_exposes_a_test_to_its_runner(self):
         # Selection is not execution: pytest imports a file it is handed and reports zero items without

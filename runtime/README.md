@@ -147,6 +147,16 @@ basename when it has a character outside ASCII (`Loader::find_loaded_module_w`, 
 module names compare case-insensitively with the system's own table (`CompareStringOrdinal`), as Windows
 compares them; a narrow name outside ASCII compares the same way through the ANSI code page.
 
+The game's code is built for the console's AMD Zen 2 and uses a few of its instructions without asking CPUID: SSE4a
+`insertq`/`extrq`, `clzero` and `monitorx`/`mwaitx` (no Intel CPU has them) and `clwb` (Intel since Ice Lake)
+([docs/cpu_features.md](../docs/cpu_features.md)). A host without one raises `#UD` there, so `gta6rt` installs a
+vectored handler before any image code runs (`src/cpu_emulation.h`): it recognises those encodings at the faulting
+address, does the same work on the thread's context and continues after the instruction. It prints one `[rt] cpu:`
+line at startup naming what the host lacks, and one the first time each instruction is emulated. On a host that has
+them the CPU runs them and the handler never sees them. Each emulated instruction costs an exception round trip, so a
+hot loop of them is slow; patching such a site in place is a later step. `cpu_emulation_test` runs every form for
+real: natively on a Zen host, through the handler on an Intel one.
+
 `module_names` checks native and mapped renamed DLLs, distinct Unicode identities, basename cache
 reuse, existing ACP aliases, the wide and case-insensitive lookups, export execution, and path errors. On native Windows with Python available,
 `run_module_names` compares original renamed EXEs through native execution and `--dry-run`, `--init`,
@@ -170,8 +180,28 @@ clone of the helper from `%TEMP%\leonida_tls_host_<pid>_<slot>.dll`, so up to 16
 once and a further one is rejected with an error instead of sharing a slot. Images without a TLS
 directory (or with an all-zero one) load normally.
 
-A `/GA` executable's code reaches its static TLS directly at index 0 (`mov r64, gs:[58h]`), but the
-loader can only get that image an index from the OS, and it need not be 0. Before the image's sections
+An executable (an image without `IMAGE_FILE_DLL`, the game's EXE under `--run`, `--init` and `--dry-run`) gets
+module TLS index 0 instead, as Windows gives the process EXE. MSVC code built with `/GA` relies on that: it reads
+`ThreadLocalStoragePointer[0]` directly and never loads `_tls_index`. A `thread_local int v = 42;` EXE built
+`/O2 /GA /MD` printed `tls_index=0 value=42` natively but `tls_index=6 value=0` under `gta6rt --run` when it got a
+helper's index. Index 0 belongs to `gta6rt.exe` itself (measured: Windows gives it to the process EXE, the trace event
+below names it, and `gta6rt.exe` has a 1398-byte TLS template when measured and no TLS callbacks), and all of its own
+TLS reads go through `_tls_index`. So `gta6rt.exe` moves off index 0 once, at start (`rt::reserve_tls_index0()`,
+called from a CRT initializer that runs before any of gta6rt's own static initializers): it writes one more clone of the
+helper, `leonida_tls_host_<pid>_home.dll`, whose TLS directory covers a copy of `gta6rt.exe`'s template (the
+helper carries a 16 KiB array for it), swaps slots 0 and that clone's index on the calling thread and writes the
+clone's index into `gta6rt.exe`'s `_tls_index`. Every thread the OS starts from then on has a fresh copy of
+`gta6rt.exe`'s TLS at that index from its first instruction, so nothing has to run on a new thread first, including
+code that runs in an earlier DLL's `DLL_THREAD_ATTACH`. Slot 0 then holds a block nothing reads, which the executable's
+template copy replaces on the loading thread, on threads started later, and through `install_tls_for_thread()` on
+older ones, exactly as a DLL's copy replaces a helper's; the OS frees both slots at thread exit. The move cannot be made
+later: MSVC keeps the address of a TLS slot in a frame across calls (`zlib_inflate` in `shader_library.h` does), so
+a thread that already runs gta6rt's code cannot be moved wherever it is stopped. The startup trace records the move at
+the first executable (`tls_index0`). DLLs keep the helper indices and work next to the executable as before.
+
+When the executable does not get index 0 (the reservation failed, or another executable holds it), its `/GA` code
+still reaches its static TLS directly at index 0 (`mov r64, gs:[58h]`), but the loader can only get that image an
+index from the OS, and it need not be 0. Before the image's sections
 are protected and before any of its code runs, TLS callbacks included, the loader rewrites each such
 slot-0 read in an executable section to the same instruction reading `TEB->TlsSlots[slot]` instead
 (`patch_ga_tls_reads`), with one `TlsAlloc` slot per image; the rewrite is the same length, so nothing
@@ -195,7 +225,19 @@ Current limits, by design:
   title's callback on, gets its copy from `load()` itself, the way Windows gives one to running threads for a DLL it
   loads: a block, no `DLL_THREAD_ATTACH`, `DLL_THREAD_DETACH` when it ends, and `~Loader` takes the block back.
   `install_tls_for_thread()` and `uninstall_tls_for_thread()` are no-ops on such a thread. Mapped DLLs' `DllMain` is not called with thread events. Destroy the `Loader` on the thread that
-  called `load()`.
+  called `load()`. As on Windows, a new thread gets every module's copy before any TLS callback runs, and the
+  executable's callbacks come after the DLLs' ones, for attach and for detach.
+- One executable holds index 0 at a time, and only after `reserve_tls_index0()` has run at process start. An
+  executable mapped without it (the reservation failed, the `Loader` is used without it, or another executable
+  holds index 0) gets a helper index and a `[rt] loader: ... does not get module TLS index 0` line on stderr: its
+  `/GA` code would read and write the TLS in slot 0, which is `gta6rt.exe`'s own or the other executable's, so
+  `--run` and `--init` refuse it with an error and exit code 1, and a `Loader` user must not run its code.
+- Threads that ran gta6rt's code before the reservation keep nothing of their TLS: they find a fresh copy at the new
+  index. In gta6rt only the main thread has run its code by then, and its TLS moves with it.
+- The home clone stays loaded until the process ends (freeing it would free `gta6rt.exe`'s TLS blocks), and a mapped
+  image's file cannot be deleted, so its file stays in `%TEMP%` until the next run's clean-up of dead processes'
+  clones deletes it. The clones for mapped DLLs are deleted at exit as before. A `gta6rt.exe` whose TLS
+  outgrows the helper's 16 KiB array is refused the move.
 - The TOC of the game's RPF archives is encrypted and is not read here. The loader works on the PE
   files and on any images the caller passes it.
 
@@ -226,7 +268,15 @@ Current limits, by design:
   Vulkan SDK and Python 3. The Vulkan device covers command submission, descriptor heaps, render-target and
   depth views, committed resources and copies (uploads, readbacks, BC textures), root signatures, graphics and
   compute pipeline states, draws, dispatches and `ExecuteIndirect`; see `docs/d3d12_vulkan.md` for what is
-  missing.
+  missing. `LEONIDA_DEVICE_FAULT=1` enables a stderr report with supported Vulkan fault information and queue
+  checkpoints on the first observed device loss.
+
+- `dstorage_xs.dll` / `xcrdapi.dll` / `dstorage.dll` — `DStorageGetFactory`: the console DirectStorage API
+  (`shims/dstorage.cpp`, declarations in `shims/dstorage_xs_abi.h`). Files open through the `GAME:` mapping and the
+  overlay; each queue reads file or memory ranges into memory in order on its own worker thread, inflating zlib
+  requests (RFC 1950, `src/shader_library.h`'s inflater), and reports through status arrays, `ID3D12Fence` signals
+  and events. BCPack, swizzle and physical-page requests are not done yet.
+  See [docs/directstorage.md](../docs/directstorage.md) for the ABI evidence and what is unverified.
 
 - `gameinput.dll` / `xgameruntime.dll` — `GameInputCreate`: the v0 GameInput API for gamepads on SDL3
   (`shims/gameinput.cpp`), so any controller SDL supports works, with rumble, Xbox trigger rumble, force feedback
@@ -239,18 +289,62 @@ Current limits, by design:
 ### What `xgameruntime.dll` reports: environment overrides
 
 The `xgameruntime` shim (`shims/xgameruntime.cpp`) answers the title's questions about the console and its package
-with fixed values. Five environment variables change an answer, for trying another of the title's code paths. Each
+with fixed values. Six environment variables change an answer, for trying another of the title's code paths. Each
 is read on every call, and a value that is empty or too long for its buffer is ignored.
 `tests/test_docs_env_vars.py` fails when the runtime or `make_game.py` reads a `LEONIDA_*` variable that no
 document names.
 
 | variable | default | what it changes |
 |---|---|---|
-| `LEONIDA_DEVICE_TYPE` | `7` | The `XSystemDeviceType` that `XSystemGetDeviceType` returns: `0` Unknown, `1` Pc, `2` XboxOne, `3` XboxOneS, `4` XboxOneX, `5` XboxOneXDevkit, `6` XboxScarlettLockhart (Series S), `7` XboxScarlettAnaconda (Series X), `8` XboxScarlettDevkit. A number outside 0..8 is ignored; text that is not a number counts as `0`. `6` also makes `XSystemGetAnalyticsInfo` report the form `Xbox Series S` instead of `Xbox Series X`. |
+| `LEONIDA_DEVICE_TYPE` | `7` | The `XSystemDeviceType` that `XSystemGetDeviceType` returns: `0` Unknown, `1` Pc, `2` XboxOne, `3` XboxOneS, `4` XboxOneX, `5` XboxOneXDevkit, `6` XboxScarlettLockhart (Series S), `7` XboxScarlettAnaconda (Series X), `8` XboxScarlettDevkit. A number outside 0..8 is ignored; text that is not a number counts as `0`. `6` also makes `XSystemGetAnalyticsInfo` report the form `Xbox Series S` instead of `Xbox Series X`. The title's registry read of `HKLM\Software\Microsoft\Windows NT\CurrentVersion\OEM` `ConsoleMode` is answered from the same setting (`6` → `0x60`, `7` → `0x64`, `8` → `0x68`; the other types have no value, so the host registry is asked), so no registry key has to be written into a Wine prefix or a Windows machine (`docs/runtime_imports.md`, "Console identity in the registry"). |
 | `LEONIDA_ANALYTICS_FORM` | unset | The `form` string of `XSystemGetAnalyticsInfo`, in place of the one the device type gives (up to 63 characters). |
 | `LEONIDA_PACKAGE_ID` | `LeonidaPackageIdentifier00000000` | The identifier `XPackageGetCurrentProcessPackageIdentifier` returns (up to 32 characters). It is also the one identifier `XPackageMount` refuses with `E_ACCESSDENIED`, as the game's own package. |
 | `LEONIDA_CONTENT_PACKAGES` | unset | The content packages `XPackageMount` can mount: `id1=path1;id2=path2` (up to 1,023 characters). The mount path of a listed identifier is its path, as written; any other identifier is `ERROR_NOT_FOUND`, and a path longer than 259 characters is `ERROR_INSUFFICIENT_BUFFER`. |
 | `LEONIDA_PACKAGED` | `1` | `0`, or text that is not a number, makes `XPackageIsPackagedProcess` return false. Any other number keeps it true. |
+| `LEONIDA_TITLE_MEMORY_MB` | unset | Caps the title memory limit (in MiB, clamped to `2048..65536`) reported by both `XSystemGetAppMemoryUsageLimit` (`xgameruntime.cpp`) and `XMemGetWorkingSetStatistics` (`xmem.cpp`). Useful on 16 GB RAM / low-VRAM hosts to prevent oversized title pools; invalid or non-positive values are ignored and fall back to the host memory report. |
+| `LEONIDA_STACKS` | unset | Comma-separated whole seconds after the title's entry point is called (e.g. `90,180`). At each time `--run` suspends every other thread in turn just long enough to copy its context and stack, then unwinds the copy (title frames through the unwind tables the loader registers) and prints to stderr `[rt] stacks t=<s> thread <tid> (<thread description, or start address>):` and up to 40 `#i module+0xRVA` frames, innermost first; a chain identical to an earlier thread's prints `same as thread <tid>`. |
+
+### Switches of the D3D12 layer for a retail boot
+
+Read once per process, by the Vulkan D3D12 layer (`shims/d3d12_vulkan_device.cpp`) unless the row names another file.
+"on" means the behaviour is the default and `0` turns it off; "unset" means it is off until the variable is set. The
+ones marked *diagnostic* only add log lines or exist to compare a run with and without a change; nothing needs them.
+
+| variable | default | what it changes |
+|---|---|---|
+| `LEONIDA_LAZY_PIPELINES` | on | Graphics pipelines are built at their first draw. `0` builds each at `CreatePipelineState`, as before; the title creates far more pipelines at startup than it draws with. |
+| `LEONIDA_LAZY_COMPUTE` | on | Compute pipelines are built at the first dispatch that names them, or earlier by the warm-up thread. `0` builds each at `CreateComputePipelineState`. |
+| `LEONIDA_COMPUTE_WARMUP_MAX_BYTES` | `1048576` | The largest SPIR-V module, in bytes, the background warm-up thread (`LEONIDA_COMPUTE_WARMUP`) builds ahead of its first dispatch. Larger modules wait for that dispatch. |
+| `LEONIDA_SERIAL_BIG_COMPILES` | on | Compute modules over 128 KiB of SPIR-V compile one at a time, because the driver's compiler needs hundreds of MiB for each. `0` lets them compile side by side. |
+| `LEONIDA_CONSOLE_FORMATS` | on | Texture descriptions the console accepts and a PC GPU may not (an R9G9B9E5 render target, an sRGB RGBA8 or BGRA8 texture with unordered access) get a host format that can do the job. `0` refuses them, as a PC D3D12 runtime does. |
+| `LEONIDA_CONSOLE_HEAP_SHADOW` | on | A console descriptor heap has a copy in the descriptor arena that the shaders read. `0` keeps its bytes in the title's memory only (the comparison for a run that misbehaves with the copy). |
+| `LEONIDA_IMPORT_BELOW_ARENA` | unset | `1` keeps a host-memory import that the driver put below the GPU address arena. By default such an import is not used and the shadow buffer in the arena answers, because a V# cannot name an address below the arena. |
+| `LEONIDA_ORDER_TEXTURE_UPLOADS` | on | A title texture in a host-transfer image is filled through the ordered host copy (`write_host_texture`). `0` fills it with `WriteToSubresource`. |
+| `LEONIDA_PLACED_IMAGE_KEYS` | on | A texture the title placed at its own address (device slot 133) and that the GPU writes keeps its own image address as its T# key. `0` re-keys it to the title address, like a texture the GPU does not write. |
+| `LEONIDA_PLACED_TEXTURE_UAV` | on | Device slot 71 writes an unordered-access view of a texture in the title's placed memory. `0` writes a null descriptor. |
+| `LEONIDA_REFRESH_MAPPED_TEXTURES` | on | A mapped slot-133 texture is refilled outside the fill budget, and its pages are committed before they are read. `0` treats it like any other title texture. |
+| `LEONIDA_TEXTURE_PAGE_CHECK` | on | The pages of a title texture are checked for being readable before they are hashed or copied. `0` checks only a texture whose check is already pending. |
+| `LEONIDA_TITLE_TEXTURE_PERIOD_MS` | `16` | The shortest time between two passes over the textures filled from the title's memory. |
+| `LEONIDA_TITLE_TEXTURE_CHECK_KB` | `4096` | How many KiB of those textures one pass hashes to find changed ones. |
+| `LEONIDA_TITLE_TEXTURE_FILL_MB` | `32` | How many MiB of changed textures one pass fills again; the rest waits for the next pass. |
+| `LEONIDA_TEXTURE_HASH_BUDGET_US` | `400` | Microseconds a pass may spend hashing before it stops at a texture boundary. `0` leaves the byte budget alone to bound it. |
+| `LEONIDA_TEXTURE_SWEEP_BUDGET_US` | `400` | Microseconds a pass may spend on residency checks and uploads between textures. |
+| `LEONIDA_TITLE_BUFFERS_MB` | `512` | The most memory, in MiB, of buffers made over the title's own memory for vertex and index views that name it. |
+| `LEONIDA_TITLE_BUFFER_COVERAGE` | on | Such a view counts as covered only when a known buffer spans all its bytes. `0` asks for the first byte only. |
+| `LEONIDA_SHADOW_FULL_WALK` | unset | *Diagnostic.* `1` queries every page of the title-memory shadows at every refresh, as before unchanged generations were skipped. |
+| `LEONIDA_STRICT_REPLAY` | unset | *Diagnostic.* `1` makes a draw or dispatch with an unresolvable resource fail its command list (`src/vulkan_replay.h`); by default it is dropped and logged. |
+| `LEONIDA_VOLUME_MIPS` | on | The XG layout of a 3D texture with mips or a block format is computed (`shims/xg_xs_layout.h`). `0` refuses it. |
+| `LEONIDA_TITLE_WATCHDOG` | unset (armed) | The title's own hang watchdog stays armed by default, as on the console: if the game's main loop does not report for 30 seconds, the title ends itself. `0` makes `gta6rt --run` keep it from firing while the game thread waits for the driver, for example on the first boot after a driver update (`src/main.cpp`), and only in the build the watchdog was measured in. |
+| `LEONIDA_PEEK_SECONDS` | `10` | *Diagnostic.* The period of the `LEONIDA_PEEK` thread (`src/main.cpp`), which prints 8-byte values of the title's image. |
+| `LEONIDA_INPUT_LOG` | on | The GameInput shim logs every press in `LEONIDA_INPUT_SCRIPT`'s form (`name@seconds`), so a session played by hand can be replayed. `0` turns the lines off. |
+| `LEONIDA_LOG_ALLOCINFO` | unset | *Diagnostic.* `1` logs every device slot 25 call (`GetResourceAllocationInfo`) with its thread, description and sizes (`shims/d3d12_xs_device.cpp`). |
+| `LEONIDA_LOG_EXE_PIPELINES` | unset | *Diagnostic.* When set, one line per distinct graphics pipeline that uses a program translated from the executable's inline containers. |
+| `LEONIDA_MEM_PROBE_CACHE` | unset | *Diagnostic.* `1` adds the pipeline cache's size to the memory probe's report; the driver serializes the whole cache to answer. |
+| `LEONIDA_TEXTURE_PROBE` | unset | *Diagnostic.* Logs a `[rt] texture-probe` line for every shader resource view of a texture in the title's memory. |
+| `LEONIDA_LOCAL_DIAGNOSTICS` | unset | *Diagnostic.* `1` turns on the boot diagnostics that write to stderr from the draw, clear, present and descriptor paths (the lines tagged `present-probe`, `fsdraw`, `heap-probe`, `desc-probe` and `PresentX diag`; `src/local_diagnostics.h`). They follow a frame of the title from its draws to the window and cost a lock and a line per draw, so they are off by default. The full-screen draw targets that `LEONIDA_CAPTURE_SOURCE` reads back are only collected with it. |
+| `LEONIDA_CAPTURE_SOURCE` | unset | *Diagnostic.* With `LEONIDA_CAPTURE`, `1` also reads back the presented source texture itself (`src/vulkan_present.h`). |
+| `LEONIDA_XG_TRACE_FORMAT` | unset | *Diagnostic.* A DXGI format number: logs the first 256 XG layout computers of that format, whatever `LEONIDA_XG_TRACE`'s cap (`shims/xg_xs.cpp`). |
+| `LEONIDA_FSDRAW_POKE_CB` | unset | *Diagnostic, changes what is drawn.* An experiment of the full-screen draw probe (`src/fsdraw_probe.h`): writes a known colour into the constant buffer a bound table names, to prove the path from the table to the render target. |
 
 The two serializer functions and `D3D12XboxCreateDevice` are the only `d3d12_xs` imports used by the
 shipped DLLs (measured; see `docs/design.md` and `docs/d3d12_vulkan.md`). The game executable's own
@@ -404,10 +498,11 @@ blocks the import-driven work:
   measured-slot proxy, but its parameter and flag layout is unmeasured, and the Xbox device vtable is only partly
   measured: the FSR DLL's calls confirm device slots 14, 15, 16, 18, 19, 27, 38, 62 and 76, slot 67 is a
   console-only pipeline call, and the rest is open (`docs/d3d12_vulkan.md`, question 2).
-- The command-queue and fence extensions: the proxies forward the public slots, and the console's own methods past
-  them (`PresentX`, `SuspendX`, `ResumeX`) have unknown slots, so they are refused with a log.
-  `PresentX` and the frame events themselves are implemented (`shims/xbox_present.*`, `xbox_present_test`) but
-  nothing reaches them yet: their queue and device slots are unmeasured.
+- The command-queue and fence extensions: the proxies forward the public slots. Of the console's own queue methods
+  past them, `PresentX` is routed (slot 30, or 32 on a queue detected as the newer layout; `docs/d3d12_vulkan.md`)
+  to the presentation the device proxy builds on the first call (`shims/xbox_present.*`, `xbox_present_test`);
+  `SuspendX` and `ResumeX` have unmeasured slots and are routed only when their variables name one. The other slots
+  past the PC table answer `S_OK` and do nothing.
 - Most of the `xgameruntime` surface: an offline shim covers `XGameRuntimeInitialize`, device/console queries,
   `XTaskQueue` and `XAsync`, and `QueryApiImpl` serves `XThreadingImpl`, `XErrorImpl`, `XNetworkingImpl`,
   `XPersistentLocalStorageImpl` and `XSystemImpl` (see `xgameruntime_test`); any other class is refused with a log.
@@ -445,6 +540,7 @@ from the ANSI code page.
 | `kind` | When | Fields |
 |---|---|---|
 | `trace_open` | first line | `pid` |
+| `tls_index0` | the first executable is mapped with module TLS index 0, which gta6rt freed at start (once per process) | `owner` (the image that held index 0, `gta6rt.exe`), `moved_to` (the index its block moved to) |
 | `map` | a module is mapped, bound and protected | `module`, `base`, `size`, `relocated` |
 | `tls_callback` | before each TLS callback the Loader runs (process attach and detach; thread events run under the Windows loader lock and are not traced) | `module`, `at` (module+RVA), `reason` |
 | `dllmain` | after `DllMain(DLL_PROCESS_ATTACH)` returns | `module`, `result` |

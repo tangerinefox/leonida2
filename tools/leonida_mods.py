@@ -36,6 +36,11 @@ from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from types import SimpleNamespace
 
+TOOLS = os.path.dirname(os.path.abspath(__file__))
+if TOOLS not in sys.path:
+    sys.path.insert(0, TOOLS)
+from report_paths import same_report_path
+
 EXPECTED_EXE = "game_scarlett_master.exe"
 MANIFEST = "mod.json"
 WINDOWS_RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)),
@@ -477,15 +482,20 @@ def pack_mod(mods_dir: str, selector: str, output: str, force: bool) -> str:
         raise ModsError("the package output cannot be inside the mod being packed")
     if os.path.exists(output) and not force:
         raise ModsError(f"{output} exists; pass --force to replace it")
-    os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
     folder = os.path.basename(path)
+    members = []
+    for base, dirs, files in os.walk(path, followlinks=False):
+        dirs.sort()
+        for name in sorted(files):
+            full = os.path.join(base, name)
+            if same_report_path(output, full):
+                raise ModsError("the package output aliases a file in the mod being packed")
+            member = PurePosixPath(folder, os.path.relpath(full, path).replace(os.sep, "/"))
+            members.append((full, member.as_posix()))
+    os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
-        for base, dirs, files in os.walk(path, followlinks=False):
-            dirs.sort()
-            for name in sorted(files):
-                full = os.path.join(base, name)
-                member = PurePosixPath(folder, os.path.relpath(full, path).replace(os.sep, "/"))
-                archive.write(full, member.as_posix())
+        for full, member in members:
+            archive.write(full, member)
     return output
 
 

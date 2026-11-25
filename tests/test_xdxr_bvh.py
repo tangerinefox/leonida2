@@ -311,6 +311,115 @@ class ClosestHit(unittest.TestCase):
         with self.assertRaises(ValueError):
             X.build_tlas([X.Instance(inst.transform, 0x12340, info["root"], info["bounds"])])
 
+    def test_inactive_nan_triangles_produce_empty_boxes_and_valid_blas(self):
+        # D3D12 marks inactive triangles with a NaN vertex (e.g. v0.x = NaN); xdxr_build.comp gives them an empty
+        # box (+inf, -inf) and never pairs them. Both 1-level and multi-level builds must validate and trace cleanly.
+        nan_sharing_edge = [[math.nan, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+        active = [[[2.0 * i, 0.0, 0.0], [2.0 * i + 1.0, 0.0, 0.0], [2.0 * i, 1.0, 0.0]] for i in range(6)]
+        tris = [nan_sharing_edge, *active]
+        for box16 in (False, True):
+            for pair in (False, True):
+                with self.subTest(box16=box16, pair=pair):
+                    data, info = X.build_blas(tris, box16=box16, pair=pair)
+                    self.assertEqual(X.validate(data, expect_bottom=True), [])
+                    self.assertEqual(X.box16_rounding(data), [])
+                    self.assertEqual(info["bounds"], ([0.0, 0.0, 0.0], [11.0, 1.0, 0.0]))
+                    if pair:
+                        self.assertEqual(X.count_pairs(data), 0)
+                    mem = X.Memory()
+                    mem.place(0x10000, data)
+                    for i, tri in enumerate(active, start=1):
+                        cx = sum(p[0] for p in tri) / 3.0
+                        cy = sum(p[1] for p in tri) / 3.0
+                        o, d = [cx - 0.5, cy - 0.5, 1.0], [0.5, 0.5, -1.0]
+                        got = X.trace(mem, 0x10000, o, d)
+                        want = X.brute_force([(None, 0xFF, tris)], o, d)
+                        self.assertTrue(same_hit(got, want), (i, got, want))
+                        self.assertEqual(got["primitive"], i)
+
+    def test_all_inactive_triangles_blas_is_valid_and_misses(self):
+        tris = [[[math.nan, float(i), 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]] for i in range(6)]
+        for box16 in (False, True):
+            with self.subTest(box16=box16):
+                data, info = X.build_blas(tris, box16=box16, pair=True)
+                self.assertEqual(X.validate(data, expect_bottom=True), [])
+                self.assertEqual(X.box16_rounding(data), [])
+                self.assertEqual(info["bounds"], ([math.inf] * 3, [-math.inf] * 3))
+                self.assertEqual(X.count_pairs(data), 0)
+                mem = X.Memory()
+                mem.place(0x10000, data)
+                self.assertIsNone(X.trace(mem, 0x10000, [0.25, 0.25, 1.0], [0.0, 0.0, -1.0]))
+
+    def test_inactive_tlas_instances_get_empty_boxes(self):
+        active_blas, active_info = X.build_blas([TRI])
+        empty_blas, empty_info = X.build_blas([[[math.nan, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]])
+        mem = X.Memory()
+        va_active = mem.place(0x100000, active_blas)
+        va_empty = mem.place(0x200000, empty_blas)
+        ident = [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0]]
+        zero = [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]
+        insts = [
+            X.Instance(zero, 0, X.INVALID, active_info["bounds"], mask=0xFF),           # null BLAS, singular matrix
+            X.Instance(ident, va_active, active_info["root"], active_info["bounds"], mask=0),  # zero mask
+            X.Instance(ident, va_empty, empty_info["root"], empty_info["bounds"], mask=0xFF),  # empty BLAS
+            X.Instance([[1, 0, 0, 3], [0, 1, 0, 0], [0, 0, 1, 0]], va_active, active_info["root"],
+                       active_info["bounds"], mask=0xFF),
+            X.Instance(ident, 0, X.INVALID, empty_info["bounds"], mask=0xFF),           # 5 instances -> 2-level TLAS
+        ]
+        for box16 in (False, True):
+            with self.subTest(box16=box16):
+                tlas, info = X.build_tlas(insts, box16=box16)
+                self.assertEqual(X.validate(tlas, expect_bottom=False), [])
+                self.assertEqual(info["bounds"], ([3.0, 0.0, 0.0], [4.0, 1.0, 0.0]))
+                va_tlas = mem.place(0x300000 + (0x10000 if box16 else 0), tlas)
+                scene = [
+                    (zero, 0xFF, []),
+                    (ident, 0, [TRI]),
+                    (ident, 0xFF, [[[math.nan, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]]),
+                    ([[1, 0, 0, 3], [0, 1, 0, 0], [0, 0, 1, 0]], 0xFF, [TRI]),
+                    (ident, 0xFF, []),
+                ]
+                for o, d in (([3.25, 0.25, 1.0], [0.0, 0.0, -1.0]), ([0.25, 0.25, 1.0], [0.0, 0.0, -1.0])):
+                    got = X.trace(mem, va_tlas, o, d)
+                    want = X.brute_force(scene, o, d)
+                    self.assertTrue(same_hit(got, want), (o, got, want))
+                self.assertEqual(X.trace(mem, va_tlas, [3.25, 0.25, 1.0], [0.0, 0.0, -1.0])["instance"], 3)
+
+    def test_pair_triangles_skips_zero_length_edges(self):
+        # Two degenerate triangles sharing only a zero-length edge (0,0,0)->(0,0,0) must not pair.
+        tris = [
+            [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        ]
+        data, info = X.build_blas(tris, pair=True)
+        self.assertEqual(X.validate(data, expect_bottom=True), [])
+        self.assertEqual(X.count_pairs(data), 0)
+        self.assertEqual(info["leaves"], 2)
+
+    def test_box_test_misses_nan_bounds(self):
+        for d in ([0.5, 0.5, -1.0], [0.0, 0.0, -1.0]):
+            with self.subTest(d=d):
+                inv = X._inverse_dir(d)
+                self.assertEqual(X._box_test(10.0, [0.0, 0.0, 1.0], d, inv, [math.nan, 0.0, 0.0], [math.nan, 1.0, 0.0]),
+                                 math.inf)
+                self.assertEqual(X._box_test(10.0, [0.0, 0.0, 1.0], d, inv, [0.0, 0.0, 0.0], [1.0, math.nan, 0.0]),
+                                 math.inf)
+
+    def test_nan_transform_falls_back_to_zero_inverse_in_tlas(self):
+        _, active_info = X.build_blas([TRI])
+        nan_rot = [[math.nan, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0]]
+        nan_trans = [[1, 0, 0, math.nan], [0, 1, 0, 0], [0, 0, 1, 0]]
+        for matrix in (nan_rot, nan_trans):
+            with self.subTest(matrix=matrix):
+                with self.assertRaises(ValueError):
+                    X.invert_affine(matrix)
+                inst = X.Instance(matrix, 0x10000, active_info["root"], active_info["bounds"])
+                tlas, info = X.build_tlas([inst])
+                self.assertEqual(X.validate(tlas, expect_bottom=False), [])
+                self.assertEqual(info["bounds"], ([math.inf] * 3, [-math.inf] * 3))
+                off = X.ptr_offset(struct.unpack_from("<I", tlas, X.ptr_offset(info["root"]))[0])
+                self.assertEqual(struct.unpack_from("<12f", tlas, off + 64), (0.0,) * 12)
+
 
 class Validate(unittest.TestCase):
     def setUp(self):
@@ -352,6 +461,13 @@ class Validate(unittest.TestCase):
 
     def test_short_buffer(self):
         self.assertEqual(X.validate(b"\0" * 10), ["buffer shorter than the 64-byte header"])
+
+    def test_nan_child_box_at_root_is_rejected(self):
+        data, info = X.build_blas([TRI])
+        b = bytearray(data)
+        root = X.ptr_offset(info["root"])
+        struct.pack_into("<f", b, root + 16, math.nan)
+        self.assertTrue(any("NaN" in e for e in X.validate(bytes(b), expect_bottom=True)))
 
 
 

@@ -475,6 +475,16 @@ class Execution(unittest.TestCase):
         want = [(7 * k if k % 8 == 1 else 1000, int(k % 8 < 4)) for k in range(64)]
         self.assertEqual([w[:2] for w in whole], want)
 
+    def test_float_equality_cannot_select_a_descriptor_word(self):
+        # +0 and -0 compare equal, but a first-lane read returns their different raw bits.
+        tier, whole, halves = self.run_both("vs_float_waterfall", vs([
+            "v_lshrrev_b32_e32 v4, 5, v0", "v_lshlrev_b32_e32 v4, 31, v4",
+            "v_readfirstlane_b32 s20, v4", "v_cmp_eq_f32_e32 vcc, s20, v4",
+            "s_and_saveexec_b64 s[12:13], vcc", "v_mov_b32_e32 v6, s20",
+            "s_mov_b64 exec, s[10:11]"]))
+        self.assertNotEqual(whole, halves)
+        self.assertEqual(tier, "C")
+
     def test_b_waterfall_invariant(self):
         tier, whole, halves = self.run_both("vs_b_wf", vs([
             "v_and_b32_e32 v4, 7, v0", "v_readfirstlane_b32 s20, v4", "v_cmp_eq_u32_e32 vcc, s20, v4",

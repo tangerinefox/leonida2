@@ -15,11 +15,14 @@
 #include <windows.h>
 #include <vulkan/vulkan.h>
 
+#include "../src/vulkan_device_fault.h"
+
 #include "../src/vulkan_backend.h"
 
 #include <algorithm>
 #include <cstdint>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 namespace leonida {
@@ -108,9 +111,9 @@ class VulkanSwapchain {
 public:
     VulkanSwapchain(PFN_vkGetInstanceProcAddr gipa, VkInstance instance, VkPhysicalDevice physical,
                     PFN_vkGetDeviceProcAddr gdpa, VkDevice device, VkQueue queue, std::uint32_t queue_family,
-                    std::mutex& submit_mutex)
+                    std::mutex& submit_mutex, DeviceFaultDiagnostics* diagnostics)
         : instance_(instance), physical_(physical), device_(device), queue_(queue), queue_family_(queue_family),
-          submit_mutex_(submit_mutex) {
+          submit_mutex_(submit_mutex), diagnostics_(diagnostics) {
         loaded_ = fn_.load(gipa, instance, gdpa, device);
         if (loaded_) {
             VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
@@ -129,12 +132,15 @@ public:
         }
     }
 
-    ~VulkanSwapchain() {
+    ~VulkanSwapchain() { close(); }
+
+    // The COM owner calls this before releasing its reference to the D3D12 queue and device.
+    void close() {
         destroy_swapchain();
-        if (blit_pool_) fn_.destroy_cmd_pool(device_, blit_pool_, nullptr);
-        if (surface_) fn_.destroy_surface(instance_, surface_, nullptr);
-        if (acquire_fence_) fn_.destroy_fence(device_, acquire_fence_, nullptr);
-        if (blit_fence_) fn_.destroy_fence(device_, blit_fence_, nullptr);
+        if (blit_pool_) fn_.destroy_cmd_pool(device_, std::exchange(blit_pool_, VK_NULL_HANDLE), nullptr);
+        if (surface_) fn_.destroy_surface(instance_, std::exchange(surface_, VK_NULL_HANDLE), nullptr);
+        if (acquire_fence_) fn_.destroy_fence(device_, std::exchange(acquire_fence_, VK_NULL_HANDLE), nullptr);
+        if (blit_fence_) fn_.destroy_fence(device_, std::exchange(blit_fence_, VK_NULL_HANDLE), nullptr);
     }
 
     VulkanSwapchain(const VulkanSwapchain&) = delete;
@@ -162,7 +168,7 @@ public:
         if (!loaded_ || !surface_) return false;
         {
             std::lock_guard lock(submit_mutex_);
-            fn_.device_wait_idle(device_);
+            observe(fn_.device_wait_idle(device_), "vkDeviceWaitIdle (DXGI)");
         }
         allow_tearing_ = allow_tearing;
         const VkFormat fmt = (preferred_format != VK_FORMAT_UNDEFINED) ? preferred_format : format_;
@@ -173,10 +179,12 @@ public:
     bool acquire_next_image(std::uint32_t& out_index, std::uint64_t timeout_ns = UINT64_MAX) {
         if (!swapchain_ || !acquire_fence_) return false;
         if (fn_.reset_fences(device_, 1, &acquire_fence_) != VK_SUCCESS) return false;
-        const VkResult r = fn_.acquire_next_image(device_, swapchain_, timeout_ns, VK_NULL_HANDLE, acquire_fence_,
-                                                  &out_index);
+        const VkResult r = observe(
+            fn_.acquire_next_image(device_, swapchain_, timeout_ns, VK_NULL_HANDLE, acquire_fence_, &out_index),
+            "vkAcquireNextImageKHR (DXGI)");
         if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) return false;
-        if (fn_.wait_for_fences(device_, 1, &acquire_fence_, VK_TRUE, timeout_ns) != VK_SUCCESS) return false;
+        if (observe(fn_.wait_for_fences(device_, 1, &acquire_fence_, VK_TRUE, timeout_ns),
+                    "vkWaitForFences (DXGI acquire)") != VK_SUCCESS) return false;
         acquired_index_ = out_index;
         if (is_offscreen()) {
             // The native image count may differ from the DXGI BufferCount (Vulkan is free to return more
@@ -212,7 +220,7 @@ public:
         pi.pSwapchains = &swapchain_;
         pi.pImageIndices = &image_index;
         std::lock_guard lock(submit_mutex_);
-        const VkResult r = fn_.queue_present(queue_, &pi);
+        const VkResult r = observe(fn_.queue_present(queue_, &pi), "vkQueuePresentKHR (DXGI)");
         return r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR;
     }
 
@@ -246,6 +254,10 @@ public:
     }
 
 private:
+    VkResult observe(VkResult result, const char* operation) const noexcept {
+        return DeviceFaultDiagnostics::observe(diagnostics_, result, operation);
+    }
+
     bool transition_image_layout(VkImage img, VkImageLayout old_layout, VkImageLayout new_layout) {
         if (!blit_cmd_ || !blit_fence_ || !img) return false;
         std::lock_guard lock(submit_mutex_);
@@ -271,8 +283,7 @@ private:
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         si.commandBufferCount = 1;
         si.pCommandBuffers = &blit_cmd_;
-        return fn_.queue_submit(queue_, 1, &si, blit_fence_) == VK_SUCCESS &&
-               fn_.wait_for_fences(device_, 1, &blit_fence_, VK_TRUE, UINT64_MAX) == VK_SUCCESS;
+        return submit_blit_and_wait(si);
     }
 
     void destroy_offscreen() {
@@ -287,7 +298,7 @@ private:
     void destroy_swapchain() {
         if (swapchain_ || !offscreen_images_.empty()) {
             std::lock_guard lock(submit_mutex_);
-            fn_.device_wait_idle(device_);
+            observe(fn_.device_wait_idle(device_), "vkDeviceWaitIdle (DXGI)");
             destroy_offscreen();
             if (swapchain_) {
                 fn_.destroy_swapchain(device_, swapchain_, nullptr);
@@ -471,8 +482,13 @@ private:
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         si.commandBufferCount = 1;
         si.pCommandBuffers = &blit_cmd_;
-        if (fn_.queue_submit(queue_, 1, &si, blit_fence_) != VK_SUCCESS) return false;
-        return fn_.wait_for_fences(device_, 1, &blit_fence_, VK_TRUE, UINT64_MAX) == VK_SUCCESS;
+        return submit_blit_and_wait(si);
+    }
+
+    bool submit_blit_and_wait(const VkSubmitInfo& submit) {
+        return observe(fn_.queue_submit(queue_, 1, &submit, blit_fence_), "vkQueueSubmit (DXGI)") == VK_SUCCESS &&
+               observe(fn_.wait_for_fences(device_, 1, &blit_fence_, VK_TRUE, UINT64_MAX),
+                       "vkWaitForFences (DXGI blit)") == VK_SUCCESS;
     }
 
     bool rebuild(std::uint32_t width, std::uint32_t height, VkFormat preferred_format, std::uint32_t buffer_count) {
@@ -540,7 +556,8 @@ private:
         ci.oldSwapchain = swapchain_;
 
         VkSwapchainKHR next = VK_NULL_HANDLE;
-        if (fn_.create_swapchain(device_, &ci, nullptr, &next) != VK_SUCCESS) return false;
+        if (observe(fn_.create_swapchain(device_, &ci, nullptr, &next), "vkCreateSwapchainKHR (DXGI)") != VK_SUCCESS)
+            return false;
         if (swapchain_) fn_.destroy_swapchain(device_, swapchain_, nullptr);
         destroy_offscreen();
         swapchain_ = next;
@@ -579,6 +596,7 @@ private:
     VkQueue queue_ = VK_NULL_HANDLE;
     std::uint32_t queue_family_ = 0;
     std::mutex& submit_mutex_;
+    DeviceFaultDiagnostics* diagnostics_;
     VkSurfaceKHR surface_ = VK_NULL_HANDLE;
     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
     VkFence acquire_fence_ = VK_NULL_HANDLE;

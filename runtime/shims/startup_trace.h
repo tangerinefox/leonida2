@@ -3,14 +3,16 @@
 // One JSON object per line, flushed per event so the file survives a crash. Off by default; every entry point is a
 // single relaxed load when it is off. Events:
 //   {"seq":1,"t":0.000,"kind":"trace_open"}
-//   {"seq":2,"t":0.001,"kind":"map","module":"a.dll","base":"0x...","size":"0x2000","relocated":false}
-//   {"seq":3,"t":0.002,"kind":"tls_callback","module":"a.dll","at":"a.dll+0x1200","reason":1}
-//   {"seq":4,"t":0.002,"kind":"dllmain","module":"a.dll","result":1}
-//   {"seq":5,"t":0.010,"kind":"unimplemented_call","import":"x.dll!Foo","caller":"a.dll+0x3f10"}   (first call only)
-//   {"seq":6,"t":0.011,"kind":"debug_string","text":"..."}
-//   {"seq":7,"t":0.020,"kind":"exception","code":"0xc0000005","at":"a.dll+0x4a00","access":"read","address":"0x0",
-//        "stack":["a.dll+0x4a00","a.dll+0x2210"]}
-//   {"seq":8,"t":0.030,"kind":"exit","code":0}
+//   {"seq":2,"t":0.001,"kind":"tls_index0","owner":"gta6rt.exe","moved_to":4}   (first executable mapped, once)
+//   {"seq":3,"t":0.001,"kind":"map","module":"a.dll","base":"0x...","size":"0x2000","relocated":false}
+//   {"seq":4,"t":0.002,"kind":"tls_callback","module":"a.dll","at":"a.dll+0x1200","reason":1}
+//   {"seq":5,"t":0.002,"kind":"dllmain","module":"a.dll","result":1}
+//   {"seq":6,"t":0.010,"kind":"unimplemented_call","import":"x.dll!Foo","caller":"a.dll+0x3f10"}   (first call only)
+//   {"seq":7,"t":0.011,"kind":"debug_string","text":"..."}
+//   {"seq":8,"t":0.020,"kind":"exception","code":"0xc0000005","at":"a.dll+0x4a00","access":"read","address":"0x0",
+//        "region":{"base":"0x0","allocation_base":"0x0","size":"0x7ffe0000","state":"0x10000","protect":"0x1",
+//        "type":"0x0"},"regs":{...},"stack":["a.dll+0x4a00","a.dll+0x2210"]}
+//   {"seq":9,"t":0.030,"kind":"exit","code":0}
 //
 // The exception handler is vectored, logs and returns EXCEPTION_CONTINUE_SEARCH: it never changes what the process
 // does (except LEONIDA_SKIP_INT3, below).
@@ -163,9 +165,46 @@ inline std::string debug_text(const EXCEPTION_RECORD& r) {
     return utf8_from_ansi(a, static_cast<int>(n ? n - 1 : strlen(a)));
 }
 
+// LOCAL DIAGNOSTIC for one of the title's asserts (docs/re/answers.md, "transient pool"): at the int3 at
+// game+0x2473e88 the title has just computed the peak of a list of resources with lifetimes against a fixed pool.
+// rdi = the list (24-byte records: entry pointer, u32 size rounded to 64 KiB), r13 = the count, rax = the peak,
+// rcx = the pool size. An entry is {record pointer, ..., u32 first pass at +16, u32 last pass at +20}; a record has
+// its usage word at +14, kind word at +16 and, for a texture, width/height/depth words at +56/+58/+60, the dimension
+// and DXGI format bytes at +62/+63 and the mip count at +66. Printed once, to stderr; every read is checked.
+inline void dump_transient_pool(const CONTEXT& c) {
+    static std::atomic<bool> done{false};
+    if (done.exchange(true)) return;
+    const auto read = [](uint64_t at, void* out, size_t n) {
+        SIZE_T got = 0;
+        return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(at), out, n, &got) && got == n;
+    };
+    std::fprintf(stderr, "[rt] pool-diag: peak %llu B, pool %llu B, %llu entries (i size first last usage kind fmt WxHxD mips)\n",
+                 static_cast<unsigned long long>(c.Rax), static_cast<unsigned long long>(c.Rcx),
+                 static_cast<unsigned long long>(c.R13));
+    for (uint64_t i = 0; i < c.R13 && i < 4096; ++i) {
+        uint64_t entry = 0, record = 0;
+        uint32_t size = 0, passes[2]{};
+        uint8_t desc[16]{};
+        uint16_t words[2]{};
+        if (!read(c.Rdi + i * 24, &entry, 8) || !read(c.Rdi + i * 24 + 8, &size, 4) || !read(entry, &record, 8) ||
+            !read(entry + 16, passes, 8) || !read(record + 14, words, 4) || !read(record + 56, desc, 16))
+            break;
+        uint16_t w, h, d;
+        std::memcpy(&w, desc, 2);
+        std::memcpy(&h, desc + 2, 2);
+        std::memcpy(&d, desc + 4, 2);
+        std::fprintf(stderr, "[rt] pool-diag: %llu %u %u %u 0x%x 0x%x %u %ux%ux%u %u\n",
+                     static_cast<unsigned long long>(i), size, passes[0], passes[1], words[0], words[1],
+                     unsigned(desc[7]), unsigned(w), unsigned(h), unsigned(d), unsigned(desc[10]));
+    }
+}
+
 inline void log_exception(const EXCEPTION_POINTERS& info) {
     const EXCEPTION_RECORD& r = *info.ExceptionRecord;
     try {
+        if (r.ExceptionCode == EXCEPTION_BREAKPOINT && info.ContextRecord &&
+            where(reinterpret_cast<uint64_t>(r.ExceptionAddress)).ends_with("master.exe+0x2473e88"))
+            dump_transient_pool(*info.ContextRecord);
         if (r.ExceptionCode == kDbgPrint || r.ExceptionCode == kDbgPrintWide) {
             const ULONG_PTR fallback = wide_fallback;
             const bool wide = r.ExceptionCode == kDbgPrintWide;
@@ -181,8 +220,27 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
                 const auto op = r.ExceptionInformation[0];
                 f += ",\"access\":" + quote(op == 0 ? "read" : op == 1 ? "write" : "execute") +
                      ",\"address\":" + quote(hex(r.ExceptionInformation[1]));
+                // The faulting page's region: committed or not, its protection, private or a mapped view.
+                MEMORY_BASIC_INFORMATION m{};
+                if (VirtualQuery(reinterpret_cast<const void*>(r.ExceptionInformation[1]), &m, sizeof(m)))
+                    f += ",\"region\":{\"base\":" + quote(hex(reinterpret_cast<uint64_t>(m.BaseAddress))) +
+                         ",\"allocation_base\":" + quote(hex(reinterpret_cast<uint64_t>(m.AllocationBase))) +
+                         ",\"size\":" + quote(hex(m.RegionSize)) + ",\"state\":" + quote(hex(m.State)) +
+                         ",\"protect\":" + quote(hex(m.Protect)) + ",\"type\":" + quote(hex(m.Type)) + "}";
             }
             if (r.ExceptionCode == kCppException) f += ",\"cpp\":true";
+            if (info.ContextRecord) {
+                // The registers at the fault: what an analyst needs to read a title assert (which value, which list).
+                const CONTEXT& c = *info.ContextRecord;
+                const std::pair<const char*, DWORD64> regs[] = {
+                    {"rax", c.Rax}, {"rcx", c.Rcx}, {"rdx", c.Rdx}, {"rbx", c.Rbx}, {"rsi", c.Rsi}, {"rdi", c.Rdi},
+                    {"r8", c.R8},   {"r9", c.R9},   {"r10", c.R10}, {"r11", c.R11}, {"r12", c.R12}, {"r13", c.R13},
+                    {"r14", c.R14}, {"r15", c.R15}, {"rbp", c.Rbp}, {"rsp", c.Rsp}};
+                f += ",\"regs\":{";
+                for (size_t i = 0; i < std::size(regs); ++i)
+                    f += std::string(i ? "," : "") + "\"" + regs[i].first + "\":" + quote(hex(regs[i].second));
+                f += "}";
+            }
             if (info.ContextRecord) f += ",\"stack\":" + stack_from(*info.ContextRecord);
             event("exception", f);
         }

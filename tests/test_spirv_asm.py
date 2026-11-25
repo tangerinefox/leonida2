@@ -80,6 +80,36 @@ class SpirvAsmUnitTests(unittest.TestCase):
                 words = _literal_words(f.read(), 7, 1)
             self.assertEqual(struct.pack(f"<{len(words)}I", *words).split(b"\0", 1)[0], literal)
 
+    def test_cli_refuses_output_that_aliases_source(self):
+        for alias in ("same", "dotdot", "hardlink", "symlink"):
+            with self.subTest(alias=alias), tempfile.TemporaryDirectory() as directory:
+                src = os.path.join(directory, "source.spvasm")
+                original = b"OpNop\n"
+                with open(src, "wb") as f:
+                    f.write(original)
+                if alias == "same":
+                    dst = src
+                elif alias == "dotdot":
+                    os.mkdir(os.path.join(directory, "sub"))
+                    dst = os.path.join(directory, "sub", "..", "source.spvasm")
+                else:
+                    dst = os.path.join(directory, f"{alias}.spv")
+                    try:
+                        if alias == "hardlink":
+                            os.link(src, dst)
+                        else:
+                            os.symlink(src, dst)
+                    except OSError as exc:
+                        self.skipTest(f"{alias} is unavailable: {exc}")
+                result = subprocess.run(
+                    [sys.executable, "-I", os.path.join(TOOLS, "spirv_asm.py"), src, "-o", dst],
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("output must not overwrite the source", result.stderr)
+                with open(src, "rb") as f:
+                    self.assertEqual(f.read(), original)
+
     def test_instruction_boundaries_follow_tokens_across_physical_lines(self):
         canonical = (
             "OpCapability Shader\n"

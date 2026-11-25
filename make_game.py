@@ -1328,6 +1328,8 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
     if not os.path.isfile(translated):
         need("spirv-as", "Install the Vulkan SDK (it includes spirv-as and spirv-val) and reopen the terminal.")
         need("spirv-val", "Install the Vulkan SDK and reopen the terminal.")
+        if "--compact-spirv" in fallbacks:
+            need("spirv-opt", "Install SPIRV-Tools with spirv-opt to use --compact-spirv.")
         log(f"shaders: translating RDNA2 to SPIR-V on {jobs} processes (the longest step)")
         # The mode and the translator's digest go down before the translation starts, while there is no index.json:
         # a stop at any point then leaves either no index (translated again) or an index with the right mode and
@@ -1345,6 +1347,7 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
     fspx_shaders(game, work, signature, emulate=emulate, fallbacks=fallbacks)
     bvh_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
     library_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
+    exe_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
     log("shaders: done")
 
 
@@ -1666,17 +1669,123 @@ def bvh_shaders(game: str, work: str, mc_signature: str, jobs: int = 1, emulate:
         f.write(settings + "\n")
 
 
+EXE_IMAGE = "game_scarlett_master.exe"
+EXE_TOOLS = ("pe_shader_containers.py", "fssm_unpack.py", "shader_disasm.py")   # as BVH_TOOLS, for the executable
+
+
+def exe_settings(image: str, mc_signature: str, emulate: bool, fallbacks: tuple[str, ...]) -> str:
+    """What the executable's shader outputs depend on, as one line: the image, the extracting, unpacking and
+    translating tools, llvm-mc, the wave64 mode and the fallback flags."""
+    return json.dumps({"image": file_sha256(image), "tools": sources_digest(TOOLS, EXE_TOOLS),
+                       "translator": translation_sources_digest(), "llvm_mc": mc_signature,
+                       "wave64_emulate": bool(emulate), "fallbacks": list(fallbacks)}, sort_keys=True)
+
+
+def exe_programs(unpacked: str, spirv: str) -> "tuple[list[str], list[str]] | None":
+    """The programs pe_shader_containers.py extracted from the executable, by file stem, and the ones among them
+    the runtime cannot find: no entry with an fssm_sha256 in <spirv>/index.json, or no module beside it. None when
+    either index is missing or unreadable, or names a module that is not there."""
+    try:
+        extracted = sorted(shader_stems(os.path.join(unpacked, "index.json"), "file", ".dxbc"))
+        with open(os.path.join(spirv, "index.json"), encoding="utf-8") as f:
+            index = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(index, dict) or not all(os.path.isfile(os.path.join(spirv, name + ".spv")) for name in index):
+        return None
+    found = {name for name, meta in index.items()
+             if isinstance(meta, dict) and isinstance(meta.get("fssm_sha256"), str)}
+    return extracted, [name for name in extracted if name not in found]
+
+
+def exe_report(programs: "tuple[list[str], list[str]]") -> None:
+    """One line with the counts, and one that names every program left without a module. It is printed on every
+    run, also when the step itself is reused: a program the translator has no rule for is never dropped quietly."""
+    extracted, missing = programs
+    log(f"shaders: {len(extracted) - len(missing)} of {len(extracted)} {EXE_IMAGE} programs translated")
+    if missing:
+        log(f"shaders: NOT translated: {', '.join(missing)}. The runtime has no module for "
+            f"{'it' if len(missing) == 1 else 'them'}, so every graphics pipeline that names "
+            f"{'it' if len(missing) == 1 else 'them'} is refused (E_INVALIDARG). When the step runs, rdna2spirv.py "
+            "prints the instruction each one stops at")
+
+
+def exe_shaders(game: str, work: str, mc_signature: str, jobs: int = 1, emulate: bool = False,
+                fallbacks: tuple[str, ...] = ()) -> None:
+    """game_scarlett_master.exe's own DXBC containers (docs/embedded_shaders.md, "Retail executable"): the
+    executable passes them inline to CreatePipelineState, so no shader archive holds them. pe_shader_containers.py
+    extracts its plain and packed programs into <work>/shaders/exe, fssm_unpack.py and shader_disasm.py unpack and disassemble
+    their FSSM programs there, and rdna2spirv.py translates them into <work>/shaders/spirv/exe, where the runtime's
+    shader library finds them by fssm_sha256, the key of the game's own shaders. Those neither feed nor depend on
+    this step.
+
+    The programs take seconds, so the step runs whole. Reuse requires both indexes, the translated modules and
+    a matching exe_build.json (exe_settings)."""
+    image = os.path.join(game, EXE_IMAGE)
+    unpacked = os.path.join(work, "shaders", "exe")
+    spirv = os.path.join(work, "shaders", "spirv", "exe")
+    extracted = os.path.join(unpacked, "index.json")
+    unpack_index = os.path.join(unpacked, "fssm_index.json")
+    translated = os.path.join(spirv, "index.json")
+    settings_file = os.path.join(spirv, "exe_build.json")
+    if not os.path.isfile(image):
+        # A work folder used before with a package that had the image still holds that run's index, and the runtime
+        # loads <shaders>/exe/index.json whenever it is there. Without the index the old modules are not found.
+        drop(translated, settings_file)
+        log(f"shaders: no {EXE_IMAGE} in the game folder, so no executable shader programs to translate")
+        return
+    settings = exe_settings(image, mc_signature, emulate, fallbacks)
+    programs = exe_programs(unpacked, spirv) if read_shader_setting(settings_file) == settings else None
+    if programs:
+        exe_report(programs)
+        return
+    log(f"shaders: extracting and translating the graphics programs of {EXE_IMAGE}")
+    drop(translated, settings_file, extracted, unpack_index)
+    # pe_shader_containers.py never overwrites a container (a second run would write <module>_NN.dxbc beside the
+    # first), and a program that no longer translates must not keep a module from the run before.
+    for folder, suffixes in ((unpacked, (".dxbc",)), (os.path.join(unpacked, "fssm"), (".fssm",)),
+                             (os.path.join(unpacked, "disasm"), (".s",)), (spirv, (".spv", ".spvasm"))):
+        if os.path.isdir(folder):
+            with os.scandir(folder) as entries:
+                for entry in entries:
+                    if entry.name.endswith(suffixes) and entry.is_file(follow_symlinks=False):
+                        os.unlink(entry.path)
+    py("pe_shader_containers.py", image, "--extract", unpacked)
+    py("fssm_unpack.py", unpacked, "--carve-index", extracted)
+    # rdna2spirv.py reads each program's stage from index.json and its FSSM blob from fssm/, both in the parent of
+    # the listings' folder, so the disassembly sits inside the extraction folder as it does for shaders.rpf.
+    disasm = os.path.join(unpacked, "disasm")
+    py("shader_disasm.py", os.path.join(unpacked, "fssm"), "--unpack-index", unpack_index, "--out", disasm,
+       "--mcpu", "gfx1013", "--jobs", jobs)
+    extra = (["--wave64-emulate"] if emulate else []) + list(fallbacks)
+    py("rdna2spirv.py", disasm, "--out", spirv, "--no-asm", *extra)
+    programs = exe_programs(unpacked, spirv)
+    if not programs or len(programs[1]) == len(programs[0]):
+        drop(translated)   # an empty or unreadable index would read as a finished step
+        fail(f"shaders: none of {EXE_IMAGE}'s programs translated, so their index is not kept. Run the shaders "
+             "stage again; if it happens again, the tool output above is why.")
+    exe_report(programs)
+    with open(settings_file, "w", encoding="utf-8", newline="\n") as f:
+        f.write(settings + "\n")
+
+
 WAVE64_MODES = ("auto", "on", "off")
 
 # The translator's fallback flags make_game.py can forward, and the argparse attribute each one reads.
 FALLBACK_FLAGS = (("--no-float-controls", "no_float_controls"), ("--bary-fallback", "bary_fallback"),
                   ("--texel-offset-fallback", "texel_offset_fallback"), ("--mesh-compute", "mesh_compute"),
-                  ("--f16-interp-fallback", "f16_interp_fallback"), ("--pc-tail-ubo", "pc_tail_ubo"))
+                  ("--f16-interp-fallback", "f16_interp_fallback"), ("--pc-tail-ubo", "pc_tail_ubo"),
+                  ("--compact-spirv", "compact_spirv"))
 
 
 def fallback_flags(a) -> tuple[str, ...]:
     """The fallback flags the parsed arguments ask for, in a stable order (the order they are recorded in)."""
-    return tuple(flag for flag, attr in FALLBACK_FLAGS if getattr(a, attr, False))
+    flags = tuple(flag for flag, attr in FALLBACK_FLAGS if getattr(a, attr, False))
+    descriptor_hash = getattr(a, "descriptor_hash", "fnv1a")
+    if descriptor_hash != "fnv1a":
+        flags += (f"--descriptor-hash={descriptor_hash}",)
+    limit = getattr(a, "loop_limit", None)
+    return flags if limit is None else (*flags, f"--loop-limit={limit}")
 
 
 def recorded_fallback_flags(work: str) -> tuple[str, ...]:
@@ -1840,7 +1949,7 @@ def runtime_gpu_max_push_constants():
 
 # Source and data files that produce the translated modules, metadata, partner stubs and native PSO catalog.
 TRANSLATION_SOURCES = ("rdna2spirv.py", "shader_ir.py", "cfg_structure.py", "file_mode.py", "fssm_header.py", "lane_masks.py", "wave64_halves.py",
-                       "wave64_emulate_opt.py", "shader_meta.py", "spirv_stubs.py", "spirv_asm.py", "spirv_asm_tables.py",
+                       "wave64_emulate_opt.py", "spirv_loop_guard.py", "shader_meta.py", "spirv_stubs.py", "spirv_asm.py", "spirv_asm_tables.py",
                        "spirv_opt.py", "report_paths.py", "replace_retry.py", "fssm_unpack.py", "shader_stage_manifest.py",
                        "rdna2_decode.py", "rdna2_isa_tables.py", "gfx10_formats.json",
                        "native_pso_hashes.py", "shader_carve.py", "shader_carve_accel.py")
@@ -2440,6 +2549,12 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
         f.write(os.path.abspath(game))
     if work is not None:
         shader_dir = os.path.join(os.path.abspath(work), "shaders", "spirv")
+        from ttpf_mips import find_pools
+        if find_pools(game):
+            profile = os.path.join(os.path.dirname(shader_dir), "bcpack", "history.bcph")
+            native = os.path.join(build, "bcpack_history_train.exe")
+            trainer = ["--trainer", native] if os.name == "nt" and os.path.isfile(native) else []
+            py("build_dstorage_history.py", game, "--out", profile, "--if-needed", *trainer)
         # Wine's path converter takes the original Unix filename bytes. The Windows reader expects UTF-8.
         encoded = shader_dir.encode("utf-8") if os.name == "nt" else os.fsencode(shader_dir)
         pending = tempfile.NamedTemporaryFile(dir=out, delete=False)
@@ -2553,13 +2668,23 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
     report = os.path.join(out, "pipeline_crashes.json")
     drop(inflight, skip, report)   # every module gets a fresh chance on each run (a new translator may have fixed it)
     # --jobs: make_game.py's own; without it vk_pipeline_check uses half the hardware threads whatever was asked
-    base = [exe, spirv, cache, *(["--jobs", str(jobs)] if jobs else [])]
+    jobs_args = ["--jobs", str(jobs)] if jobs else []
+    base = [exe, spirv, cache, *jobs_args]
+
+    def seed_bvh() -> None:
+        bvh = os.path.join(spirv, "bvh")
+        if not os.path.isfile(os.path.join(bvh, "index.json")):
+            return
+        log("pipelines: creating XboxBvhBuilder compute pipelines")
+        run([exe, bvh, cache, *jobs_args])
+
     if not checker_supports(exe, "--inflight-file", "--skip-file"):
         # An older build takes any argument it doesn't know as the cache path, so it would write the cache into
         # pipeline_inflight.txt and exit 0. Run it as before: a module that kills it stops the stage.
         log("pipelines: this vk_pipeline_check has no --inflight-file; rebuild the runtime stage so a module that "
             "crashes the driver is skipped instead of stopping the stage")
         run(base)
+        seed_bvh()
         log("pipelines: done")
         return
     base += ["--inflight-file", inflight]
@@ -2635,6 +2760,7 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
         why = f"; {len(crashed)} module(s) took the driver down and were counted as failed (with their SPIR-V " \
               f"hashes in pipeline_crashes.json): " + ", ".join(crashed) if crashed else ""
         fail(f"vk_pipeline_check exited with {exit_label(code)}{why}")
+    seed_bvh()
     log("pipelines: done")
 
 
@@ -2883,6 +3009,11 @@ def main() -> int:
                     help="translate wave64 compute and mesh shaders to be exact on any subgroup size (needed on "
                          "32-wide GPUs: NVIDIA, Intel). auto (default) checks GPU subgroup support and prefers "
                          "native wave64 on affected AMD Windows drivers")
+    ap.add_argument("--descriptor-hash", choices=("fnv1a", "fnv1a_fmix32"), default="fnv1a",
+                    help="translate all stages for the selected runtime descriptor table hash")
+    ap.add_argument("--loop-limit", type=int, help="translator loop visit limit (default 65536, 0 disables)")
+    ap.add_argument("--compact-spirv", action="store_true",
+                    help="run the translator's compact binary pass on all shader libraries (requires spirv-opt)")
     ap.add_argument("--no-float-controls", action="store_true",
                     help="translate without SignedZeroInfNanPreserve and DenormPreserve (Depends on: #664), for "
                          "devices whose vk_pipeline_check skips a shader without "
@@ -2912,6 +3043,8 @@ def main() -> int:
                     help="plain console logs (default when stdout is not a TTY); skip the LEONIDA setup screen "
                          "and per-stage log view")
     a = ap.parse_args()
+    if a.loop_limit is not None and not 0 <= a.loop_limit <= 0xffffffff:
+        ap.error("--loop-limit must be in 0..4294967295")
     stages = STAGES
     if a.stages is not None:
         stages = [s.strip() for s in a.stages.split(",") if s.strip()]

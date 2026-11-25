@@ -144,6 +144,20 @@ def encode_box16(lo, hi):
 
 
 # ---- geometry helpers ----
+def _empty_box():
+    return [INF, INF, INF], [-INF, -INF, -INF]
+
+
+def _box_empty(box):
+    lo, hi = box
+    return not all(lo[c] <= hi[c] for c in range(3))
+
+
+def _tri_inactive(tri):
+    """Treat a NaN in any vertex component as inactive (matches runtime/src/xdxr_build.comp for static builds)."""
+    return any(math.isnan(c) for p in tri for c in p)
+
+
 def _bounds(points):
     lo = [min(p[c] for p in points) for c in range(3)]
     hi = [max(p[c] for p in points) for c in range(3)]
@@ -151,8 +165,11 @@ def _bounds(points):
 
 
 def _union(boxes):
-    lo = [min(b[0][c] for b in boxes) for c in range(3)]
-    hi = [max(b[1][c] for b in boxes) for c in range(3)]
+    live = [b for b in boxes if not _box_empty(b)]
+    if not live:
+        return _empty_box()
+    lo = [min(b[0][c] for b in live) for c in range(3)]
+    hi = [max(b[1][c] for b in live) for c in range(3)]
     return lo, hi
 
 
@@ -170,8 +187,8 @@ def invert_affine(m):
     det = (a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1])
            - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0])
            + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]))
-    if det == 0:
-        raise ValueError("singular instance transform")
+    if det == 0 or not math.isfinite(det):
+        raise ValueError("singular or non-finite instance transform")
     inv = [[0.0] * 3 for _ in range(3)]
     for r in range(3):
         for c in range(3):
@@ -179,20 +196,31 @@ def invert_affine(m):
             c1, c2 = (r + 1) % 3, (r + 2) % 3
             inv[r][c] = (a[r1][c1] * a[r2][c2] - a[r1][c2] * a[r2][c1]) / det
     t = [row[3] for row in m]
-    return [inv[r] + [-(inv[r][0] * t[0] + inv[r][1] * t[1] + inv[r][2] * t[2])] for r in range(3)]
+    out = [inv[r] + [-(inv[r][0] * t[0] + inv[r][1] * t[1] + inv[r][2] * t[2])] for r in range(3)]
+    if any(not math.isfinite(x) for row in out for x in row):
+        raise ValueError("singular or non-finite instance transform")
+    return out
 
 
 # ---- tree construction (ASSUMPTION: the heuristic is ours; any valid BVH4 traverses the same) ----
 def _split4(items, centre):
-    """Split items into up to four groups by two median cuts along the widest centroid axes."""
+    """Split items into up to four groups by two median cuts along the widest centroid axes.
+    Items with an empty box (``centre(i) is None``) sort last, matching xdxr_build.comp MODE_MORTON."""
     def cut(group):
         if len(group) < 2:
             return [group]
-        lo, hi = _bounds([centre(i) for i in group])
-        axis = max(range(3), key=lambda c: hi[c] - lo[c])
-        group = sorted(group, key=lambda i: centre(i)[axis])
-        mid = len(group) // 2
-        return [group[:mid], group[mid:]]
+        live = [i for i in group if centre(i) is not None]
+        if not live:
+            mid = len(group) // 2
+            return [group[:mid], group[mid:]]
+        empty = [i for i in group if centre(i) is None]
+        if len(live) >= 2:
+            lo, hi = _bounds([centre(i) for i in live])
+            axis = max(range(3), key=lambda c: hi[c] - lo[c])
+            live = sorted(live, key=lambda i: centre(i)[axis])
+        ordered = live + empty
+        mid = len(ordered) // 2
+        return [ordered[:mid], ordered[mid:]]
     out = []
     for half in cut(items):
         out.extend(g for g in cut(half) if g)
@@ -275,36 +303,38 @@ def _write_header(buf, flags, end, n_elements, bounds, nodes_off, root, elements
                      nodes_off, 0, root, elements_off, parents_off, 0)
 
 
-def _remap_for(tri, order):
-    """Remap byte that returns D3D's barycentrics (the weights of the triangle's own vertices 1 and 2) when the
-    node reads the vertices in ``order``: the edge function of slot s weighs order[s]."""
-    order = [tuple(p) for p in order]
-    return order.index(tuple(tri[1])) | order.index(tuple(tri[2])) << 2
-
-
 def _pair_triangles(tris):
-    """Greedy pairing of triangles that share an edge into one leaf (TRI0 = v0 v1 v2, TRI1 = v1 v3 v2). Returns a
-    list of leaves, each a list of (slots, remap, prim) entries plus the five vertex slots."""
+    """Greedy pairing of active triangles that share an edge into one leaf (TRI0 = v0 v1 v2, TRI1 = v1 v3 v2).
+    Inactive (NaN) triangles and zero-length edges are never paired, matching runtime/src/xdxr_build.comp. Returns a
+    list of leaves, each a list of (slots, remap, prim) entries plus the four vertex slots."""
     leaves = []
     used = [False] * len(tris)
+    inactive = [_tri_inactive(t) for t in tris]
     edges = {}
     for i, t in enumerate(tris):
+        if inactive[i]:
+            continue
         for k in range(3):
             a, b = tuple(t[k]), tuple(t[(k + 1) % 3])
+            if a == b:
+                continue
             edges.setdefault((b, a), []).append((i, k))     # an opposite-winding neighbour has edge (b, a)
     for i, t in enumerate(tris):
         if used[i]:
             continue
         used[i] = True
         mate = None
-        for k in range(3):
-            a, b = tuple(t[k]), tuple(t[(k + 1) % 3])
-            for j, kj in edges.get((a, b), []):
-                if not used[j]:
-                    mate = (k, j, kj)
+        if not inactive[i]:
+            for k in range(3):
+                a, b = tuple(t[k]), tuple(t[(k + 1) % 3])
+                if a == b:
+                    continue
+                for j, kj in edges.get((a, b), []):
+                    if not used[j]:
+                        mate = (k, j, kj)
+                        break
+                if mate:
                     break
-            if mate:
-                break
         if not mate:
             v = [list(t[0]), list(t[1]), list(t[2]), list(t[2])]
             leaves.append((v, [(TRI0, REMAP_IDENTITY, i)]))
@@ -316,7 +346,11 @@ def _pair_triangles(tris):
         q = tris[j]
         p3 = q[(kj + 2) % 3]                                  # the mate's vertex off the shared edge
         v = [list(p0), list(p1), list(p2), list(p3)]
-        leaves.append((v, [(TRI0, _remap_for(t, (p0, p1, p2)), i), (TRI1, _remap_for(q, (p1, p3, p2)), j)]))
+        # TRI0 reads (p0, p1, p2): vertex m of t is in slot (m + 4 - k) % 3.
+        # TRI1 reads (p1, p3, p2): vertex m of q is in slot (m + 5 - kj) % 3.
+        remap0 = ((5 - k) % 3) | (((6 - k) % 3) << 2)
+        remap1 = ((6 - kj) % 3) | (((7 - kj) % 3) << 2)
+        leaves.append((v, [(TRI0, remap0, i), (TRI1, remap1, j)]))
     return leaves
 
 
@@ -335,10 +369,11 @@ def build_blas(triangles, geometry_index=0, flags=0, box16=False, pair=False, op
         leaves = [([list(t[0]), list(t[1]), list(t[2]), list(t[2])], [(TRI0, REMAP_IDENTITY, i)])
                   for i, t in enumerate(tris)]
     # the tree's leaves are triangle references (leaf record, node type): a paired record is reached through two
-    # pointers, each with its own triangle's box
+    # pointers, each with its own triangle's box. Inactive (NaN) triangles get an empty box (+inf, -inf).
     refs = [(h, kind, prim) for h, (_, entries) in enumerate(leaves) for kind, _, prim in entries]
-    ref_box = {r: _bounds(tris[r[2]]) for r in refs}
-    centre = lambda r: [(ref_box[r][0][c] + ref_box[r][1][c]) * 0.5 for c in range(3)]
+    ref_box = {r: _empty_box() if _tri_inactive(tris[r[2]]) else _bounds(tris[r[2]]) for r in refs}
+    centre = lambda r: (None if _box_empty(ref_box[r])
+                        else [(ref_box[r][0][c] + ref_box[r][1][c]) * 0.5 for c in range(3)])
     root = _build_tree(refs, centre, lambda r: ref_box[r])
     inner = _inner_nodes(root)
     parents_off, elements_off, nodes_off, end, node_size = _layout(len(leaves), LEAF_SIZE, inner, box16)
@@ -386,9 +421,13 @@ class Instance:
 
 
 def _world_box(inst):
+    if inst.blas_va == 0 or (inst.mask & 0xFF) == 0 or _box_empty(inst.blas_bounds):
+        return _empty_box()
     lo, hi = inst.blas_bounds
     corners = [[(lo, hi)[(i >> c) & 1][c] for c in range(3)] for i in range(8)]
     pts = [_transform_point(inst.transform, p) for p in corners]
+    if any(math.isnan(c) for p in pts for c in p):
+        return _empty_box()
     return _bounds(pts)
 
 
@@ -401,7 +440,8 @@ def build_tlas(instances, box16=False):
             raise ValueError("BLAS addresses must be 256-byte aligned")
     boxes = {i: _world_box(inst) for i, inst in enumerate(instances)}
     handles = list(range(len(instances)))
-    centre = lambda h: [(boxes[h][0][c] + boxes[h][1][c]) * 0.5 for c in range(3)]
+    centre = lambda h: (None if _box_empty(boxes[h])
+                        else [(boxes[h][0][c] + boxes[h][1][c]) * 0.5 for c in range(3)])
     root = _build_tree(handles, centre, lambda h: boxes[h])
     inner = _inner_nodes(root)
     parents_off, elements_off, nodes_off, end, node_size = _layout(len(instances), INSTANCE_SIZE, inner, box16)
@@ -409,9 +449,16 @@ def build_tlas(instances, box16=False):
     inst_ptrs = {}
     for h, inst in enumerate(instances):
         off = elements_off + h * INSTANCE_SIZE
-        inv = invert_affine(inst.transform)
+        if _box_empty(boxes[h]):
+            try:
+                inv = invert_affine(inst.transform)
+            except ValueError:
+                inv = [[0.0] * 4 for _ in range(3)]
+        else:
+            inv = invert_affine(inst.transform)
         identity_rot = all(inst.transform[r][c] == (1.0 if r == c else 0.0) for r in range(3) for c in range(3))
-        internal = (inst.blas_root & ~INST_FLAGS_MASK) | (INST_IDENTITY_ROTATION if identity_rot else 0)
+        inst_root = INVALID if inst.blas_va == 0 else inst.blas_root
+        internal = (inst_root & ~INST_FLAGS_MASK) | (INST_IDENTITY_ROTATION if identity_rot else 0)
         struct.pack_into("<12f", buf, off, *[x for row in inst.transform for x in row])
         struct.pack_into("<4I", buf, off + 48, (inst.instance_id & 0xFFFFFF) | (inst.mask & 0xFF) << 24,
                          (inst.contribution & 0xFFFFFF) | (inst.flags & 0xFF) << 24, internal,
@@ -461,7 +508,7 @@ class Memory:
 
 def _box_test(extent, org, d, inv, lo, hi):
     """Entry distance of the ray into the box, or inf on a miss (TestXboxBvh4Node / RayBoxTest)."""
-    if any(lo[c] > hi[c] for c in range(3)):
+    if not all(lo[c] <= hi[c] for c in range(3)):
         return INF
     tnear, tfar = 0.0, extent
     for c in range(3):
@@ -635,7 +682,7 @@ def brute_force(scene, org, d, tmax=INF, mask=0xFF):
     ``scene`` is a list of (transform or None, mask, triangles); the result names the scene index as instance."""
     best = None
     for idx, (m, imask, tris) in enumerate(scene):
-        if m is not None and not imask & mask:
+        if not tris or (m is not None and not imask & mask):
             continue
         if m is None:
             lo, ld = org, d
@@ -735,7 +782,9 @@ def validate(data, expect_bottom=None):
                     lo, hi = b[:3], b[3:]
                 if k == INVALID:
                     continue
-                if box and not all(box[0][c] <= lo[c] and hi[c] <= box[1][c] for c in range(3)):
+                if any(math.isnan(c) for c in (*lo, *hi)):
+                    errs.append(f"child box {i} of {p:#x} contains NaN")
+                elif box and not all(box[0][c] <= lo[c] and hi[c] <= box[1][c] for c in range(3)):
                     errs.append(f"child box {i} of {p:#x} is not inside its parent's box")
                 stack.append((k, (lo, hi), p))
         else:

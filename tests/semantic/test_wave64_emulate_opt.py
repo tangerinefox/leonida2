@@ -470,6 +470,12 @@ def run_emulated_workgroup(spvasm, local_size, push_constants=None, memory=None,
             elif op == "OpShiftRightLogical":
                 bits = types[a[0]][1]
                 vals[res] = (vals[a[1]] & ((1 << bits) - 1)) >> vals[a[2]]
+            elif op == "OpShiftRightArithmetic":
+                bits = types[a[0]][1]
+                operand = vals[a[1]]
+                if operand >> (bits - 1):
+                    operand -= 1 << bits
+                vals[res] = (operand >> vals[a[2]]) & ((1 << bits) - 1)
             elif op == "OpIAdd":
                 bits = types[a[0]][1]
                 vals[res] = (vals[a[1]] + vals[a[2]]) & ((1 << bits) - 1)

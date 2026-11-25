@@ -20,11 +20,19 @@ your own copy or with a synthetic test before you build on it, and record the re
 
 - **Finding:** code built with `/GA` reads thread-local storage straight from `ThreadLocalStoragePointer[0]` and
   assumes the executable's own TLS block sits at index 0. Static TLS has to be set up per mapped module, not once.
-- **Where:** the retail run on `main` ends in CRT startup with an access violation and 0 D3D12 calls, "the stop-4
-  shape (TLS from module index 0)" ([retail_boot_intel_host.md §1](retail_boot_intel_host.md)). The loader already
-  keeps one TLS host slot per mapped module (`runtime/src/pe_loader.cpp`, `runtime/src/tls_host.cpp`), and the
-  integration tree carries a fix for stop 4 that `main` does not
-  ([retail_boot_chain.md](retail_boot_chain.md), row 4).
+- **Where:** a retail run on `main` at `867d922f` ended in CRT startup with an access violation and 0 D3D12 calls, "the
+  stop-4 shape (TLS from module index 0)" ([retail_boot_intel_host.md §1](retail_boot_intel_host.md)). The loader keeps
+  one TLS host slot per mapped module (`runtime/src/pe_loader.cpp`, `runtime/src/tls_host.cpp`). The integration tree
+  clears stop 4 with #4313 ([retail_boot_chain.md](retail_boot_chain.md), row 4).
+- **Status:** answered on `main` by `b7a3fed28` and `4710549af`, which the measurement above predates; the retail
+  confirmation is still pending. `load()` rewrites the executable's `mov r64, gs:[58h]` reads so that they reach a
+  per-thread view with the image's own block at `[0]`, and each other mapped module with a TLS directory has an index of
+  its own. `loader_tls` checks it with a `/GA` executable beside a DLL with TLS of its own, on the loading thread and on
+  a new one, and shows the stop with `LEONIDA_TLS_GA_PATCH=0`; `run_tiny_game_ga_tls` runs a `/GA` build of the stand-in
+  game through `gta6rt --run`. #4313, which #321 and #64 carry, is an alternative design, not a missing fix: the
+  runtime's own EXE gives up index 0 at process start, so an index-0 read of any shape works without a rewrite. What is
+  left of this lead is the retail `--run` on current `main` and, if it still stops here, the read shape the rewrite does
+  not know.
 - **Implement:**
   1. Find the stop-4 fix on the integration tree and compare it with `Loader::initialize_tls` on `main`.
   2. Make the executable's slot resolve at index 0 of the thread's TLS array, and give every other mapped module that

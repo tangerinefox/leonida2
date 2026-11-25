@@ -12,11 +12,13 @@ the pattern matches their basenames, not directory paths. Package `__init__.py` 
 because discover imports them and runs any TestCase they define regardless of the pattern. No matching files is an
 error in serial and parallel runs.
 
-It runs the files `python -m unittest discover -s tests/semantic` finds (`test*.py` by default, and packages below it), each as
-`python -m unittest <module>` from that folder, so a file sees the same import path as under discover. The files can
-run side by side because each one writes only into its own temporary folder; a new test must do the same. With -j 1,
+It runs the files `python -m unittest discover -s tests/semantic` finds (`test*.py` by default, and packages below it), each in its own process from that folder, so a file sees the same import path as under discover.
+
+The files can run side by side because each one writes only into its own temporary folder; a new test must do the same. With -j 1,
 or on a single core, it runs that discover command itself. Prints the output of every failing file and one summary
 line, and exits 1 if a file fails, none is found, or no test ran. Standard library only.
+
+The count of tests comes from unittest's own result object, not from its output: a module that writes a line shaped like unittest's summary to stderr - a nested runner, or an atexit handler that runs after unittest's own summary - cannot change it.
 
 `--timeout SECONDS` limits each module subprocess in parallel mode, or the entire discover subprocess with
 `-j 1`. The value must be positive and at most 86400 seconds (24 hours), keeping it within platform wait limits.
@@ -26,15 +28,33 @@ The default has no time limit. This stops the direct test subprocess, not any de
 import argparse
 import concurrent.futures
 import fnmatch
+import json
 import locale
 import math
 import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 
 MAX_TIMEOUT_SECONDS = 24 * 60 * 60
+
+# The child runs the module through unittest's own program and writes the result to a file, so the count of tests
+# comes from the result object and nothing the module writes can change it. The exit codes are unittest's own: 1
+# when a test failed, 5 when nothing ran at all, 0 otherwise. The module is left unset, as `python -m unittest` leaves it, so
+# the name is imported and not looked up as an attribute of the program itself.
+CHILD_PROGRAM = (
+    "import json, os, sys, unittest\n"
+    "program = unittest.TestProgram(module=None, argv=['unittest'] + sys.argv[1:], exit=False)\n"
+    "result = program.result\n"
+    "with open(os.environ['LEONIDA_TEST_COUNT'], 'w', encoding='utf-8') as handle:\n"
+    "    json.dump({'testsRun': result.testsRun}, handle)\n"
+    "if not result.wasSuccessful():\n"
+    "    sys.exit(1)\n"
+    "elif result.testsRun == 0 and len(result.skipped) == 0:\n"
+    "    sys.exit(5)\n"
+    "sys.exit(0)\n")
 
 
 def module_path(directory, module):
@@ -73,28 +93,42 @@ def positive_seconds(value):
     return seconds
 
 
+def read_count(path):
+    """The number of tests the child ran, as unittest's own result object reported it."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return int(json.load(handle)["testsRun"])
+    except (OSError, ValueError, KeyError, TypeError):
+        # The child wrote no result: it did not finish, so no test is known to have run.
+        return 0
+
+
 def run_module(directory, module, verbose, timeout=None):
     """(return code, tests run, output) of `python -m unittest <target>` run from `directory`."""
     # `python -m unittest pkg.__init__` imports pkg and then runs the same file again as pkg.__init__, so a
     # registration in the initializer happens twice. Running the package itself imports it once; module_path() is
     # still the initializer's path, so the jobs stay sorted by the file they run.
     target = module[:-len(".__init__")] if module.endswith(".__init__") else module
-    cmd = [sys.executable, "-m", "unittest", *(["-v"] if verbose else []), target]
-    try:
-        p = subprocess.run(cmd, cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                           errors="replace", timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
-        out = exc.stdout or ""
-        if isinstance(out, bytes):  # TimeoutExpired retains bytes even when text=True.
-            out = out.decode(locale.getpreferredencoding(False), errors="replace")
-        return 1, 0, out + f"\nTIMED OUT after {timeout:g} s: {module}\n"
-    ran = re.search(r"^Ran (\d+) tests? in", p.stdout, re.M)
-    count = int(ran.group(1)) if ran else 0
+    cmd = [sys.executable, "-c", CHILD_PROGRAM, *(["-v"] if verbose else []), target]
+    with tempfile.TemporaryDirectory() as scratch:
+        count_path = os.path.join(scratch, "count.json")
+        env = dict(os.environ, LEONIDA_TEST_COUNT=count_path)
+        try:
+            p = subprocess.run(cmd, cwd=directory, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, errors="replace", timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            # TimeoutExpired retains bytes even when text=True.
+            parts = [chunk.decode(locale.getpreferredencoding(False), errors="replace") if isinstance(chunk, bytes)
+                     else chunk for chunk in (exc.stdout, exc.stderr) if chunk]
+            out = "".join(parts)
+            return 1, 0, out + f"\nTIMED OUT after {timeout:g} s: {module}\n"
+        count = read_count(count_path)
+    out = p.stdout + p.stderr
     # Discover imports every package initializer, but an empty one has no tests to run. It is included in the
     # module list so parallel runs see TestCase classes when there are any; without them, it is not a failure.
-    if p.returncode == 5 and count == 0 and module.endswith(".__init__") and "NO TESTS RAN" in p.stdout:
-        return 0, 0, p.stdout
-    return p.returncode, count, p.stdout
+    if p.returncode == 5 and count == 0 and module.endswith(".__init__") and "NO TESTS RAN" in p.stderr:
+        return 0, 0, out
+    return p.returncode, count, out
 
 
 def main(argv=None):

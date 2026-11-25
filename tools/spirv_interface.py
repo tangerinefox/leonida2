@@ -115,6 +115,8 @@ class AggregateType:
                     raise InterfaceError("structure uses too many interface locations to inspect")
                 masks.extend(member_masks)
             return tuple(masks)
+        if self.kind == "matrix" and component:
+            raise InterfaceError("a matrix cannot start at a nonzero Component")
         element = self.items[0].location_masks(component)
         if len(element) * self.count > MAX_EXPANDED_LOCATIONS:
             raise InterfaceError("aggregate uses too many interface locations to inspect")
@@ -240,6 +242,7 @@ class Module:
         self.group_uses = []
         self.definition_ids = set()
         self.shape_cache = {}
+        self.shape_depth = {}
         for opcode, operands, at in instructions(words):
             self.read_instruction(opcode, operands, at)
         self.apply_decoration_groups()
@@ -369,6 +372,8 @@ class Module:
 
     def shape(self, identifier, path=()):
         if identifier in self.shape_cache:
+            if len(path) + self.shape_depth[identifier] > MAX_TYPE_DEPTH:
+                raise InterfaceError("cyclic or excessively deep varying type")
             return self.shape_cache[identifier]
         if identifier in path or len(path) == MAX_TYPE_DEPTH:
             raise InterfaceError("cyclic or excessively deep varying type")
@@ -382,11 +387,13 @@ class Module:
                 raise InterfaceError("unsupported numeric type in graphics interface")
             kind = "f" if opcode == OP_TYPE_FLOAT else ("i" if args[1] else "u")
             result = NumericType(kind, width)
+            depth = 1
         elif opcode == OP_TYPE_VECTOR:
             element = self.shape(args[0], nested)
             if not isinstance(element, NumericType) or element.components != 1 or not 2 <= args[1] <= 4:
                 raise InterfaceError("invalid varying vector type")
             result = NumericType(element.kind, element.width, args[1])
+            depth = 1 + self.shape_depth[args[0]]
         elif opcode in (OP_TYPE_ARRAY, OP_TYPE_MATRIX):
             element = self.shape(args[0], nested)
             if opcode == OP_TYPE_ARRAY:
@@ -396,6 +403,7 @@ class Module:
                         or not 2 <= args[1] <= 4):
                     raise InterfaceError("invalid varying matrix type")
                 result = AggregateType("matrix", (element,), args[1])
+            depth = 1 + self.shape_depth[args[0]]
         elif opcode == OP_TYPE_STRUCT:
             if not args:
                 raise InterfaceError("empty structure in graphics interface")
@@ -403,9 +411,11 @@ class Module:
                 if self.member_decorations.get((identifier, i)):
                     raise InterfaceError("decorated nested interface structure members are unsupported")
             result = AggregateType("struct", tuple(self.shape(member, nested) for member in args))
+            depth = 1 + max(self.shape_depth[member] for member in args)
         else:
             raise InterfaceError("unsupported pointer in graphics interface")
         self.shape_cache[identifier] = result
+        self.shape_depth[identifier] = depth
         return result
 
     def pick_entry(self, stage, entry):

@@ -83,6 +83,12 @@ public:
         return found;
     }
 
+    // find() can return a shorter alias. Only a complete range can serve the view without new backing.
+    bool covers(std::uint64_t va, std::uint64_t bytes) const {
+        Hit hit{};
+        return find(va, hit, bytes) && bytes <= hit.size - (va - hit.start);
+    }
+
     std::size_t size() const { return ranges_.size(); }
     std::uint64_t longest() const { return longest_; }
 

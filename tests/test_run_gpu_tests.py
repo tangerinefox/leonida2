@@ -747,13 +747,17 @@ class TestProgramThatDiesBeforeItsVerdict(unittest.TestCase):
         "ps_tex": "", "ps_imgatomic": "",
     }
 
-    def run_one(self, name, code, printed):
+    def run_one(self, name, code, printed, *, subgroup_size=None):
         with tempfile.TemporaryDirectory() as tmp:
             args = SimpleNamespace(filter=name + ".asm", build=tmp, llvm_mc="unused", require_pass=False)   # one row
 
             def launch(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
                 if cmd[:3] == [sys.executable, "-I", rgt.TRANSLATOR]:
-                    (Path(tmp) / "spirv" / f"{name}.spv").touch()
+                    spirv = Path(tmp) / "spirv"
+                    (spirv / f"{name}.spv").touch()
+                    if subgroup_size is not None:
+                        (spirv / "index.json").write_text(
+                            json.dumps({name: {"subgroup_size": subgroup_size}}), encoding="utf-8", newline="\n")
                     return SimpleNamespace(returncode=0, stdout="", stderr="")
                 return SimpleNamespace(returncode=code, stdout="", stderr=printed)
 
@@ -779,6 +783,14 @@ class TestProgramThatDiesBeforeItsVerdict(unittest.TestCase):
     def test_no_pixel_count_for_a_frame_that_was_never_read(self):
         _rc, rows, out = self.run_one("ps_gather_wrap", -11, "device: X\n")
         self.assertNotIn("pixels differ", rows[0][2], out)
+
+    def test_failed_dispatch_is_not_an_unpinned_subgroup_skip(self):
+        warning = "compute subgroup size: 32 not available"
+        for code in (1, -11, 0xC0000005):
+            with self.subTest(code=code):
+                rc, rows, out = self.run_one("cs_barrier_loop", code, warning, subgroup_size=32)
+                self.assertEqual(rc, 1, out)
+                self.assertEqual([row[1:] for row in rows], [["cs_barrier_loop", f"exit {code}: {warning}"]], out)
 
     def test_a_verdict_keeps_its_line(self):
         self.assertEqual(rgt.verdict_line(0, "device: X\ncs_lds: 64 lanes mirrored"), "cs_lds: 64 lanes mirrored")

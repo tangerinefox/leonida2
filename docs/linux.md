@@ -83,6 +83,12 @@ Runtime workflow. The stage writes `<out>/gta6rt.sh`, which starts `gta6rt.exe` 
 [testing.md](testing.md#the-windows-runtime-on-linux-under-wine-or-proton) has the test runs under Wine and Proton
 and what fails there.
 
+For XMA2 audio, `runtime/CMakeLists.txt` builds `runtime/xma_decoder` for `x86_64-pc-windows-msvc` when `cargo` is on
+`PATH`. Distribution Rust packages typically omit the Windows MSVC standard library, which leaves XMA voices silent
+unless you add the `x86_64-pc-windows-msvc` Rust target or pass a prebuilt static library with
+`-DLEONIDA_XMA2_DECODER_LIB=<path>`, built yourself from this checkout's `runtime/xma_decoder` with the command in
+[runtime/xma_decoder/README.md](../runtime/xma_decoder/README.md).
+
 ### Why there is no native Linux `gta6rt`
 
 A native (ELF) loader is not a matter of build flags:

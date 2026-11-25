@@ -10,6 +10,7 @@
 #include "vulkan_loader.h"
 #include "../src/vulkan_device_filter.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -818,9 +819,10 @@ int main() {
         }
         const UINT64 compact_blas_bytes =
             std::max<UINT64>(blas_compact_info.ResultDataMaxSizeInBytes, compact_vk_sizes.accelerationStructureSize);
+        // Not nested std::max: MSVC 19.52 at /O2 reads the inner call's result from a stack slot it never wrote.
         const UINT64 compact_scratch_bytes = std::max<UINT64>(
-            tlas_info.ScratchDataSizeInBytes,
-            std::max<UINT64>(blas_compact_info.ScratchDataSizeInBytes, compact_vk_sizes.buildScratchSize));
+            {tlas_info.ScratchDataSizeInBytes, blas_compact_info.ScratchDataSizeInBytes,
+             compact_vk_sizes.buildScratchSize});
 
         auto compact_scratch_desc = make_buf_desc(align256(compact_scratch_bytes) + 256u,
                                                   D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);

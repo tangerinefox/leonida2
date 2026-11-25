@@ -161,6 +161,7 @@ class TestTables(unittest.TestCase):
         self.assertEqual(T.language(["Привет"]), "ru")
         self.assertEqual(T.language(["안녕하세요"]), "ko")
         self.assertEqual(T.language(["你好世界"]), "zh")
+        self.assertEqual(T.language(["مرحبا بالعالم"]), "ar")
 
     def test_group(self):
         self.assertEqual(T.table_group(["BIL1_A_1", "BIL1_B_2", "BIL1_C_3", "OTHER"]), "BIL1")

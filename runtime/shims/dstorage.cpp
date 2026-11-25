@@ -5,20 +5,19 @@
 // for those names, the console ABI and what each method does here. In short:
 //   - OpenFile resolves kernel32.dll!CreateFileW through the shim registry, so a GAME: path goes through the
 //     runtime's console path mapping and write overlay (file_system.cpp) exactly as the title's own CreateFileW.
-//   - Each queue has one worker thread that runs its submitted entries in order: a request reads a file range or
+//   - Each queue publishes its submitted entries in order: a request reads a file range or
 //     copies a memory range into the destination, a status entry, fence signal or event runs when every entry before
 //     it has. Completion is therefore in queue order, as the API guarantees.
-//   - A zlib request (ZlibDecompress alone) reads its source into a staging buffer, inflates it on the worker with
-//     the runtime's RFC 1950 inflater (leonida::zlib_inflate, src/shader_library.h) and copies the result to the
-//     destination only when it is exactly DestinationSize bytes; a stream that fails leaves the destination as it was.
-//   - BCPack, swizzle and physical-page requests fail with E_NOTIMPL for now (later PRs: they become stages between
-//     the read and the destination write, BCPack after the inflate).
+//   - Compressed requests stage RFC 1950 inflate, BCPack BC block reconstruction and DirectStorage
+//     macro-unshuffle before publishing the destination. Physical page numbers resolve in xmem at execution.
 // Nothing here goes online or touches the GPU.
 #include <windows.h>
 #include <d3d12.h>
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <map>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
@@ -33,7 +32,15 @@
 #include <vector>
 
 #include "../src/shader_library.h"  // leonida::zlib_inflate
+#include "../src/title_page_watch.h"  // title_gpu_views, title_texel_writes, kernel_writes
+#include "../src/bcpack.h"
+#include "../src/shader_directory.h"
+#include "../src/dstorage_swizzle.h"
+#include "../src/dstorage_trace.h"
 #include "dstorage_xs_abi.h"
+#include "dstorage_staging.h"
+#include "startup_trace.h"
+#include "xmem.h"
 #include "shims.h"
 
 using namespace dsx;
@@ -431,8 +438,66 @@ HRESULT read_error(DWORD error) {
     }
 }
 
-// Reads exactly "size" bytes at "offset" of a synchronous handle into "destination".
-HRESULT read_file_range(HANDLE handle, uint64_t offset, void* destination, uint32_t size) {
+bool extended_enabled() {
+    static const bool enabled = [] {
+        char value[2]{};
+        return GetEnvironmentVariableA("LEONIDA_DSTORAGE_EXTENDED", value, sizeof value) != 1 || value[0] != '0';
+    }();
+    return enabled;
+}
+
+// Calibrated predictor values stay in a local sidecar. Absent or invalid files retain the built-in codec policy.
+const leonida::bcpack::Calibration* bcpack_history() {
+    static const auto profile = []() -> std::unique_ptr<leonida::bcpack::Calibration> {
+        std::wstring explicit_path(32768, L'\0');
+        const DWORD n = GetEnvironmentVariableW(L"LEONIDA_DSTORAGE_HISTORY", explicit_path.data(), DWORD(explicit_path.size()));
+        if (n >= explicit_path.size()) return {};
+        std::filesystem::path path;
+        if (n) {
+            explicit_path.resize(n);
+            if (explicit_path == L"0") return {};
+            path = explicit_path;
+        } else {
+            auto shaders = leonida::shader_paths::configured();
+            if (shaders.empty()) return {};
+            if (!shaders.has_filename()) shaders = shaders.parent_path();
+            path = shaders.parent_path() / "bcpack" / "history.bcph";
+        }
+        FILE* raw = nullptr;
+        if (_wfopen_s(&raw, path.c_str(), L"rb") || !raw) {
+            log_once("history-open", "could not open the local BCPack predictor profile");
+            return {};
+        }
+        std::unique_ptr<FILE, decltype(&std::fclose)> file(raw, &std::fclose);
+        auto table = std::make_unique<leonida::bcpack::Calibration>();
+        char magic[8];
+        if (std::fread(magic, 1, sizeof magic, raw) != sizeof magic || std::memcmp(magic, "BCPHIST1", 8) ||
+            std::fread(table.get(), 1, sizeof *table, raw) != sizeof *table || std::fgetc(raw) != EOF || std::ferror(raw)) {
+            log_once("history-format", "invalid local BCPack predictor profile");
+            return {};
+        }
+        unsigned bc6_ep = 0, bc6_ix = 0, bc7_ep = 0, bc7_ix = 0;
+        for (const auto& row : table->bc6) {
+            bc6_ep += row.ep_class != 0;
+            bc6_ix += row.ix_class != 0;
+        }
+        for (const auto& row : table->bc7) {
+            bc7_ep += unsigned(std::count_if(row.ep_bits.begin(), row.ep_bits.end(), [](auto v) {return v != 0;}));
+            bc7_ix += unsigned(std::count_if(row.ix_bits.begin(), row.ix_bits.end(), [](auto v) {return v != 0;}));
+        }
+        log_once("history-ok", std::string("loaded ") + (n ? "explicit" : "default") + " BCPack profile; BC6H endpoint/index rows " +
+                 std::to_string(bc6_ep) + "/256 " + std::to_string(bc6_ix) + "/256; BC7 endpoint/index fields " +
+                 std::to_string(bc7_ep) + "/6144 " + std::to_string(bc7_ix) + "/8192");
+        return table;
+    }();
+    return profile.get();
+}
+
+// Reads exactly "size" bytes at "offset" of a synchronous handle into "destination". Through kernel_writes, as the
+// title's own reads: the destination is title memory, which a kernel write cannot fault in (pages the D3D12 layer
+// keeps read-only, xmem pages that wait for their first touch), title_page_watch.h.
+enum class ReadTarget { Title, Staging };
+HRESULT read_file_range(HANDLE handle, uint64_t offset, void* destination, uint32_t size, ReadTarget target) {
     LARGE_INTEGER length{};
     if (!GetFileSizeEx(handle, &length)) return HRESULT_FROM_WIN32(GetLastError());
     const uint64_t file_size = static_cast<uint64_t>(length.QuadPart);
@@ -445,7 +510,13 @@ HRESULT read_file_range(HANDLE handle, uint64_t offset, void* destination, uint3
         at.Offset = static_cast<DWORD>(position);
         at.OffsetHigh = static_cast<DWORD>(position >> 32);
         DWORD got = 0;
-        if (!ReadFile(handle, out + done, size - done, &got, &at)) {
+        // A private vector cannot be mapped or write-protected by the title.
+        const auto read = [&] {
+            return target == ReadTarget::Title
+                ? leonida::kernel_writes::read_file(handle, out + done, size - done, &got, &at)
+                : ::ReadFile(handle, out + done, size - done, &got, &at);
+        };
+        if (!read()) {
             const DWORD error = GetLastError();
             if (error != ERROR_NOACCESS) return read_error(error);
             // Destination pages not committed yet (see touch_pages): commit them from user mode and read again once.
@@ -453,7 +524,7 @@ HRESULT read_file_range(HANDLE handle, uint64_t offset, void* destination, uint3
             at = OVERLAPPED{};
             at.Offset = static_cast<DWORD>(position);
             at.OffsetHigh = static_cast<DWORD>(position >> 32);
-            if (!ReadFile(handle, out + done, size - done, &got, &at)) return read_error(GetLastError());
+            if (!read()) return read_error(GetLastError());
         }
         if (got == 0) return E_DSTORAGE_END_OF_FILE;  // the file shrank since the size check
         done += got;
@@ -463,7 +534,21 @@ HRESULT read_file_range(HANDLE handle, uint64_t offset, void* destination, uint3
 
 // ---- Queues -------------------------------------------------------------------------------------------------------
 
+// Only sampled when request tracing is enabled. Times include work done by the file/decode worker.
+struct Timing {
+    using Clock = std::chrono::steady_clock;
+    long long read{}, inflate{}, bcpack{}, copy{}, unshuffle{};
+    static Clock::time_point start() {
+        return leonida::dstorage::trace_enabled() ? Clock::now() : Clock::time_point{};
+    }
+    static long long elapsed(Clock::time_point begin) {
+        return leonida::dstorage::trace_enabled()
+            ? std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - begin).count() : 0;
+    }
+};
 struct Entry {
+    Timing timing;
+    const char* reason = "none";
     enum class Type { Request, Status, Signal, Event } type = Type::Request;
     DSTORAGE_REQUEST request{};
     File* file = nullptr;          // a reference, for a file request naming a live file
@@ -494,6 +579,10 @@ public:
     // Separate from the constructor so a failure to start the thread can be reported.
     bool start() {
         if (!error_event_) return false;
+        wchar_t workers[4]{};
+        const DWORD n = GetEnvironmentVariableW(L"LEONIDA_DSTORAGE_WORKERS", workers, 4);
+        if (!(n == 1 && (workers[0] == L'1' || workers[0] == L'0')))
+            preparation_work_ = CreateThreadpoolWork(prepare_in_background, this, nullptr);
         try {
             worker_ = std::thread([this] { run(); });
         } catch (...) {
@@ -503,6 +592,7 @@ public:
     }
     ~Queue() {
         Close();
+        if (preparation_work_) CloseThreadpoolWork(preparation_work_);
         if (error_event_) CloseHandle(error_event_);
         std::lock_guard lock(stats().mutex);
         --priority_stats(stats().s, desc_.Priority).CurrentQueueCount;
@@ -679,7 +769,7 @@ private:
     size_t usable() const { return desc_.Capacity - 1u; }
     size_t half() const { return desc_.Capacity / 2u; }
     bool auto_submit() const { return !desc_.Options.AutoSubmitDisabled; }
-    size_t used_locked() const { return entries_.size() + (in_flight_ ? 1 : 0); }
+    size_t used_locked() const { return entries_.size() + in_flight_; }
 
     void enqueue(Entry&& e) {
         {
@@ -726,23 +816,67 @@ private:
         }
     }
 
+    struct Prepared {
+        Entry& entry;
+        HRESULT result = S_OK;
+        std::vector<uint8_t> bytes;
+    };
+    // Each queue publishes in order. Only an adjacent pair of file transforms can
+    // overlap. Memory inputs, direct reads, page resolution and notifications remain barriers.
+    static bool can_prepare(const Entry& e) {
+        const auto& r = e.request;
+        const auto o = r.Options.AsUINT64;
+        constexpr uint64_t budget = 16ull << 20;
+        return e.type == Entry::Type::Request && !e.cancelled && SUCCEEDED(e.enqueue_error) && e.file &&
+               (options::zlib(o) || options::bcpack(o) || options::swizzle(o)) &&
+               leonida::dstorage::staging_bytes(r) <= budget;
+    }
+
+    static void CALLBACK prepare_in_background(PTP_CALLBACK_INSTANCE, void* context, PTP_WORK) {
+        auto& q = *static_cast<Queue*>(context);
+        q.set_pending(+1);
+        auto& job = *q.helper_job_;
+        job.result = q.validate_request(job.entry);
+        if (SUCCEEDED(job.result)) job.result = q.prepare(job.entry, job.bytes);
+        else job.entry.reason = "request-validation";
+    }
+
     void run() {
         for (;;) {
-            Entry e;
+            Entry head, next;
+            leonida::dstorage::StagingPool::Lease reservation(leonida::dstorage::staging_pool());
+            Prepared prepared{next, S_OK, {}};
+            bool paired = false;
             {
                 std::unique_lock lock(mutex_);
                 work_.wait(lock, [&] { return submitted_ > 0 || closed_; });
-                if (submitted_ == 0) return;  // closed and drained
-                e = std::move(entries_.front());
+                if (submitted_ == 0) return;
+                head = std::move(entries_.front());
                 entries_.pop_front();
                 --submitted_;
-                in_flight_ = true;
+                paired = preparation_work_ && submitted_ && can_prepare(head) && can_prepare(entries_.front()) &&
+                         reservation.try_pair(leonida::dstorage::staging_bytes(head.request) +
+                                              leonida::dstorage::staging_bytes(entries_.front().request));
+                if (paired) {
+                    next = std::move(entries_.front());
+                    entries_.pop_front();
+                    --submitted_;
+                    helper_job_ = &prepared;
+                    SubmitThreadpoolWork(preparation_work_);
+                }
+                in_flight_ = paired ? 2 : 1;
             }
-            process(e);
-            release_references(e);
+            process(head, nullptr, paired);
+            release_references(head);
+            if (paired) {
+                WaitForThreadpoolWorkCallbacks(preparation_work_, FALSE);
+                process(next, &prepared);
+                release_references(next);
+                helper_job_ = nullptr;
+            }
             {
                 std::lock_guard lock(mutex_);
-                in_flight_ = false;
+                in_flight_ = 0;
                 space_.notify_all();
                 if (entries_.empty()) idle_.notify_all();
             }
@@ -751,8 +885,11 @@ private:
 
     // Runs on the worker. since_notify_ is the first failure since the last status entry or fence signal: the
     // HRESULT a status entry reports.
-    void process(Entry& e) {
+    void process(Entry& e, Prepared* prepared, bool pair_reserved = false) {
         HRESULT hr = e.enqueue_error;
+        if (FAILED(hr)) e.reason = "enqueue";
+        const auto begin = Timing::start();
+        long long notify_us = 0;
         switch (e.type) {
             case Entry::Type::Request:
                 // A cancelled request is a success whatever else is wrong with it (the GDK: not counted as a failure).
@@ -760,27 +897,85 @@ private:
                     hr = S_OK;
                 } else if (SUCCEEDED(hr)) {
                     // Pending: processing has started and not completed (DSTORAGE_PRIORITY_STATS).
-                    set_pending(+1);
-                    hr = execute_request(e);
+                    if (prepared) {
+                        hr = prepared->result;
+                        if (SUCCEEDED(hr)) hr = publish(e, prepared->bytes);
+                    } else {
+                        set_pending(+1);
+                        hr = execute_request(e, pair_reserved);
+                    }
                     set_pending(-1);
+                }
+                if (FAILED(hr) || leonida::dstorage::trace_enabled()) {
+                    const auto& r = e.request;
+                    const auto o = r.Options.AsUINT64;
+                    const bool pages = (o & options::kDestinationPages) != 0;
+                    std::fprintf(stderr, "[rt] ds-request queue=%p options=%llx zlib=%d bc=%llu sw=%llu "
+                                 "dest=%s address=%p file=%ls offset=%llu src=%u mid=%u dst=%u cancelled=%d hr=%08lx "
+                                 "tick_ms=%llu page_offset=%u read_us=%lld inflate_us=%lld bc_us=%lld copy_us=%lld sw_us=%lld paired=%d reason=%s priority=%d\n",
+                                 static_cast<void*>(this), o, int(options::zlib(o)), options::bcpack(o),
+                                 options::swizzle(o), pages ? "pages" : "buffer", r.Destination,
+                                 e.file ? e.file->path().c_str() : L"-", e.file ? r.FileOffset : 0ull,
+                                 r.SourceSize, r.IntermediateSize, r.DestinationSize, int(e.cancelled),
+                                 static_cast<unsigned long>(hr), GetTickCount64(),
+                                 pages ? unsigned(r.DestinationPageOffset) : 0u, e.timing.read, e.timing.inflate,
+                                 e.timing.bcpack, e.timing.copy, e.timing.unshuffle, int(prepared != nullptr), e.reason, int(desc_.Priority));
+                    if (hr == E_DSTORAGE_ACCESS_VIOLATION) {
+                        const void* cpu = pages ? r.DestinationPageArray : cpu_destination(r);
+                        MEMORY_BASIC_INFORMATION info{};
+                        VirtualQuery(cpu, &info, sizeof(info));
+                        std::fprintf(stderr, "[rt] ds-access queue=%p dest=%p cpu=%p paired=%llx base=%p "
+                                     "region=%zu state=%lx protect=%lx type=%lx\n", static_cast<void*>(this),
+                                     r.Destination, cpu, static_cast<unsigned long long>(pages ? 0 :
+                                     leonida::title_gpu_views::other_view(reinterpret_cast<uintptr_t>(cpu))),
+                                     info.BaseAddress, info.RegionSize, info.State, info.Protect, info.Type);
+                    }
+                    // Put failures on the same clock as title faults, even if another queue is active.
+                    if (FAILED(hr) && rt::startup_trace::enabled()) {
+                        rt::startup_trace::event("dstorage_failure",
+                            "\"queue\":" + rt::startup_trace::quote(rt::startup_trace::hex(reinterpret_cast<uintptr_t>(this))) +
+                            ",\"hr\":" + rt::startup_trace::quote(hr_text(hr)) +
+                            ",\"options\":" + rt::startup_trace::quote(rt::startup_trace::hex(o)) +
+                            ",\"offset\":" + std::to_string(e.file ? r.FileOffset : 0ull) +
+                            ",\"source_size\":" + std::to_string(r.SourceSize) +
+                            ",\"destination_size\":" + std::to_string(r.DestinationSize));
+                    }
                 }
                 if (e.file && e.file_counted) e.file->finish_pending();
                 if (FAILED(hr) && SUCCEEDED(since_notify_)) since_notify_ = hr;
                 break;
-            case Entry::Type::Status:
+            case Entry::Type::Status: {
+                const auto result = FAILED(hr) ? hr : since_notify_;
                 if (SUCCEEDED(hr)) {
-                    e.status->complete(e.index, since_notify_);
+                    e.status->complete(e.index, result);
                     since_notify_ = S_OK;
                 }
+                notify_us = Timing::elapsed(begin);
+                if (leonida::dstorage::trace_enabled())
+                    std::fprintf(stderr, "[rt] ds-status queue=%p array=%p slot=%u hr=%08lx\n",
+                                 static_cast<void*>(this), static_cast<void*>(e.status), e.index,
+                                 static_cast<unsigned long>(result));
                 break;
+            }
             case Entry::Type::Signal:
                 if (SUCCEEDED(hr)) hr = e.fence->Signal(e.value);
+                notify_us = Timing::elapsed(begin);
+                if (leonida::dstorage::trace_enabled())
+                    std::fprintf(stderr, "[rt] ds-signal queue=%p value=%llu hr=%08lx\n", static_cast<void*>(this),
+                                 e.value, static_cast<unsigned long>(hr));
                 since_notify_ = S_OK;
                 break;
             case Entry::Type::Event:
                 if (SUCCEEDED(hr) && !SetEvent(e.event)) hr = HRESULT_FROM_WIN32(GetLastError());
+                notify_us = Timing::elapsed(begin);
+                if (leonida::dstorage::trace_enabled())
+                    std::fprintf(stderr, "[rt] ds-event queue=%p hr=%08lx\n", static_cast<void*>(this),
+                                 static_cast<unsigned long>(hr));
                 break;
         }
+        if (e.type != Entry::Type::Request && leonida::dstorage::trace_enabled())
+            std::fprintf(stderr, "[rt] ds-notify queue=%p type=%u us=%lld\n", static_cast<void*>(this),
+                         static_cast<unsigned>(e.type), notify_us);
         if (FAILED(hr)) {
             DSTORAGE_ERROR_FIRST_FAILURE f{};
             f.HResult = hr;
@@ -789,38 +984,36 @@ private:
         }
     }
 
-    HRESULT execute_request(const Entry& e) {
+    HRESULT validate_request(const Entry& e) const {
         const DSTORAGE_REQUEST& r = e.request;
         const uint64_t o = r.Options.AsUINT64;
         if (o & options::kReservedMask) return E_DSTORAGE_RESERVED_FIELDS;
         if (options::source_type(o) != desc_.SourceType) return E_DSTORAGE_INVALID_SOURCE_TYPE;
         if (options::bcpack(o) > DSTORAGE_BCPACK_MODE_BC7) return E_DSTORAGE_INVALID_BCPACK_MODE;
         if (options::swizzle(o) > DSTORAGE_SWIZZLE_MODE_4K_12K_4K_12K) return E_DSTORAGE_INVALID_SWIZZLE_MODE;
-        if (options::bcpack(o) != 0 || options::swizzle(o) != 0) {
-            log_once("decompress", "BCPack and swizzle requests are not implemented yet (E_NOTIMPL)");
-            return E_NOTIMPL;
-        }
-        if (o & (options::kDestinationPages | options::kSourcePages)) {
-            log_once("pages", "physical-page requests are not implemented yet (E_NOTIMPL)");
+        const unsigned bc = unsigned(options::bcpack(o)), sw = unsigned(options::swizzle(o));
+        const bool pages = o & (options::kDestinationPages | options::kSourcePages);
+        if ((bc || sw || pages) && !extended_enabled()) return E_NOTIMPL;
+        if (bc == DSTORAGE_BCPACK_MODE_BC2) {
+            log_once("bc2", "BC2 has no known BCPack block decoder (E_NOTIMPL)");
             return E_NOTIMPL;
         }
         const bool zlib = options::zlib(o);
-        // IntermediateSize is the BCPack data's size between the inflate and the BCPack decode (DSTORAGE_REQUEST), so
-        // it is 0 for every request that gets here (BCPack is refused above).
-        if (r.IntermediateSize != 0) return E_DSTORAGE_INVALID_INTERMEDIATE_SIZE;
-        // E_DSTORAGE_INVALID_DESTINATION_SIZE: without decompression DestinationSize must equal the source's length,
-        // with it it must be larger (dstorageerr.h's description; DSTORAGE_REQUEST says the same of DestinationSize).
-        if (zlib ? r.DestinationSize <= r.SourceSize : r.DestinationSize != r.SourceSize)
-            return E_DSTORAGE_INVALID_DESTINATION_SIZE;
+        if ((zlib && bc) != (r.IntermediateSize != 0) || r.IntermediateSize > kMaxRequestBytes)
+            return E_DSTORAGE_INVALID_INTERMEDIATE_SIZE;
+        if (zlib || bc) {
+            if (r.DestinationSize <= r.SourceSize) return E_DSTORAGE_INVALID_DESTINATION_SIZE;
+        } else if (r.DestinationSize != r.SourceSize) return E_DSTORAGE_INVALID_DESTINATION_SIZE;
+        if (bc && r.DestinationSize % ((bc == 1 || bc == 4) ? 8 : 16)) return E_DSTORAGE_INVALID_DESTINATION_SIZE;
+        if (sw && r.DestinationSize % leonida::dstorage::group_size(sw)) return E_DSTORAGE_INVALID_DESTINATION_SIZE;
         const bool memory = desc_.SourceType == DSTORAGE_REQUEST_SOURCE_MEMORY;
+        if (!memory && (o & options::kSourcePages)) return E_DSTORAGE_INVALID_SOURCE_TYPE;
         const uint64_t total = static_cast<uint64_t>(r.DestinationSize) + (memory ? r.SourceSize : 0u);
-        if (total > kMaxRequestBytes) return E_DSTORAGE_REQUEST_TOO_LARGE;
-        // DSTORAGE_REQUEST: a buffer over 32 MiB is allowed only with 64 KiB or 2 MiB pages, which are not implemented
-        // yet (refused above). The source is never larger than the destination here (the same size without zlib,
-        // smaller with it), so this covers both buffers, and bounds the staging buffers of a zlib request too.
-        if (r.DestinationSize > kMax4kPageDestinationSize) return E_DSTORAGE_REQUEST_TOO_LARGE;
-        // DSTORAGE_REQUEST: with ZlibDecompress the file offset must be 16-byte aligned.
-        if (zlib && !memory && r.FileOffset % 16 != 0) return E_DSTORAGE_INVALID_FILE_OFFSET;
+        if (total > kMaxRequestBytes ||
+            (r.DestinationSize > kMax4kPageDestinationSize && !(o & options::kDestinationPages)) ||
+            (memory && r.SourceSize > kMax4kPageDestinationSize && !(o & options::kSourcePages)))
+            return E_DSTORAGE_REQUEST_TOO_LARGE;
+        if ((zlib || bc) && !memory && r.FileOffset % 16 != 0) return E_DSTORAGE_INVALID_FILE_OFFSET;
         if (!r.Destination) return E_INVALIDARG;
         if (memory) {
             if (!r.Source) return E_INVALIDARG;
@@ -828,68 +1021,192 @@ private:
             if (!r.File) return E_INVALIDARG;
             if (!e.file_counted) return E_DSTORAGE_FILE_NOT_OPEN;
         }
-        if (zlib) return inflate_request(e, memory);
-        if (r.SourceSize == 0) return S_OK;  // nothing to move; the reference does not say this fails
-        if (memory) return guarded_move(r.Destination, r.Source, r.SourceSize) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION;
-        return read_file_range(e.file->handle(), r.FileOffset, r.Destination, r.SourceSize);
+        return S_OK;
     }
 
-    // A zlib request whose checks have passed: the source (SourceSize bytes of the file or of memory) goes into a
-    // staging buffer, inflates there, and only a result of exactly DestinationSize bytes is copied to the destination.
-    // So a failed stream leaves the destination as it was, and a memory source that overlaps its destination is safe.
-    // Both buffers are at most 32 MiB (execute_request). The stream is RFC 1950: the two header bytes, the deflate
-    // data, the Adler-32 of the result; bytes after the Adler-32 are not read. A failure is the matching
-    // dstorageerr.h code: a bad header (not deflate, a window over 32 KiB, a bad check value or a preset dictionary)
-    // E_DSTORAGE_ZLIB_BAD_HEADER, bad or truncated deflate data E_DSTORAGE_ZLIB_BAD_DATA, an Adler-32 mismatch
-    // E_DSTORAGE_ZLIB_PARITY_FAIL, and a stream that inflates to more or fewer bytes than DestinationSize
-    // E_DSTORAGE_DECOMPRESSION_ERROR (no code names a size mismatch; this is the header's generic one).
-    HRESULT inflate_request(const Entry& e, bool memory) {
-        const DSTORAGE_REQUEST& r = e.request;
-        std::vector<uint8_t> source, result;
-        try {
-            source.resize(r.SourceSize);
-            result.reserve(r.DestinationSize);
-        } catch (const std::bad_alloc&) {
-            return E_OUTOFMEMORY;
+    HRESULT execute_request(Entry& e, bool pair_reserved) {
+        const HRESULT valid = validate_request(e);
+        if (FAILED(valid)) { e.reason = "request-validation"; return valid; }
+        const auto& r = e.request;
+        const auto o = r.Options.AsUINT64;
+        const bool memory = desc_.SourceType == DSTORAGE_REQUEST_SOURCE_MEMORY;
+        if ((o & (options::kDestinationPages | options::kSourcePages)) || options::zlib(o) ||
+            options::bcpack(o) || options::swizzle(o)) {
+            leonida::dstorage::StagingPool::Lease reservation(leonida::dstorage::staging_pool());
+            if (!pair_reserved) reservation.acquire(leonida::dstorage::staging_bytes(r));
+            std::vector<uint8_t> data;
+            const auto hr = prepare(e, data);
+            return FAILED(hr) ? hr : publish(e, data);
         }
-        if (r.SourceSize != 0) {
-            if (memory) {
-                if (!guarded_move(source.data(), r.Source, r.SourceSize)) return E_DSTORAGE_ACCESS_VIOLATION;
-            } else if (const HRESULT hr = read_file_range(e.file->handle(), r.FileOffset, source.data(), r.SourceSize);
-                       FAILED(hr)) {
+        if (r.SourceSize == 0) return S_OK;  // nothing to move; the reference does not say this fails
+        void* const destination = cpu_destination(r);
+        if (memory) {
+            const auto begin = Timing::start();
+            const auto hr = written(r, guarded_move(destination, r.Source, r.SourceSize) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION);
+            e.timing.copy = Timing::elapsed(begin);
+            if (FAILED(hr)) e.reason = "copy";
+            return hr;
+        }
+        if (extended_enabled() && !rt::xmem::commit_physical_range(destination, r.DestinationSize)) {
+            e.reason = "destination-commit";
+            return E_DSTORAGE_ACCESS_VIOLATION;
+        }
+        const auto begin = Timing::start();
+        const auto hr = read_file_range(e.file->handle(), r.FileOffset, destination, r.SourceSize, ReadTarget::Title);
+        e.timing.read = Timing::elapsed(begin);
+        if (FAILED(hr)) e.reason = "file-read";
+        return written(r, hr);
+    }
+
+    // Where the CPU writes a request's destination: the title hands its stream pool's GPU-only alias range as the
+    // destination of streamed texture data (gfxgeom notes, section 2), which only the GPU maps; its CPU view holds the
+    // same pages (src/title_page_watch.h, title_gpu_views).
+    static void* cpu_destination(const DSTORAGE_REQUEST& r) {
+        return reinterpret_cast<void*>(leonida::title_gpu_views::to_cpu(reinterpret_cast<uintptr_t>(r.Destination)));
+    }
+    // A request that wrote its destination tells the D3D12 layer, whose images of textures in that memory are filled
+    // from it (title_texel_writes).
+    static HRESULT written(const DSTORAGE_REQUEST& r, HRESULT hr) {
+        if (SUCCEEDED(hr)) leonida::title_texel_writes::note(cpu_destination(r), r.DestinationSize);
+        return hr;
+    }
+
+    // The caller may populate or remap the physical page list between enqueue and Submit.
+    // Snapshot page numbers on the worker before taking xmem's allocation/map lock.
+    static HRESULT page_transfer(const ULONG_PTR* pages, uint16_t offset, std::span<uint8_t> buffer, bool write) {
+        if (buffer.empty()) return S_OK;
+        std::vector<uint64_t> numbers(1 + (buffer.size() - 1 + offset) / 65536);
+        if (!guarded_move(numbers.data(), pages, numbers.size() * sizeof(numbers[0])))
+            return E_DSTORAGE_ACCESS_VIOLATION;
+        if (rt::xmem::transfer_physical(numbers, offset, buffer, write)) return S_OK;
+        return HRESULT_FROM_WIN32(GetLastError());
+    }
+
+    static HRESULT inflate(const std::vector<uint8_t>& src, std::vector<uint8_t>& out, size_t size) {
+        leonida::ZlibError why{};
+        static const bool bulk = [] {
+            wchar_t value[2]{};
+            return GetEnvironmentVariableW(L"LEONIDA_DSTORAGE_FAST_INFLATE", value, 2) != 1 || value[0] != L'0';
+        }();
+        out.reserve(size);
+        if (leonida::zlib_inflate(src, out, size, &why, bulk))
+            return out.size() == size ? S_OK : E_DSTORAGE_DECOMPRESSION_ERROR;
+        switch (why) {
+            case leonida::ZlibError::header: return E_DSTORAGE_ZLIB_BAD_HEADER;
+            case leonida::ZlibError::checksum: return E_DSTORAGE_ZLIB_PARITY_FAIL;
+            case leonida::ZlibError::limit: return E_DSTORAGE_DECOMPRESSION_ERROR;
+            default: return E_DSTORAGE_ZLIB_BAD_DATA;
+        }
+    }
+
+    static HRESULT decode_stages(Entry& e, unsigned bc, unsigned sw, std::vector<uint8_t>& data) {
+        const auto& r = e.request;
+        if (options::zlib(r.Options.AsUINT64)) {
+            std::vector<uint8_t> scratch;
+            static const bool reported = (log_once("zlib", "zlib requests use CPU inflate (RFC 1950)"), true);
+            (void)reported;
+            const auto begin = Timing::start();
+            const auto hr = inflate(data, scratch, bc ? r.IntermediateSize : r.DestinationSize);
+            e.timing.inflate = Timing::elapsed(begin);
+            if (FAILED(hr)) { e.reason = "inflate"; return hr; }
+            data = std::move(scratch);
+        }
+        if (bc) {
+            std::vector<uint8_t> scratch(r.DestinationSize);
+            static const bool allow_fitted = [] {
+                char value[2]{};
+                return GetEnvironmentVariableA("LEONIDA_DSTORAGE_FITTED", value, sizeof value) != 1 || value[0] != '0';
+            }();
+            const auto begin = Timing::start();
+            static const bool fast_entropy = [] {
+                char value[2]{};
+                return GetEnvironmentVariableA("LEONIDA_DSTORAGE_FAST_BCPACK", value, sizeof value) != 1 || value[0] != '0';
+            }();
+            const char* failure = nullptr;
+            const auto quality = leonida::bcpack::decode(bc, data, scratch, allow_fitted, bc >= 6 ? bcpack_history() : nullptr, &failure, fast_entropy);
+            e.timing.bcpack = Timing::elapsed(begin);
+            if (quality == leonida::bcpack::Quality::failed) { e.reason = failure; return E_DSTORAGE_DECOMPRESSION_ERROR; }
+            if (quality == leonida::bcpack::Quality::fitted) {
+                static const bool reported = (log_once("fitted", "using fitted BCPack predictors"), true);
+                (void)reported;
+                if (leonida::dstorage::trace_enabled())
+                    std::fprintf(stderr, "[rt] ds-fitted bc=%u bytes=%u\n", bc, r.DestinationSize);
+            }
+            data = std::move(scratch);
+        }
+        if (sw) {
+            std::vector<uint8_t> scratch(r.DestinationSize);
+            const auto begin = Timing::start();
+            if (!leonida::dstorage::unshuffle(sw, data, scratch)) return E_DSTORAGE_INVALID_DESTINATION_SIZE;
+            e.timing.unshuffle = Timing::elapsed(begin);
+            data = std::move(scratch);
+        }
+        return S_OK;
+    }
+
+    HRESULT prepare(Entry& e, std::vector<uint8_t>& data) try {
+        const auto& r = e.request;
+        const auto o = r.Options.AsUINT64;
+        const bool memory = desc_.SourceType == DSTORAGE_REQUEST_SOURCE_MEMORY;
+        const auto bc = unsigned(options::bcpack(o)), sw = unsigned(options::swizzle(o));
+        data.resize(r.SourceSize);
+        HRESULT hr = S_OK;
+        const auto read_begin = Timing::start();
+        if (!memory) hr = read_file_range(e.file->handle(), r.FileOffset, data.data(), r.SourceSize, ReadTarget::Staging);
+        else if (o & options::kSourcePages) hr = page_transfer(r.SourcePageArray, r.SourcePageOffset, data, false);
+        else if (!data.empty() && !guarded_move(data.data(), r.Source, data.size())) hr = E_DSTORAGE_ACCESS_VIOLATION;
+        e.timing.read = Timing::elapsed(read_begin);
+        if (FAILED(hr)) { e.reason = "read"; return hr; }
+        if (bc || sw || options::zlib(o)) {
+            set_decompression_pending(+1);
+            try {
+                hr = decode_stages(e, bc, sw, data);
+            } catch (const std::bad_alloc&) {
+                hr = E_OUTOFMEMORY;
+            }
+            set_decompression_pending(-1);
+            if (FAILED(hr)) {
+                std::lock_guard lock(stats().mutex);
+                ++stats().s.DecompressionErrors;
                 return hr;
             }
         }
-        log_once("zlib", "zlib requests are inflated on the CPU (RFC 1950, leonida::zlib_inflate)");
-        set_decompression_pending(+1);
-        leonida::ZlibError why = leonida::ZlibError::none;
-        const bool inflated = leonida::zlib_inflate(source, result, r.DestinationSize, &why);
-        set_decompression_pending(-1);
+        return S_OK;
+    } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
+
+    HRESULT publish(Entry& e, std::vector<uint8_t>& data) try {
+        const auto& r = e.request;
+        const auto o = r.Options.AsUINT64;
+        const auto bc = options::bcpack(o), sw = options::swizzle(o);
         HRESULT hr = S_OK;
-        if (!inflated) {
-            switch (why) {
-                case leonida::ZlibError::header: hr = E_DSTORAGE_ZLIB_BAD_HEADER; break;
-                case leonida::ZlibError::checksum: hr = E_DSTORAGE_ZLIB_PARITY_FAIL; break;
-                case leonida::ZlibError::limit: hr = E_DSTORAGE_DECOMPRESSION_ERROR; break;  // longer than the destination
-                default: hr = E_DSTORAGE_ZLIB_BAD_DATA; break;
+        const auto copy_begin = Timing::start();
+        if (o & options::kDestinationPages) hr = page_transfer(r.DestinationPageArray, r.DestinationPageOffset, data, true);
+        else if (!data.empty()) {
+            void* const dest = cpu_destination(r);
+            if (extended_enabled() && !rt::xmem::commit_physical_range(dest, data.size())) {
+                e.reason = "destination-commit";
+                return E_DSTORAGE_ACCESS_VIOLATION;
             }
-        } else if (result.size() != r.DestinationSize) {
-            hr = E_DSTORAGE_DECOMPRESSION_ERROR;  // shorter than the destination
+            hr = written(r, guarded_move(dest, data.data(), data.size()) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION);
         }
-        if (FAILED(hr)) {
-            std::lock_guard lock(stats().mutex);
-            ++stats().s.DecompressionErrors;
-            return hr;
+        e.timing.copy = Timing::elapsed(copy_begin);
+        if (FAILED(hr)) e.reason = "publish";
+        if (leonida::dstorage::trace_enabled() && SUCCEEDED(hr) && (bc || sw || (o & options::kDestinationPages) ||
+            leonida::title_gpu_views::other_view(reinterpret_cast<uintptr_t>(r.Destination)))) {
+            std::fprintf(stderr, "[rt] ds-write queue=%p dest=%p cpu=%p options=%llx bytes=%zu nonzero=%d\n",
+                         static_cast<void*>(this), r.Destination, (o & options::kDestinationPages) ? nullptr : cpu_destination(r),
+                         o, data.size(),
+                         int(std::any_of(data.begin(), data.end(), [](uint8_t byte) { return byte != 0; })));
         }
-        return guarded_move(r.Destination, result.data(), result.size()) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION;
-    }
+        return hr;
+    } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
 
     void set_pending(int delta) {
         std::lock_guard lock(stats().mutex);
         priority_stats(stats().s, desc_.Priority).PendingRequestCount += static_cast<uint32_t>(delta);
     }
 
-    // PendingDecompressionRequestCount is the zlib requests being inflated; TotalDecompressionRequestCount counts each
+    // PendingDecompressionRequestCount covers the current decode pipeline; TotalDecompressionRequestCount counts each
     // one that reached its inflate (its source was read), DecompressionErrors those whose stream then failed.
     static void set_decompression_pending(int delta) {
         std::lock_guard lock(stats().mutex);
@@ -943,9 +1260,16 @@ private:
             if (record_.FailureCount++ == 0) record_.FirstFailure = f;
             if (error_event_) SetEvent(error_event_);
         }
-        log_once("fail" + hr_text(f.HResult) + std::to_string(f.CommandType),
-                 "an entry failed with " + hr_text(f.HResult) + " (command type " + std::to_string(f.CommandType) +
-                     "; logged once per code)");
+        static auto* counts = new std::map<HRESULT, uint64_t>;
+        std::lock_guard lock(log_mutex());
+        const auto count = ++(*counts)[f.HResult];
+        // The boot digest groups identical lines. Keep one invariant line per HRESULT and
+        // report the cumulative value separately so a truncated run is still countable.
+        std::fprintf(stderr, "[rt] dstorage: an entry failed with 0x%08lx (facility=%lx code=%lx)\n"
+                             "[rt] ds-error-count hr=%08lx count=%llu command=%u\n",
+                     static_cast<unsigned long>(f.HResult), static_cast<unsigned long>(HRESULT_FACILITY(f.HResult)),
+                     static_cast<unsigned long>(HRESULT_CODE(f.HResult)), static_cast<unsigned long>(f.HResult),
+                     static_cast<unsigned long long>(count), unsigned(f.CommandType));
     }
 
     void clear_record_locked() {
@@ -971,10 +1295,12 @@ private:
     std::condition_variable work_, space_, idle_;
     std::deque<Entry> entries_;
     size_t submitted_ = 0;  // the first submitted_ entries are submitted
-    bool in_flight_ = false;
+    size_t in_flight_ = 0;
     bool closing_ = false;
     bool closed_ = false;
     std::thread worker_;
+    PTP_WORK preparation_work_ = nullptr;
+    Prepared* helper_job_ = nullptr; // Lives on the publisher stack through the callback and ordered write.
     HRESULT since_notify_ = S_OK;  // worker only
     std::mutex error_mutex_;
     DSTORAGE_ERROR_RECORD record_{};

@@ -2,9 +2,10 @@
 //
 // GDK code does not always import the console runtime. The package's libHttpClient.GDK.dll and XCurl.dll have no
 // import entry for xgameruntime.dll at all: their statically linked xgameruntime.lib thunks hold the wide string
-// "xgameruntime.dll" and the names InitializeApiImpl, InitializeApiImplEx, InitializeApiImplEx2, QueryApiImpl and
-// UninitializeApiImpl, and look them up at run time (docs/runtime_imports.md, "Run-time loaded modules"). Bound to the
-// host, that LoadLibraryW would load the PC's Gaming Services runtime or fail, and never reach the offline shims.
+// "xgameruntime.dll" and the names InitializeApiImpl, InitializeApiImplEx, InitializeApiImplEx2, QueryApiImpl,
+// UninitializeApiImpl and XErrorReport, and look them up at run time (docs/runtime_imports.md, "Run-time loaded
+// modules"). Bound to the host, that LoadLibraryW would load the PC's Gaming Services runtime or fail, and never reach
+// the offline shims.
 //
 // So for a module the shim registry owns (rt::shims::owns_dll: xgameruntime.dll, d3d12_xs.dll, xmem.dll, ...), these
 // return a pseudo-handle, and GetProcAddress on it resolves names (and "#ordinal") through rt::shims::find. A name the

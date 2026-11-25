@@ -24,7 +24,7 @@ public:
         while (!pending_.empty()) {
             const Entry& front = pending_.front();
             if (!front.idle && !query(front.semaphore, front.value)) break;
-            completed_ = front.ticket;
+            if (front.ticket > completed_) completed_ = front.ticket;
             pending_.pop_front();
         }
         return completed_;
@@ -34,8 +34,18 @@ public:
     // that must have them done (and may not hold the lock that guards this object while it waits) waits for.
     std::vector<std::pair<Semaphore, std::uint64_t>> pending_through(std::uint64_t ticket) const {
         std::vector<std::pair<Semaphore, std::uint64_t>> out;
-        for (const Entry& entry : pending_)
-            if (entry.ticket <= ticket && !entry.idle) out.emplace_back(entry.semaphore, entry.value);
+        for (const Entry& entry : pending_) {
+            if (entry.ticket > ticket || entry.idle) continue;
+            bool merged = false;
+            for (auto& [sem, val] : out) {
+                if (sem == entry.semaphore) {
+                    if (entry.value > val) val = entry.value;
+                    merged = true;
+                    break;
+                }
+            }
+            if (!merged) out.emplace_back(entry.semaphore, entry.value);
+        }
         return out;
     }
 

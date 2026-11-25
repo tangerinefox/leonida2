@@ -220,8 +220,12 @@ def main():
                 print(f"ERROR: cannot scan --extra directory {e.filename or x}: {e.strerror or e}", file=sys.stderr)
                 return 2
         elif os.path.isfile(x):
-            with open(x, "rb") as f:
-                harvest(f.read(), strings, a.min)
+            try:
+                with open(x, "rb") as f:
+                    harvest(f.read(), strings, a.min)
+            except OSError as e:
+                print(f"ERROR: cannot read --extra input {e.filename or x}: {e.strerror or e}", file=sys.stderr)
+                return 2
     d = {}
     for s in sorted(strings):
         d.setdefault(f"{joaat(s):08x}", s)

@@ -86,7 +86,13 @@ struct VulkanDeviceInfo {
     std::uint32_t copy_family = UINT32_MAX;
     std::vector<VkQueue> compute_queues;
     std::vector<VkQueue> copy_queues;
+    bool pipeline_creation_feedback = false;
+    bool device_fault_diagnostics = false;
+    bool device_fault_info = false;
+    bool device_checkpoints = false;
+    bool device_diagnostics_config = false;
     bool separate_depth_stencil_layouts = true;
+    bool depth_range_unrestricted = false;  // VK_EXT_depth_range_unrestricted enabled on this device.
     std::uint32_t max_push_constants_size = 0;
     bool push_constants_need_fallback = false;
     // maxBufferSize and maxMemoryAllocationSize, which cap the GPU address arena (src/arena_size.h). 0: read from
@@ -124,6 +130,9 @@ struct VulkanDeviceInfo {
     // VK_EXT_host_image_copy and its hostImageCopy feature are enabled on `device`: WriteToSubresource and
     // ReadFromSubresource on textures in CPU-visible heaps copy on the CPU instead of through a staging submit.
     bool host_image_copy = false;
+    // Tests only: every host-transfer texture is treated as one the driver gave no memory type (a GTX 1050 Ti,
+    // NVIDIA 582.78), so it is made again without host-transfer usage and copies on the staging path on any GPU.
+    bool force_host_transfer_retry = false;
     // VK_KHR_shader_fma and its shaderFmaFloat32 feature are enabled on `device`: translated shaders built with
     // `rdna2spirv.py --fma khr` (OpFmaKHR, capability FMAKHR in the index) can be created. Without it only the
     // default `--fma glsl` shaders can.
@@ -156,6 +165,9 @@ struct VulkanDeviceInfo {
     bool fragment_shader_barycentric = false;
     bool fragment_shader_interlock = false;
     bool maintenance8 = false;
+    // VK_KHR_maintenance5, enabled where its VK_FORMAT_A8_UNORM_KHR can be sampled and is a colour attachment the GPU
+    // can blend: A8_UNORM render targets are then stored in that format (other A8_UNORM textures stay R8_UNORM).
+    bool a8_render_target = false;
     // The instance enabled VK_EXT_debug_utils: SetMarker/BeginEvent/EndEvent become debug labels. Otherwise they
     // do nothing.
     bool debug_utils = false;
@@ -238,6 +250,20 @@ VkImage vulkan_image(ID3D12Resource* resource);
 VkBuffer vulkan_buffer(ID3D12Resource* resource);
 // What a device from create_vulkan_device* was created with (enabled features included), or null. For tests.
 const VulkanDeviceInfo* vulkan_device_info(ID3D12Device* device);
+// True when a slot-133 buffer is a shadow copied from the title's pages, false when they were imported. For tests.
+bool title_shadow_buffer(ID3D12Resource* resource);
+// VirtualQuery calls made by the title-buffer shadows in their latest refresh. For tests.
+std::uint64_t title_shadow_refresh_queries(ID3D12Device* device);
+// The trackers behind the title-buffer shadows and title windows (copies whose pages overlap or touch share one).
+// For tests.
+std::uint64_t title_shadow_trackers(ID3D12Device* device);
+// What the title-buffer shadows' latest refresh did, summed over their trackers: GetWriteWatch calls, write-watched
+// pages found written, the write faults taken since they were made, and the bytes of covered pages write-watched and
+// hot (asked about rather than guarded). For tests.
+struct TitleShadowWatch {
+    std::uint64_t asks = 0, written = 0, faults = 0, watched_bytes = 0, hot_bytes = 0;
+};
+TitleShadowWatch title_shadow_watch(ID3D12Device* device);
 // True when `device` has VK_KHR_acceleration_structure + VK_KHR_ray_query enabled.
 bool device_supports_ray_tracing(ID3D12Device* device);
 
@@ -285,6 +311,15 @@ bool device_sparse_buffer_tiles(ID3D12Device* device);
 // The size in bytes of the device's GPU address arena, or 0 without one. For tests.
 std::uint64_t device_arena_size(ID3D12Device* device);
 
+// The blocks of device memory that textures share (src/image_memory.h): how many, their bytes, and the textures in
+// them. For tests.
+struct ImageMemoryStats {
+    std::uint64_t blocks = 0;
+    std::uint64_t block_bytes = 0;
+    std::uint64_t textures = 0;
+};
+ImageMemoryStats image_memory_stats(ID3D12Device* device);
+
 // The bindless set 0 a device with VulkanDeviceInfo::bindless keeps (vulkan_bindless.h), and its layout: what a
 // pipeline whose shader declares set-0 bindings is created with and binds. Null without such a set. The set is
 // brought up to date at every ExecuteCommandLists.
@@ -330,6 +365,7 @@ float sdr_white_nits_from_level(unsigned long level);
 // presentation front end the game uses (DXGI or PresentX, still open). Holds a reference to the device.
 class WindowPresenter {
 public:
+    // `device` is kept alive while the presenter lives; null when the owner guarantees that itself.
     WindowPresenter(IUnknown* device, std::unique_ptr<leonida::VulkanPresenter> presenter);
     ~WindowPresenter();
     WindowPresenter(const WindowPresenter&) = delete;
@@ -344,6 +380,8 @@ public:
                     bool tear = false);
     // A black frame, nothing read (PresentX with no planes).
     HRESULT present_blank(UINT sync_interval);
+    // Show the shell image through startup clears, then hand off to the first non-black output.
+    bool present_splash(ID3D12Resource* image);
     // One or two planes composed (VulkanPresenter::present_planes); `planes` names the textures by ResourceId, so the
     // caller fills it with resource_id(). DXGI_ERROR_UNSUPPORTED for a source the compose pass cannot read.
     HRESULT present_planes(const leonida::PresentPlanes& planes, UINT sync_interval, bool tear = false);
@@ -377,13 +415,21 @@ private:
 bool device_has_swapchain_colorspace(ID3D12Device* device);
 
 // Null when `device` is not a Vulkan device created with presentation, or the window cannot be presented to.
-std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, HWND window);
+// The presenter holds a reference on the device, or on the Xbox device proxy that is its outer identity, so it may
+// outlive the caller's reference. `hold_device` false takes none: for a presenter that the device proxy owns itself
+// and destroys before its device (the presentation gta6rt's proxy builds, d3d12_xs_device.cpp), where a reference
+// to the proxy would keep the proxy, the presenter and its window alive for good.
+std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, HWND window, bool hold_device = true);
 
 // Where each root parameter's arguments go in the 32 user-data dwords the translated shaders read (docs section
 // 3.5). Built when a Vulkan device creates the root signature. A signature can be bound at either bind point, so it
 // carries both layouts:
-//   - graphics: rt::rootsig::pack() (from s0, two dwords per table; D3D-448 keeps it until per-stage user-data windows
-//     exist, because a mesh shader (s16) and a pixel shader (s8) share one push-constant block);
+//   - graphics: rt::rootsig::pack_stage(Stage::Pixel), the console layout of vertex, pixel and geometry shaders
+//     (from s8, one dword per table), which the game's own shaders read: VS_Blit/PS_BlitColour and the Scaleform
+//     VS load their table's first descriptor from s[8:9] with s9 forced to 0. A signature that would spill there
+//     (more than 24 dwords) keeps rt::rootsig::pack() (from s0, two dwords per table), logged: the graphics spill
+//     array is not modelled. A mesh shader reads from s16 and shares the block with its pixel shader (s8), so mesh
+//     pipelines still see their arguments 8 dwords early (D3D-448);
 //   - compute: rt::rootsig::pack_stage(Stage::Compute), the measured console layout (from s4, one dword per table).
 // A layout that refuses the signature is marked unusable; binding the signature there invalidates the list.
 struct RootArgumentLayout {
@@ -392,11 +438,21 @@ struct RootArgumentLayout {
         std::uint32_t user_offset;     // graphics: first dword; unused for a parameter with no dwords
         std::uint32_t constant_count;  // constants only
         std::uint32_t compute_offset = rt::rootsig::kNoSgpr;  // compute: first user SGPR
+        // A table: the CBV/SRV/UAV slots its ranges declare (an unbounded range counts as 1024), for the scan of
+        // title-written V#s before a submission (src/title_va_alias.h). 0: a sampler table, or not a table.
+        std::uint32_t table_descriptors = 0;
     };
     std::vector<Parameter> parameters;
     std::uint32_t flags = 0;  // D3D12_ROOT_SIGNATURE_FLAGS from the serialized blob
+    // The graphics layout is the console's (pack_stage(Stage::Pixel)): a table takes one dword. False: pack()'s, two.
+    bool graphics_console = false;
     bool graphics_ok = true;
     bool compute_ok = true;
+    // One past the last user-data dword the explicit root arguments take at each bind point, where the console puts
+    // the directly indexed heaps (resource heap, then sampler heap). kNoSgpr: no such dword (the compute arguments
+    // spill, or graphics keeps pack()'s s0 layout).
+    std::uint32_t compute_arguments_end = rt::rootsig::kNoSgpr;
+    std::uint32_t graphics_arguments_end = rt::rootsig::kNoSgpr;
 };
 
 // For the command list: the argument layout of a root signature from a Vulkan device, and the id it records for a
@@ -411,6 +467,24 @@ const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12Pi
 // device identity pointer, or nullptr when `heap` is null or belongs to another implementation.
 IUnknown* descriptor_heap_info(ID3D12DescriptorHeap* heap, D3D12_DESCRIPTOR_HEAP_DESC& desc,
                                D3D12_GPU_VIRTUAL_ADDRESS& gpu_base);
+
+// Xbox device slots 70/71: a buffer view of the title's own memory, with no resource object. `view` is a PC
+// D3D12_SHADER_RESOURCE_VIEW_DESC (or, `unordered`, D3D12_UNORDERED_ACCESS_VIEW_DESC) of a buffer, `address` the
+// memory's console VA and `width` its bytes. Writes the V# into `destination` and returns true; false when `device`
+// is not this module's or the layer cannot write that view (the slot is left as it was).
+bool write_placed_buffer_view(ID3D12Device* device, bool unordered, const void* view, std::uint64_t address,
+                              std::uint64_t width, D3D12_CPU_DESCRIPTOR_HANDLE destination);
+
+// Xbox placed texture SRV (slot 70) or UAV (slot 71). The 56-byte console resource description includes the
+// XG layout at +44. The PC SRV/UAV description and placement address select the view. A GPU-writable
+// image must already exist for a UAV. False leaves the destination descriptor zeroed.
+bool write_placed_texture_view(ID3D12Device* device, bool unordered, const std::uint32_t* resource_words,
+                               const std::uint32_t* view_words, std::uint64_t address,
+                               D3D12_CPU_DESCRIPTOR_HANDLE destination);
+
+// The VA shaders read a descriptor table at: for one inside a console descriptor heap (Xbox slot 14) whose arena copy
+// lies elsewhere, the matching VA in that copy; any other VA unchanged.
+D3D12_GPU_VIRTUAL_ADDRESS console_descriptor_table_va(D3D12_GPU_VIRTUAL_ADDRESS va);
 
 // Reads the shader-visible descriptor heap GPU base addresses currently bound on `list` (0 when unbound).
 // Returns false when `list` is not one of this module's command lists.

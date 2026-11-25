@@ -10,6 +10,8 @@
 #endif
 #include <vulkan/vulkan.h>
 
+#include "vulkan_device_fault.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <functional>
@@ -23,14 +25,15 @@ public:
     // A device-local allocation for a chunk; null on failure.
     using Allocate = std::function<VkDeviceMemory(const VkMemoryRequirements&)>;
 
-    ScratchBuffers(PFN_vkGetDeviceProcAddr get, VkDevice device, Allocate allocate)
-        : device_(device), allocate_(std::move(allocate)) {
+    ScratchBuffers(PFN_vkGetDeviceProcAddr get, VkDevice device, Allocate allocate,
+                   DeviceFaultDiagnostics* diagnostics = nullptr)
+        : device_(device), diagnostics_(diagnostics), allocate_(std::move(allocate)) {
         loaded_ = vk_.load(get, device);
     }
 
     ~ScratchBuffers() {
         if (!loaded_) return;
-        vk_.vkDeviceWaitIdle(device_);
+        DeviceFaultDiagnostics::observe(diagnostics_, vk_.vkDeviceWaitIdle(device_), "vkDeviceWaitIdle");
         release(current_);
         for (auto& batch : retired_) release(batch);
         for (auto& chunk : spare_) destroy(chunk);
@@ -101,7 +104,9 @@ public:
             if (retired_[i].ticket != 0) {
                 std::uint64_t done = 0;
                 if (!retired_[i].timeline ||
-                    vk_.vkGetSemaphoreCounterValue(device_, retired_[i].timeline, &done) != VK_SUCCESS ||
+                    DeviceFaultDiagnostics::observe(diagnostics_,
+                        vk_.vkGetSemaphoreCounterValue(device_, retired_[i].timeline, &done),
+                        "vkGetSemaphoreCounterValue (scratch)") != VK_SUCCESS ||
                     done < retired_[i].ticket) {
                     ++i;
                     continue;
@@ -175,6 +180,7 @@ private:
     }
 
     VkDevice device_;
+    DeviceFaultDiagnostics* diagnostics_;
     Allocate allocate_;
     Functions vk_;
     bool loaded_ = false;

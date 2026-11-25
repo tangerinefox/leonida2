@@ -37,7 +37,7 @@ from collections import Counter
 
 # `python -I` leaves the script's directory off sys.path.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from shader_stage_manifest import shader_stems  # noqa: E402
+from shader_stage_manifest import shader_stages  # noqa: E402
 from replace_retry import replace as replace_retry  # noqa: E402
 
 # Defensive per-blob ceiling, not a maximum defined by the XBCH format.
@@ -152,6 +152,22 @@ def unpack(dxbc: bytes, payload: str = "last"):
     return _inflate_xbch(blob), ents
 
 
+def program_counts(rows: list, stages: dict) -> dict:
+    """Containers, programs (tag-0x0D payloads) and containers with more than one payload, per stage.
+
+    A container is one carved DXBC file and one row here; a program is one tag-0x0D payload in it. The two counts
+    differ wherever a container carries more than one payload (docs/shader_library.md, "Containers and programs").
+    `stages` maps a row's name to the stage the carve index recorded. A name it lacks, or one it holds without a
+    stage, is counted under None: its stage is unknown."""
+    out = {}
+    for row in rows:
+        counts = out.setdefault(stages.get(row["name"]), {"containers": 0, "programs": 0, "multi_payload": 0})
+        counts["containers"] += 1
+        counts["programs"] += row["xbch_payloads"]
+        counts["multi_payload"] += row["xbch_payloads"] > 1
+    return out
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Unpack the FSSM program from each carved shader container.")
     ap.add_argument("src", help="carved shader directory")
@@ -165,10 +181,11 @@ def main(argv=None) -> int:
         what = "is not a folder" if os.path.exists(src) else "does not exist"
         print(f"ERROR: {src} {what}. Give the folder with the carved .dxbc files.", file=sys.stderr)
         return 2
+    stages = {}
     try:
         if a.carve_index:
-            names = shader_stems(a.carve_index, "file", ".dxbc")
-            shaders = sorted(os.path.join(src, name + ".dxbc") for name in names)
+            stages = shader_stages(a.carve_index, "file", ".dxbc")
+            shaders = sorted(os.path.join(src, name + ".dxbc") for name in stages)
             for path in shaders:
                 if not os.path.isfile(path):
                     raise ValueError(f"{a.carve_index}: declared shader file is missing: {path}")
@@ -225,6 +242,15 @@ def main(argv=None) -> int:
         replace_retry(tmp, os.path.join(src, "fssm_index.json"))   # a scanner or sync client may hold tmp briefly on Windows
     print("magic:", dict(Counter(r["magic"] for r in rows)))
     print("s_endpgm per blob:", dict(Counter(len(r["endpgm"]) for r in rows)))
+    counts = program_counts(rows, stages)
+    print(f"programs: {sum(c['programs'] for c in counts.values())} tag-0x0D payloads in {len(rows)} containers, "
+          f"{sum(c['multi_payload'] for c in counts.values())} containers with more than one "
+          f"(--payload {a.payload} is the one unpacked)")
+    if stages:  # a stage comes from the carve index; without one there is nothing to break the counts down by
+        for stage in sorted(counts, key=lambda s: (s is None, s or "")):
+            c = counts[stage]
+            print(f"  {stage or 'stage unknown'}: {c['containers']} containers, {c['programs']} payloads, "
+                  f"{c['multi_payload']} with more than one")
     sizes = sorted(r["size"] for r in rows)
     print(f"size min {sizes[0]}, median {sizes[len(sizes) // 2]}, max {sizes[-1]}, total {sum(sizes) / 2**20:.0f} MiB")
     return 0

@@ -607,6 +607,27 @@ class TestGalleryCommandLine(unittest.TestCase):
                 self.assertIn("--port must be between 0 and 65535", stderr.getvalue())
                 start_server.assert_not_called()
 
+    def test_rejects_non_directory_explicit_paths_before_starting_server(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "missing")
+            regular_file = os.path.join(tmp, "not-a-directory")
+            with open(regular_file, "wb") as f:
+                f.write(b"synthetic")
+            for flag in ("--models-dir", "--textures-dir"):
+                for path in (missing, regular_file, ""):
+                    with (
+                        self.subTest(flag=flag, path=path),
+                        mock.patch.object(gallery, "start_server") as start_server,
+                        mock.patch.object(sys, "stderr", new_callable=io.StringIO) as stderr,
+                    ):
+                        with self.assertRaises(SystemExit) as raised:
+                            gallery.main([flag, path, "--no-browser"])
+
+                        self.assertEqual(raised.exception.code, 2)
+                        self.assertIn(f"{flag} is not a directory", stderr.getvalue())
+                        self.assertNotIn("Traceback", stderr.getvalue())
+                        start_server.assert_not_called()
+
     def test_passes_default_and_boundary_ports_to_server(self) -> None:
         for args, port in (([], 8080), (["--port", "0"], 0), (["--port", "65535"], 65535)):
             with self.subTest(port=port), mock.patch.object(gallery, "start_server") as start_server:
@@ -614,6 +635,21 @@ class TestGalleryCommandLine(unittest.TestCase):
                 start_server.assert_called_once_with(
                     port=port, models_dir=None, textures_dir=None, open_browser=False,
                     retry_next_port=not args,
+                )
+
+    def test_passes_usable_explicit_directories_to_server(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            models_dir = os.path.join(tmp, "models")
+            textures_dir = os.path.join(tmp, "textures")
+            os.makedirs(models_dir)
+            os.makedirs(textures_dir)
+            with mock.patch.object(gallery, "start_server") as start_server:
+                self.assertEqual(gallery.main([
+                    "--models-dir", models_dir, "--textures-dir", textures_dir, "--no-browser",
+                ]), 0)
+                start_server.assert_called_once_with(
+                    port=8080, models_dir=models_dir, textures_dir=textures_dir, open_browser=False,
+                    retry_next_port=True,
                 )
 
     def test_reports_unavailable_listen_ports(self) -> None:

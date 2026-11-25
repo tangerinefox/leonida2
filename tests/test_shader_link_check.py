@@ -553,6 +553,13 @@ class CommandLineTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "report would overwrite an input file"):
             link.ensure_report_is_separate(self.report, [self.report])
 
+    def test_missing_input_and_report_alias_on_a_folding_volume(self):
+        source = self.directory / "Caf\u00e9.spv"
+        report = self.directory / "cafe\u0301.spv"
+        with patch("report_paths.case_insensitive_volume", return_value=True):
+            with self.assertRaisesRegex(ValueError, "report would overwrite an input file"):
+                link.ensure_report_is_separate(report, [source])
+
     def test_inspect_keeps_types_and_components(self):
         shader = self.module("with_component", input(location=3, component=2, components=2))
         result = self.command("inspect", shader)

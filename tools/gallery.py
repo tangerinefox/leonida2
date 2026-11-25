@@ -529,6 +529,9 @@ def main(argv: list[str] | None = None) -> int:
     port = 8080 if args.port is None else args.port
     if not 0 <= port <= 65535:
         parser.error("--port must be between 0 and 65535")
+    for flag, path in (("--models-dir", args.models_dir), ("--textures-dir", args.textures_dir)):
+        if path is not None and not os.path.isdir(path):
+            parser.error(f"{flag} is not a directory: {path}")
     try:
         start_server(
             port=port,

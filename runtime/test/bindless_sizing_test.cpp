@@ -1,6 +1,6 @@
 // bindless::size_bindings with synthetic device limits: no GPU. The counts of set 0 come from the device's descriptor
-// limits (vulkan_bindless.h): today's sizes where a device is at them, larger 2D, sampler and storage arrays where it
-// has room, and less where it is below them.
+// limits (vulkan_bindless.h): today's sizes where a device is at them, larger image, sampler and storage arrays where
+// it has room, and less where it is below them.
 #ifndef VK_NO_PROTOTYPES
 #define VK_NO_PROTOTYPES
 #endif
@@ -103,8 +103,13 @@ int main() {
         EXPECT(f.counts[bindless::sampler_binding] == 4000 - bindless::reserved_samplers);
         EXPECT(f.counts[bindless::sampler_binding] > 2048);  // a full sampler heap and the fallback
         EXPECT(storage(f, D::dim_2d) == bindless::max_storage_indices);
-        EXPECT(storage(f, D::dim_2d_array) == 1024 && storage(f, D::dim_3d) == 256 && storage(f, D::dim_1d) == 256);
-        EXPECT(count(f, D::dim_2d_array) == 1024 && count(f, D::dim_3d) == 256 && count(f, D::dim_1d) == 256);
+        // The other dimensions grow too (a title's cube maps, texture arrays and 1D lookups outnumber the defaults);
+        // their storage arrays hold as many indices as the 2D one.
+        EXPECT(count(f, D::dim_2d_array) == bindless::max_2d_array_images &&
+               count(f, D::dim_3d) == bindless::max_3d_images && count(f, D::dim_1d) == bindless::max_1d_images);
+        EXPECT(storage(f, D::dim_2d_array) == bindless::max_storage_indices &&
+               storage(f, D::dim_3d) == bindless::max_storage_indices &&
+               storage(f, D::dim_1d) == bindless::max_storage_indices);
         EXPECT(f.ms_samples[0] == VK_SAMPLE_COUNT_4_BIT && f.ms_samples[2] == VK_SAMPLE_COUNT_4_BIT);
         EXPECT(storage_consistent(f));
         if (update_after_bind)

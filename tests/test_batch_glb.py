@@ -57,10 +57,33 @@ class TestBatchGlb(unittest.TestCase):
                         [sys.executable, "-I", os.path.join(TOOLS, "batch_glb.py"), source, output],
                         capture_output=True, text=True, errors="replace", check=False,
                     )
-                    self.assertEqual(result.returncode, 1)
+                    self.assertEqual(result.returncode, 2)
                     self.assertTrue(result.stderr.startswith("ERROR: "), result.stderr)
                     self.assertIn(error, result.stderr)
                     self.assertEqual(len(result.stderr.splitlines()), 1)
+
+    def test_cli_exit_status_follows_the_docstring(self) -> None:
+        script = os.path.join(TOOLS, "batch_glb.py")
+        with tempfile.TemporaryDirectory() as root:
+            empty = os.path.join(root, "empty")
+            broken = os.path.join(root, "broken")
+            os.mkdir(empty)
+            os.mkdir(broken)
+            with open(os.path.join(broken, "broken.obj"), "w", encoding="utf-8", newline="\n") as f:
+                f.write("o broken\nf 1 2 3\n")
+
+            cases = [
+                ("empty input folder: no model failed", [empty, os.path.join(root, "out_empty")], 0),
+                ("one model failed", [broken, os.path.join(root, "out_broken")], 1),
+                ("usage error", ["--bogus"], 2),
+            ]
+            for label, args, expected in cases:
+                with self.subTest(case=label):
+                    result = subprocess.run(
+                        [sys.executable, "-I", script, *args],
+                        capture_output=True, text=True, errors="replace", check=False,
+                    )
+                    self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
 
     def test_cli_rejects_invalid_jobs_and_max_tex_size(self) -> None:
         with tempfile.TemporaryDirectory() as root:

@@ -12,6 +12,8 @@
 #endif
 #include <vulkan/vulkan.h>
 
+#include "vulkan_device_fault.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <functional>
@@ -29,14 +31,15 @@ public:
     using Allocate = std::function<VkDeviceMemory(const VkMemoryRequirements&)>;
 
     // `max_range`: the device's maxStorageBufferRange; a copy is split into dispatches that stay inside it.
-    Depth24Converter(PFN_vkGetDeviceProcAddr get, VkDevice device, Allocate allocate, std::uint64_t max_range = 1u << 27)
-        : device_(device), allocate_(std::move(allocate)), max_range_(max_range) {
+    Depth24Converter(PFN_vkGetDeviceProcAddr get, VkDevice device, Allocate allocate,
+                     std::uint64_t max_range = 1u << 27, DeviceFaultDiagnostics* diagnostics = nullptr)
+        : device_(device), diagnostics_(diagnostics), allocate_(std::move(allocate)), max_range_(max_range) {
         loaded_ = vk_.load(get, device);
     }
 
     ~Depth24Converter() {
         if (!loaded_) return;
-        vk_.vkDeviceWaitIdle(device_);
+        DeviceFaultDiagnostics::observe(diagnostics_, vk_.vkDeviceWaitIdle(device_), "vkDeviceWaitIdle");
         release(current_);
         for (auto& batch : retired_) release(batch);
         for (auto& chunk : spare_) destroy(chunk);
@@ -146,7 +149,9 @@ public:
             if (retired_[i].ticket != 0) {
                 std::uint64_t done = 0;
                 if (!retired_[i].timeline ||
-                    vk_.vkGetSemaphoreCounterValue(device_, retired_[i].timeline, &done) != VK_SUCCESS ||
+                    DeviceFaultDiagnostics::observe(diagnostics_,
+                        vk_.vkGetSemaphoreCounterValue(device_, retired_[i].timeline, &done),
+                        "vkGetSemaphoreCounterValue (scratch)") != VK_SUCCESS ||
                     done < retired_[i].ticket) {
                     ++i;
                     continue;
@@ -354,6 +359,7 @@ private:
     }
 
     VkDevice device_;
+    DeviceFaultDiagnostics* diagnostics_;
     Allocate allocate_;
     std::uint64_t max_range_;
     Functions vk_;

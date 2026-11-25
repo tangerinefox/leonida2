@@ -360,6 +360,78 @@ class MainTests(unittest.TestCase):
                 data = json.load(f)
             self.assertEqual(counts(data["overall"]["rbf0"]), {"files": 1, "bytes": 42})
 
+    def _restore_writable_root(self):
+        for entry in os.listdir(self.root):
+            try:
+                os.chmod(os.path.join(self.root, entry), 0o600)
+            except OSError:
+                pass
+
+    def test_failed_replace_over_readonly_report_cleans_staging_file(self):
+        self.archive("a", [{"head": RBF0_HEAD, "size": 1}])
+        self.run_main()
+        before = self.types()
+        dest = os.path.join(self.root, "types.json")
+        os.chmod(dest, 0o444)
+        self.addCleanup(self._restore_writable_root)
+        with mock.patch.object(carve.os, "replace", side_effect=PermissionError("replace failed")):
+            with self.assertRaisesRegex(PermissionError, "replace failed"):
+                self.run_main()
+        self.assertEqual(self.types(), before)
+        self.assertEqual([n for n in os.listdir(self.root) if n.startswith(".types-")], [])
+
+    @unittest.skipUnless(os.name == "nt", "Windows enforces read-only file replace and unlink")
+    def test_windows_readonly_report_failure_cleans_staging_file(self):
+        self.archive("a", [{"head": RBF0_HEAD, "size": 1}])
+        self.run_main()
+        before = self.types()
+        dest = os.path.join(self.root, "types.json")
+        os.chmod(dest, 0o444)
+        self.addCleanup(self._restore_writable_root)
+        with self.assertRaises(PermissionError):
+            self.run_main()
+        self.assertEqual(self.types(), before)
+        self.assertEqual([n for n in os.listdir(self.root) if n.startswith(".types-")], [])
+
+    def test_fdopen_failure_closes_descriptor_and_cleans_staging_file(self):
+        self.archive("a", [{"head": RBF0_HEAD, "size": 1}])
+        real_mkstemp = carve.tempfile.mkstemp
+        real_close = os.close
+        created = []
+        closed = []
+
+        def spy_mkstemp(*args, **kwargs):
+            fd, temp = real_mkstemp(*args, **kwargs)
+            created.append((fd, temp))
+            return fd, temp
+
+        def spy_close(fd):
+            closed.append(fd)
+            return real_close(fd)
+
+        try:
+            with (
+                mock.patch.object(carve.tempfile, "mkstemp", side_effect=spy_mkstemp),
+                mock.patch.object(carve.os, "fdopen", side_effect=OSError("fdopen failed")),
+                mock.patch.object(carve.os, "close", side_effect=spy_close),
+            ):
+                with self.assertRaisesRegex(OSError, "fdopen failed"):
+                    self.run_main()
+            self.assertEqual(len(created), 1)
+            self.assertIn(created[0][0], closed)
+            self.assertEqual([n for n in os.listdir(self.root) if n.startswith(".types-")], [])
+        finally:
+            for fd, temp in created:
+                if fd not in closed:
+                    try:
+                        real_close(fd)
+                    except OSError:
+                        pass
+                try:
+                    os.unlink(temp)
+                except OSError:
+                    pass
+
 
 if __name__ == "__main__":
     unittest.main()

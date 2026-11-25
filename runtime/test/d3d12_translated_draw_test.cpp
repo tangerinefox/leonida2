@@ -3,8 +3,8 @@
 // them through llvm-mc and tools/rdna2spirv.py (test/shaders/build.py), which writes spirv/index.json with each
 // program's fssm_sha256. The proxy's CreateGraphicsPipelineState then finds both stages by the SHA-256 of the FSSM
 // program inside the DXBC container, as it would for the game; nothing here bypasses that lookup. What it covers:
-//   - the user-data contract: a descriptor-table root argument (s0:s1, the table's console VA) and four root constants
-//     (s2..s5) reach the VS and the PS through the 144-byte push-constant block;
+//   - the user-data contract: a descriptor-table root argument (s8, the table's console VA) and four root constants
+//     (s9..s12) reach the VS and the PS through the 144-byte push-constant block, in the console's graphics layout;
 //   - vertex fetch: the VS has no input layout; it s_loads a V# the application wrote into a shader-visible descriptor
 //     slot and fetches position and colour with buffer_load_dwordx4 ... idxen. The V# points at a DEFAULT-heap vertex
 //     buffer (a range of the GPU address arena, copied from an upload buffer). A V# cannot point at the upload
@@ -180,12 +180,12 @@ int main() {
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
         Ref<ID3D12Device> device;
         EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device),
-                                                           reinterpret_cast<void**>(&device.p))));
+                                                           reinterpret_cast<void**>(&device.p), /*console_lists=*/false)));
         rt::d3d12::set_device_outer(inner, device.p);
 #endif
 
-        // Root signature: [0] a descriptor table of one SRV (s0:s1, the table's console VA), [1] four 32-bit
-        // constants (s2, s3: the draw's offset; s4: the PS's bias; s5 unused). No input layout: the VS fetches.
+        // Root signature: [0] a descriptor table of one SRV (s8, the table's console VA), [1] four 32-bit
+        // constants (s9, s10: the draw's offset; s11: the PS's bias; s12 unused). No input layout: the VS fetches.
         D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
         D3D12_ROOT_PARAMETER params[2] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -316,7 +316,7 @@ int main() {
 
             struct Draw {
                 unsigned slot;
-                float constants[4];  // s2, s3: offset; s4: bias; s5: unused
+                float constants[4];  // s9, s10: offset; s11: bias; s12: unused
                 UINT vertices;
             };
             const Draw draws[3] = {{0, {x_offset, 0, bias, 0}, 6},     // top left

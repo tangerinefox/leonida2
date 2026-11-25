@@ -16,6 +16,7 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from file_mode import published_mode  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 from spirv_interface import (Address, Declaration, InterfaceError, NumericType,  # noqa: E402
                              StageInterface, reflect_module)
 
@@ -234,21 +235,8 @@ def write_report(path: Path, doc):
 def ensure_report_is_separate(output, inputs):
     if output is None:
         return
-    out = output.resolve()
-    try:
-        out_stat = out.stat()
-    except (FileNotFoundError, NotADirectoryError):
-        out_stat = None
     for source in dict.fromkeys(inputs):
-        if out_stat is None:
-            aliases = out == source.resolve()
-        else:
-            try:
-                # Existing targets can be compared by file identity, including hard links.
-                aliases = os.path.samestat(out_stat, source.stat())
-            except (FileNotFoundError, NotADirectoryError):
-                aliases = out == source.resolve()
-        if aliases:
+        if same_report_path(output, source):
             raise ValueError(f"report would overwrite an input file: {source}")
 
 

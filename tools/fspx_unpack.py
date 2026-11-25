@@ -145,6 +145,11 @@ def code_range(code: bytes):
     the first s_endpgm. end is None when the program has no s_endpgm."""
     words = struct.unpack_from(f"<{len(code) // 4}I", code)
     start = PROLOGUE_SIZE if len(words) > 8 and all(words[k] >> 16 == 0xD580 for k in PROLOGUE_WORDS) else 0
+    # Some pipeline programs have only the two hash carriers. Both must be literal-bearing
+    # VOP3 NOPs of the form in fspx_prologue_probe; the first body instruction starts at byte 24.
+    if not start and len(words) >= 6 and all(
+            words[k] >> 16 == 0xD580 and words[k + 1] & 0xFFFE0100 == 0x03FE0100 for k in (0, 3)):
+        start = 24
     pos = code.find(ENDPGM, start)
     while pos >= 0 and pos % 4:
         pos = code.find(ENDPGM, pos + 1)
@@ -169,7 +174,7 @@ def unpack_payload(payload: bytes):
     meta = {
         "version": struct.unpack_from("<I", payload, 4)[0],
         "directory": {str(k): [o, s] for k, (o, s) in sorted(entries.items())},
-        "code": {"start": start, "end": end, "prologue": start == PROLOGUE_SIZE},
+        "code": {"start": start, "end": end, "prologue": start > 0},
         **decode_kind0(blob[0]),
     }
     return (meta, blob), 0
@@ -254,7 +259,7 @@ def main(argv=None) -> int:
             listing = None
             if disasm and meta["code"]["end"]:
                 start, end = meta["code"]["start"], meta["code"]["end"]
-                asm, invalid, err = disasm.disasm(blob[6][start:end], a.mcpu)
+                asm, invalid, err = disasm.disasm(blob[6][start:end], a.mcpu, wave32=meta.get("wave32", True))
                 if not asm.strip():
                     reason = (err.strip().splitlines() or ["no output"])[0]
                     print(f"{name}: {reason}", file=sys.stderr)

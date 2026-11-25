@@ -333,6 +333,51 @@ class ScriptQtableTests(unittest.TestCase):
         self.assertFalse(rep["valid"])
         self.assertEqual(rep["cross_tree_edges"], n - 1)
 
+    def test_bin_folder_sorts_hex_offsets_numerically_and_skips_bin_subdirs(self):
+        # Build a 2-chunk qtable (> 64 KiB) split across unpadded hex names 90000.bin and 100000.bin.
+        # Lexicographic sort puts 100000.bin before 90000.bin, and a subdir ending in .bin used to crash.
+        table_end = 40 + 2 * 8
+        first_off = (table_end + 15) & ~15
+        off0 = first_off
+        off1 = 65536 + 16  # second record starts in chunk 2 so chunk 1 alone is incomplete
+        root_rec = struct.pack("<4I2Q", 0x11111111, 0, 0xAAAA0001, 0, Q_PTR_HIGH | (off1 + 8), 0) + bytes(off1 - off0 - 32)
+        child_rec = struct.pack("<4I", 0, 0, 0xAAAA0002, 0) + bytes(16)
+        blob = (
+            struct.pack("<10I", 0, 0, 0, 0, 0, 2, 0, 0, 0, 0)
+            + struct.pack("<2Q", off0, off1)
+            + bytes(first_off - table_end)
+            + root_rec
+            + child_rec
+        )
+        self.assertGreater(len(blob), 65536)
+        with tempfile.TemporaryDirectory() as d:
+            os.mkdir(os.path.join(d, "000000.bin"))
+            with open(os.path.join(d, "90000.bin"), "wb") as f:
+                f.write(blob[:65536])
+            with open(os.path.join(d, "100000.bin"), "wb") as f:
+                f.write(blob[65536:])
+            loaded, meta = script_qtable.load_qtable_payload(d)
+        self.assertEqual(loaded, blob)
+        self.assertEqual((meta["offset"], meta["chunks"]), (0x90000, 2))
+
+    def test_type_query_sorts_histograms_numerically(self):
+        # Two structs sharing the same type hash with sizes 32 and 112: "32" must come before "112".
+        table_end = 40 + 2 * 8
+        first_off = (table_end + 15) & ~15
+        off0 = first_off
+        off1 = off0 + 32
+        r0 = struct.pack("<4I2Q", 0x22222222, 0, 0xBBBB0001, 0, Q_PTR_HIGH | (off1 + 8), 0)
+        r1 = struct.pack("<4I", 0, 0, 0xBBBB0001, 0) + bytes(112 - 16)
+        blob = (
+            struct.pack("<10I", 0, 0, 0, 0, 0, 2, 0, 0, 0, 0)
+            + struct.pack("<2Q", off0, off1)
+            + bytes(first_off - table_end)
+            + r0
+            + r1
+        )
+        rep = script_qtable.parse_qtable(blob, type_hash=0xBBBB0001)
+        self.assertEqual(list(rep["type_query"]["struct_sizes"].keys()), ["32", "112"])
+
 
 if __name__ == "__main__":
     unittest.main()

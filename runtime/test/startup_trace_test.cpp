@@ -272,6 +272,8 @@ void test_trace(const fs::path& dir) {
     check(has(e, "\"code\":\"0xc0000005\""), "exception code");
     check(has(e, "\"at\":" + mod + hex_rva(kFaultRva) + "\""), "exception address is module+RVA");
     check(has(e, "\"access\":\"read\"") && has(e, "\"address\":\"0x0\""), "access kind and faulting address");
+    check(has(e, "\"region\":{\"base\":\"0x0\"") && has(e, "\"state\":\"0x10000\""),
+          "the faulting page's region (address 0 is free memory)");
     check(has(e, "\"stack\":[" + mod.substr(0) + hex_rva(kFaultRva)), "stack starts at the faulting instruction");
 
     check(find_line(lines, "exit") == &lines.back(), "exit comes last");

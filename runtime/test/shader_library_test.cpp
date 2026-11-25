@@ -562,6 +562,22 @@ int main() {
     CHECK(zlib_inflate(stored, out) && out.size() == 40);
     for (std::uint8_t i = 0; i < 40; ++i) CHECK(out[i] == i);
     CHECK(zlib_inflate(fixed, out) && out == bytes("hello hello hello leonida"));
+    {
+        // Python zlib.compress(b'\xff' * 5553 + b'abc' * 5553). Exercises overlapping
+        // matches with periods one and three across multiple Adler reduction boundaries.
+        const std::vector<std::uint8_t> repeated = {
+            0x78, 0x9c, 0xed, 0xc2, 0x41, 0x11, 0x00, 0x00, 0x08, 0x03, 0xa0, 0xac,
+            0xd3, 0xfe, 0x19, 0x66, 0x0d, 0x1f, 0x70, 0xb4, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xbc, 0x90, 0x59, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+            0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0xd5, 0x3c, 0x7b, 0xa2, 0x71,
+            0x87, 0x48,
+        };
+        std::vector<std::uint8_t> expected(5553, 0xff);
+        for (int i = 0; i < 5553; ++i) expected.insert(expected.end(), {'a', 'b', 'c'});
+        CHECK(zlib_inflate(repeated, out, expected.size()) && out == expected);
+        ZlibError why{};
+        CHECK(!zlib_inflate(repeated, out, expected.size() - 1, &why) && why == ZlibError::limit);
+    }
     CHECK(zlib_inflate(dynamic, out) && out == skewed(600));
     CHECK(sha256_hex(out) == "9cd6848f765bff2a9f42a8b42f6164042dad67d3e9f82e0044ddc7d1ecdeebb2");
     auto broken = dynamic;
@@ -576,6 +592,16 @@ int main() {
     CHECK(zlib_inflate(fixed, out, max_limit) && out == bytes("hello hello hello leonida"));
     CHECK(zlib_inflate(dynamic, out, max_limit) && out == skewed(600));
     CHECK(!zlib_inflate(bytes("not zlib"), out));
+    // The reason a caller can ask for (dstorage.cpp reports each with its own HRESULT).
+    ZlibError why = ZlibError::limit;
+    CHECK(zlib_inflate(dynamic, out, 600, &why) && why == ZlibError::none);
+    CHECK(!zlib_inflate(dynamic, out, 599, &why) && why == ZlibError::limit);
+    CHECK(!zlib_inflate(bytes("not zlib"), out, 1 << 20, &why) && why == ZlibError::header);
+    broken = dynamic;
+    broken.back() ^= 1;
+    CHECK(!zlib_inflate(broken, out, 1 << 20, &why) && why == ZlibError::checksum);
+    broken.resize(100);
+    CHECK(!zlib_inflate(broken, out, 1 << 20, &why) && why == ZlibError::data);
 
     Json json;
     // "s" holds an escaped quote and a \u escape for U+00E9, which the reader must turn into UTF-8.
@@ -719,6 +745,81 @@ int main() {
     CHECK(!library.load(dir.string(), &error) && !error.empty());  // refused, not thrown
     std::filesystem::remove_all(dir);
 
+    // The descriptor-hash marker (`descriptor_hash` in each module's meta, descriptor_table.h): absent is bare fnv1a;
+    // the census covers the root index and every sub-index, and the majority decides. LEONIDA_DESCRIPTOR_HASH overrides
+    // in the device, through descriptor_hash_kind_from_env.
+    {
+        const auto root = dir / "hash_kinds";
+        const auto write_index = [](const std::filesystem::path& folder, const std::string& modules) {
+            std::filesystem::create_directories(folder);
+            std::ofstream index(folder / "index.json", std::ios::binary);
+            index << "{" << modules << "}";
+        };
+        const auto module = [](const char* name, const char* marker) {
+            std::string out = "{\"stage\": \"vs\", \"fssm_sha256\": \"" + std::string(name) + "\"";
+            if (marker) out += ", \"descriptor_hash\": \"" + std::string(marker) + "\"";
+            return out + "}";
+        };
+        const auto census = [](const ShaderLibrary& library, std::size_t fmix32, std::size_t fnv1a) {
+            return library.descriptor_hash_census().fnv1a_fmix32 == fmix32 &&
+                   library.descriptor_hash_census().fnv1a == fnv1a;
+        };
+
+        // All-new and all-old: every module agrees, so that is the kind.
+        write_index(root, "\"a\": " + module("aa", "fnv1a_fmix32") + ", \"b\": " + module("bb", "fnv1a_fmix32"));
+        ShaderLibrary all_new;
+        CHECK(all_new.load(root.string(), &error));
+        CHECK(census(all_new, 2, 0) && all_new.descriptor_hash_kind() == DescriptorHashKind::fnv1a_fmix32);
+
+        write_index(root, "\"a\": " + module("aa", nullptr) + ", \"b\": " + module("bb", nullptr));
+        ShaderLibrary all_old;
+        CHECK(all_old.load(root.string(), &error));
+        CHECK(census(all_old, 0, 2) && all_old.descriptor_hash_kind() == DescriptorHashKind::fnv1a);
+
+        // Mixed: the majority wins (an explicit "fnv1a" counts as fnv1a, like an absent marker).
+        write_index(root, "\"a\": " + module("aa", "fnv1a_fmix32") + ", \"b\": " + module("bb", "fnv1a_fmix32") +
+                              ", \"c\": " + module("cc", nullptr));
+        ShaderLibrary mixed_majority;
+        CHECK(mixed_majority.load(root.string(), &error));
+        CHECK(census(mixed_majority, 2, 1) &&
+              mixed_majority.descriptor_hash_kind() == DescriptorHashKind::fnv1a_fmix32);
+
+        write_index(root, "\"a\": " + module("aa", "fnv1a_fmix32") + ", \"b\": " + module("bb", "fnv1a") +
+                              ", \"c\": " + module("cc", nullptr) + ", \"d\": " + module("dd", nullptr));
+        ShaderLibrary mixed_minority;
+        CHECK(mixed_minority.load(root.string(), &error));
+        CHECK(census(mixed_minority, 1, 3) && mixed_minority.descriptor_hash_kind() == DescriptorHashKind::fnv1a);
+
+        // A tie has no majority: the old bare FNV-1a stays.
+        write_index(root, "\"a\": " + module("aa", "fnv1a_fmix32") + ", \"b\": " + module("bb", nullptr));
+        ShaderLibrary tied;
+        CHECK(tied.load(root.string(), &error));
+        CHECK(census(tied, 1, 1) && tied.descriptor_hash_kind() == DescriptorHashKind::fnv1a);
+
+        // A sub-index's marker is counted too: two old modules in the root and one new one in fspx/ is a 1 fnv1a_fmix32
+        // / 2 fnv1a library, and loading a folder replaces the census rather than adding to it.
+        write_index(root, "\"a\": " + module("aa", nullptr) + ", \"b\": " + module("bb", nullptr));
+        write_index(root / "fspx", "\"upscaler\": " + module("cc", "fnv1a_fmix32"));
+        ShaderLibrary sub_index;
+        CHECK(sub_index.load(root.string(), &error));
+        CHECK(census(sub_index, 1, 2) && sub_index.descriptor_hash_kind() == DescriptorHashKind::fnv1a);
+        CHECK(sub_index.load(root.string(), &error) && census(sub_index, 1, 2));  // reload, not accumulate
+        std::filesystem::remove_all(root / "fspx");
+        CHECK(sub_index.load(root.string(), &error) && census(sub_index, 0, 2));
+
+        // LEONIDA_DESCRIPTOR_HASH: an exact kind name wins over the census; anything else is ignored.
+        DescriptorHashKind chosen = DescriptorHashKind::fnv1a_fmix32;
+        CHECK(descriptor_hash_kind_from_env("fnv1a", &chosen) && chosen == DescriptorHashKind::fnv1a);
+        CHECK(descriptor_hash_kind_from_env("fnv1a_fmix32", &chosen) &&
+              chosen == DescriptorHashKind::fnv1a_fmix32);
+        CHECK(!descriptor_hash_kind_from_env(nullptr, &chosen));
+        CHECK(!descriptor_hash_kind_from_env("", &chosen));
+        CHECK(!descriptor_hash_kind_from_env("Fnv1a", &chosen));
+        CHECK(!descriptor_hash_kind_from_env("other", &chosen));
+        CHECK(chosen == DescriptorHashKind::fnv1a_fmix32);  // a refused value leaves the caller's kind alone
+        std::filesystem::remove_all(dir);
+    }
+
     if (const int line = fspx_checks()) return line;
 
     // FSPX entries: found by fspx_code_sha256, in the main index or in <dir>/fspx/index.json (named "fspx/<name>").
@@ -744,6 +845,7 @@ int main() {
         const auto found = fspx.fspx_candidates("cs", code_hash);
         CHECK(found.size() == 1 && found[0]->name == "fspx/upscaler_00" && found[0]->local_size[0] == 8 &&
               found[0]->wave64 && found[0]->fssm_sha256.empty());
+        CHECK(found[0]->code_base_known && !found[0]->uses_code_base);
         CHECK(fspx.spirv(*found[0]).size() == 5);  // <dir>/fspx/upscaler_00.spv
         // The key computed both ways finds the entry: from the container slot 62 gets, from the bare program.
         CHECK(fspx.program_candidates("cs", compute_program(accc_container(fspx_payload(code)))) == found);
@@ -764,6 +866,17 @@ int main() {
               fspx.fspx_candidates("cs", code_hash).empty());
         std::filesystem::remove(dir / "fspx" / "index.json");
         CHECK(fspx.load(dir.string(), &error) && fspx.size() == 2 && fspx.fspx_size() == 0 && fspx.find("cs", hash));
+        std::filesystem::rename(dir / "fspx", dir / "fspx_compute");
+        {
+            std::ofstream sub(dir / "fspx_compute" / "index.json", std::ios::binary);
+            sub << "{\"upscaler_00\": {\"stage\": \"cs\", \"fspx_code_sha256\": \"" << code_hash
+                << "\", \"fspx_state_sha256\": \"" << sha256_hex(std::vector<std::uint8_t>(28, 0x11)) << "\"}}";
+        }
+        CHECK(fspx.load(dir.string(), &error) && fspx.size() == 3 && fspx.fspx_size() == 0 &&
+              fspx.fspx_compute_size() == 1);
+        const auto compute = fspx.program_candidates("cs", compute_program(fspx_payload(code)));
+        CHECK(compute.size() == 1 && compute[0]->name == "fspx_compute/upscaler_00" &&
+              fspx.spirv(*compute[0]).size() == 5);
         std::filesystem::remove_all(dir);
     }
 
@@ -850,7 +963,7 @@ int main() {
         std::filesystem::create_directories(dir / "fspx");
         write(dir / "index.json", "{" + game + "}");
         write(dir / "fspx" / "index.json",
-              "{\"upscaler_00\": {\"stage\": \"cs\", \"fspx_code_sha256\": \"" + sha256_hex(code) + "\"}}");
+              "{\"upscaler_00\": {\"stage\": \"cs\", \"uses_code_base\": false, \"fspx_code_sha256\": \"" + sha256_hex(code) + "\"}}");
         // The second entry is a program whose metadata failed: no key, so nothing can find it and it is not counted.
         write(dir / "bvh" / "index.json",
               "{\"BuilderProgram\": " + program_entry + ",\n \"NoKey\": {\"error\": \"ValueError: synthetic\"}}");
@@ -865,11 +978,14 @@ int main() {
         const auto found = bvh.program_candidates("cs", program);
         CHECK(found.size() == 1 && found[0]->name == "bvh/BuilderProgram" && found[0] == bvh.find("cs", builder_hash));
         CHECK(found[0]->lds_bytes == 32768 && found[0]->wave64 && found[0]->subgroup_size == 64 &&
-              found[0]->uses_code_base && found[0]->local_size[0] == 64 && found[0]->fspx_code_sha256.empty());
+              found[0]->code_base_known && found[0]->uses_code_base && found[0]->local_size[0] == 64 && found[0]->fspx_code_sha256.empty());
         CHECK(bvh.spirv(*found[0]).size() == 5);  // <dir>/bvh/BuilderProgram.spv
         // The other indexes are untouched: the game's shader and the FSPX program are found as before, each by its
         // own key, and a builder program is neither an FSPX program nor a shader of another stage.
         CHECK(bvh.find("cs", hash) && bvh.find("cs", hash)->name == "cs_game");
+        CHECK(!bvh.find("cs", hash)->code_base_known);
+        const auto* no_code_base = bvh.program_candidates("cs", compute_program(code)).at(0);
+        CHECK(no_code_base->code_base_known && !no_code_base->uses_code_base);
         CHECK(bvh.program_candidates("cs", compute_program(code)).at(0)->name == "fspx/upscaler_00");
         CHECK(bvh.fspx_candidates("cs", builder_hash).empty() && bvh.candidates("vs", builder_hash).empty());
         // A program the translator left out (Box16Rehydration today) has no entry: nothing is found, and no other
@@ -893,6 +1009,38 @@ int main() {
         write(dir / "fspx" / "index.json", "{broken");
         CHECK(bvh.load(dir.string(), &error) && bvh.size() == 2 && bvh.bvh_size() == 1 && bvh.fspx_size() == 0 &&
               bvh.program_candidates("cs", program).size() == 1);
+        std::filesystem::remove_all(dir);
+    }
+
+    // game_scarlett_master.exe's inline containers (docs/embedded_shaders.md, "Retail executable"): translated into
+    // <dir>/exe (entries named "exe/<name>") and found by fssm_sha256, like the game's and the builder's shaders.
+    {
+        const std::string exe_hash = sha256_hex(bytes("scarlett master executable shader"));
+        const std::uint32_t words[5] = {0x07230203, 0x00010500, 0, 1, 0};
+        std::filesystem::create_directories(dir / "exe");
+        {
+            std::ofstream index(dir / "exe" / "index.json", std::ios::binary);
+            index << "{\"container_00\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << exe_hash
+                  << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"wave64\": true, \"subgroup_size\": 64, "
+                     "\"input_signature\": [{\"semantic\": \"SV_VertexID\", \"semantic_index\": 0, \"register\": 0, "
+                     "\"system_value\": 6, \"component_type\": \"uint\"}]}}";
+            std::ofstream spv(dir / "exe" / "container_00.spv", std::ios::binary);
+            spv.write(reinterpret_cast<const char*>(words), sizeof(words));
+        }
+        {
+            std::ofstream index(dir / "index.json", std::ios::binary | std::ios::trunc);
+            index << "{\"vs_game\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << hash << "\"}}";
+        }
+        ShaderLibrary exe;
+        CHECK(exe.load(dir.string(), &error) && exe.size() == 2 && exe.exe_size() == 1);
+        const auto found = exe.candidates("vs", exe_hash);
+        CHECK(found.size() == 1 && found[0]->name == "exe/container_00" && found[0]->wave64 &&
+              found[0]->push_constant_bytes == 144 && found[0]->input_signature.size() == 1 &&
+              found[0]->input_signature[0].semantic == "SV_VertexID");
+        CHECK(exe.spirv(*found[0]).size() == 5);  // <dir>/exe/container_00.spv
+        CHECK(exe.candidates("vs", hash).at(0)->name == "vs_game");
+        CHECK(exe.candidates("ps", exe_hash).empty());
+        std::filesystem::remove_all(dir / "exe");
         std::filesystem::remove_all(dir);
     }
 

@@ -551,8 +551,8 @@ void run_checks(const std::filesystem::path& root) {
         check(delete_w(L"GAME:\\data\\bye.txt") == FALSE && GetLastError() == ERROR_FILE_NOT_FOUND,
               "deleting an already hidden file reports ERROR_FILE_NOT_FOUND");
         SetLastError(0);
-        check(delete_w(L"GAME:\\nope\\missing.txt") == FALSE && GetLastError() == ERROR_FILE_NOT_FOUND,
-              "deleting a file that never existed reports ERROR_FILE_NOT_FOUND");
+        check(delete_w(L"GAME:\\nope\\missing.txt") == FALSE && GetLastError() == ERROR_PATH_NOT_FOUND,
+              "deleting a file in a folder that never existed reports ERROR_PATH_NOT_FOUND");
 
         // Deleting a nested package file creates parent directories inside .gta6rt-deleted/; those marker parent
         // directories must not hide the corresponding ancestor directories in the package.
@@ -768,6 +768,49 @@ void run_checks(const std::filesystem::path& root) {
               "and the new folder is empty: only . and ..");
     }
 
+    {
+        const std::filesystem::path host = root / "host_missing";
+        write_path(host / "file.txt", "file");
+        const std::wstring host_dest = (host / "dest.txt").wstring();
+        auto error_of = [](BOOL ok) { return ok ? DWORD{0} : GetLastError(); };
+        struct Name {
+            const wchar_t* game;
+            std::filesystem::path host;
+            DWORD expected;
+            const char* what;
+        };
+        const Name names[] = {
+            {L"GAME:\\nowhere\\x.txt", host / "nowhere" / "x.txt", ERROR_PATH_NOT_FOUND, "inside a missing folder"},
+            {L"GAME:\\misc\\keep.txt\\x.txt", host / "file.txt" / "x.txt", ERROR_PATH_NOT_FOUND, "below a file"},
+            {L"GAME:\\misc\\absent.txt", host / "absent.txt", ERROR_FILE_NOT_FOUND, "missing from a folder that exists"},
+        };
+        for (const Name& n : names) {
+            const std::wstring native = n.host.wstring();
+            const std::string suffix = std::string(" of a name ") + n.what + " fails as on the host";
+            SetLastError(0);
+            const DWORD host_delete = error_of(::DeleteFileW(native.c_str()));
+            SetLastError(0);
+            check(error_of(delete_w(n.game)) == n.expected && host_delete == n.expected, ("DeleteFileW" + suffix).c_str());
+            SetLastError(0);
+            const DWORD host_rmdir = error_of(::RemoveDirectoryW(native.c_str()));
+            SetLastError(0);
+            check(error_of(rmdir_w(n.game)) == n.expected && host_rmdir == n.expected,
+                  ("RemoveDirectoryW" + suffix).c_str());
+            SetLastError(0);
+            const DWORD host_setattr = error_of(::SetFileAttributesW(native.c_str(), FILE_ATTRIBUTE_NORMAL));
+            SetLastError(0);
+            check(error_of(setattr_w(n.game, FILE_ATTRIBUTE_NORMAL)) == n.expected && host_setattr == n.expected,
+                  ("SetFileAttributesW" + suffix).c_str());
+            SetLastError(0);
+            const DWORD host_move = error_of(::MoveFileExW(native.c_str(), host_dest.c_str(), MOVEFILE_REPLACE_EXISTING));
+            SetLastError(0);
+            check(error_of(move_ex_w(n.game, L"GAME:\\misc\\dest.txt", MOVEFILE_REPLACE_EXISTING)) == n.expected &&
+                      host_move == n.expected,
+                  ("MoveFileExW" + suffix).c_str());
+        }
+        check(!std::filesystem::exists(overlay / "nowhere") && !std::filesystem::exists(overlay / "misc" / "dest.txt"),
+              "and none of them leaves anything in the overlay");
+    }
     // Recreating a removed package directory clears its own marker, but not nested deletion markers.
     {
         std::filesystem::create_directories(package / "recreate_dir");

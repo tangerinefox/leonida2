@@ -66,6 +66,7 @@ CAUGHT = [
     ("heightmap2.dat", b"MHIU" + bytes(12), "MHIU heightmap"),
     ("presets.dat", b"SPS1" + bytes(12), "SPS1 shader-preset table"),
     ("effects.dat", b"SGD5" + bytes(12), "SGD5 effects database"),
+    ("profile.dat", b"BCPHIST1" + bytes(8), "local BCPack predictor profile"),
     ("texcontainer.dat", b"RDS5" + bytes(12), "RDS5 texture container"),
     ("bank2.json", b"AWC\x00" + bytes(12), "AWC audio bank"),
     ("script.lol", b"YSC\x00" + bytes(12), "YSC compiled script"),
@@ -181,8 +182,8 @@ PASSED_ARCHIVES = [
 ]
 
 
-def run(args, cwd=None):
-    return subprocess.run([sys.executable, "-I", SCRIPT, *args], cwd=cwd, capture_output=True, text=True)
+def run(args, cwd=None, env=None):
+    return subprocess.run([sys.executable, "-I", SCRIPT, *args], cwd=cwd, env=env, capture_output=True, text=True)
 
 
 class CheckNoGameData(unittest.TestCase):
@@ -303,6 +304,35 @@ class CheckNoGameData(unittest.TestCase):
         rc, out, err = self.run_with_unreadable(locked, [locked, pe])
         self.assertEqual(rc, 1, out + err)
         self.assertIn("PE executable", out)
+
+    def test_git_missing_is_one_stderr_line_and_exit_2(self):
+        # PATH holds no git: the default mode cannot list the tracked files, and that is not "game data found" (1)
+        empty = os.path.join(self.dir, "empty-bin")
+        os.mkdir(empty)
+        self.write("notes.txt", b"plain text\n")
+        result = run([], cwd=self.dir, env=dict(os.environ, PATH=empty))
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+        self.assertTrue(result.stderr.startswith("check_no_game_data: cannot list the tracked files with git: "),
+                        result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_outside_a_repository_is_one_stderr_line_and_exit_2(self):
+        # GIT_CEILING_DIRECTORIES stops git from finding a repository above the temporary directory, and LC_ALL=C
+        # keeps git's message in English; a GIT_DIR, GIT_WORK_TREE or GIT_INDEX_FILE of the caller would point git at a
+        # repository anyway (a git hook sets them), so they are removed
+        self.write("notes.txt", b"plain text\n")
+        env = {k: v for k, v in os.environ.items() if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")}
+        env.update(GIT_CEILING_DIRECTORIES=os.path.dirname(self.dir), LC_ALL="C")
+        result = run([], cwd=self.dir, env=env)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+        self.assertTrue(result.stderr.startswith("check_no_game_data: cannot list the tracked files with git: "),
+                        result.stderr)
+        self.assertIn("not a git repository", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
 
     @unittest.skipUnless(shutil.which("git"), "git not installed")
     def test_default_mode_reads_tracked_files_only(self):

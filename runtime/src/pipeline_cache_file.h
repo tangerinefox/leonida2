@@ -1,4 +1,7 @@
 // Publish a checkpoint only after every byte has reached a closed, same-directory staging file.
+//
+// Used by vk_pipeline_check for its offline corpus checkpoints. The runtime fills a mapped session staging file
+// directly (d3d12_pipeline_checkpoint.h).
 #pragma once
 
 #include <algorithm>

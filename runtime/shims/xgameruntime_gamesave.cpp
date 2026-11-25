@@ -371,6 +371,60 @@ HRESULT read_blobs(const XGameSaveContainer* c, const char* const* names, uint32
 }
 
 // ---- Committing an update ----
+//
+// Every write goes to "<blob>~" first. Then each op, in name order, applies its change: the blob's file is copied to
+// its backup "<blob>~b~", then a write renames its temporary over the blob or a delete removes the blob. A blob never
+// leaves its name, so a process that dies midway leaves each blob under its name, old or new, as before. When an op
+// fails, the ops already applied are undone newest first (a blob that existed is copied back from its backup, one
+// that did not is removed), the scratch files are deleted and the update fails with E_GS_OUT_OF_LOCAL_STORAGE. A
+// backup whose restore failed is kept, so the old contents survive. Every scratch name ends in '~', which encode_name
+// never produces and decode_name rejects, so enumeration and the quota never count one. A commit first deletes the
+// temporaries of a commit that died midway. It leaves backups alone: one may be the only copy of a blob's old
+// contents. The next successful update of that blob replaces and then removes its backup.
+
+struct CommitStep {
+    fs::path final_path, temp, backup;
+    bool write = false;
+    bool existed = false;      // the blob had a file before the update; the backup is a copy of it
+    bool backed_up = false;    // this update wrote the backup
+    bool applied = false;      // the op took effect
+    bool keep_backup = false;  // its undo failed: the backup holds the only copy of the old contents
+};
+
+bool copy_blob(const fs::path& from, const fs::path& to) {
+    std::error_code ec;
+    fs::copy_file(from, to, fs::copy_options::overwrite_existing, ec);
+    return !ec;
+}
+
+// Undoes the applied steps among steps[0, upto), newest first. A step whose restore fails keeps its backup.
+void undo_steps(std::vector<CommitStep>& steps, size_t upto) {
+    for (size_t i = upto; i-- > 0;) {
+        CommitStep& s = steps[i];
+        if (!s.applied) continue;
+        std::error_code ec;
+        if (s.existed) {
+            if (copy_blob(s.backup, s.final_path)) {
+                s.applied = false;
+            } else {
+                s.keep_backup = true;
+            }
+        } else {
+            fs::remove(s.final_path, ec);
+            if (!ec) s.applied = false;
+        }
+    }
+}
+
+// Deletes what the update left behind: the temporaries, and the backups it wrote itself that are not the only copy of
+// a blob's old contents.
+void remove_scratch(const std::vector<CommitStep>& steps) {
+    for (const CommitStep& s : steps) {
+        std::error_code ec;
+        fs::remove(s.temp, ec);
+        if (s.backed_up && !s.keep_backup) fs::remove(s.backup, ec);
+    }
+}
 
 HRESULT commit(XGameSaveUpdate* u) {
     XGameSaveContainer* c = u->container;
@@ -388,24 +442,53 @@ HRESULT commit(XGameSaveUpdate* u) {
     std::error_code ec;
     fs::create_directories(dir, ec);
     if (ec) return E_GS_OUT_OF_LOCAL_STORAGE;
-    std::vector<std::pair<fs::path, fs::path>> renames;   // temporary -> final
+    // Temporaries of a commit that died midway: never blobs, and nothing else uses these names. Backups are kept.
+    for (const auto& e : fs::directory_iterator(dir, ec)) {
+        std::error_code entry_ec;
+        const std::wstring n = e.path().filename().wstring();
+        if (n.ends_with(L"~") && !n.ends_with(L"~b~") && e.is_regular_file(entry_ec)) fs::remove(e.path(), entry_ec);
+    }
+
+    std::vector<CommitStep> steps;
+    steps.reserve(u->ops.size());
     for (const auto& [name, op] : u->ops) {
-        if (!op.write) continue;
-        const fs::path final_path = dir / widen(encode_name(name));
-        fs::path temp = final_path;
-        temp += L"~";
-        if (!write_file(temp, op.data.data(), op.data.size())) {
-            for (const auto& r : renames) fs::remove(r.first, ec);
-            fs::remove(temp, ec);
+        CommitStep s;
+        s.final_path = dir / widen(encode_name(name));
+        s.temp = s.final_path;
+        s.temp += L"~";
+        s.backup = s.final_path;
+        s.backup += L"~b~";
+        s.write = op.write;
+        std::error_code exists_ec;
+        s.existed = fs::is_regular_file(s.final_path, exists_ec);
+        if (op.write && !write_file(s.temp, op.data.data(), op.data.size())) {
+            std::error_code rm_ec;
+            for (const CommitStep& done : steps) fs::remove(done.temp, rm_ec);
+            fs::remove(s.temp, rm_ec);
             return E_GS_OUT_OF_LOCAL_STORAGE;
         }
-        renames.emplace_back(temp, final_path);
+        steps.push_back(std::move(s));
     }
-    for (const auto& [temp, final_path] : renames)
-        if (!MoveFileExW(temp.c_str(), final_path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+
+    for (size_t i = 0; i < steps.size(); ++i) {
+        CommitStep& s = steps[i];
+        bool ok = true;
+        if (s.existed) ok = s.backed_up = copy_blob(s.final_path, s.backup);
+        if (ok && s.write) {
+            ok = MoveFileExW(s.temp.c_str(), s.final_path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+        } else if (ok && s.existed) {   // a delete
+            std::error_code rm_ec;
+            fs::remove(s.final_path, rm_ec);   // already gone is a delete that has nothing left to do
+            ok = !rm_ec;
+        }
+        if (!ok) {
+            undo_steps(steps, i);   // the failed op changed nothing: only the ops before it were applied
+            remove_scratch(steps);
             return E_GS_OUT_OF_LOCAL_STORAGE;
-    for (const auto& [name, op] : u->ops)
-        if (!op.write) fs::remove(dir / widen(encode_name(name)), ec);
+        }
+        s.applied = true;
+    }
+    remove_scratch(steps);
     if (u->has_display_name) write_file(dir / L".display", u->display_name.data(), u->display_name.size());
     return S_OK;
 }
