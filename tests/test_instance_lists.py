@@ -122,6 +122,15 @@ def resource(*, rotation_first: bool = False) -> tuple[bytes, bytes]:
     return bytes(V), bytes(P)
 
 
+class PointerTests(unittest.TestCase):
+    def test_instance_list_block_number_is_20_bits(self):
+        # 4097 blocks: block 1 at V+0, block 4097 at V+0x100. A 12-bit block field would read 4097 as block 1.
+        V = bytes(0x200)
+        blocks = [(il.GRASS_INST, 0x10, 0x50000000)] * 4096 + [(il.GRASS_INST, 0x40, 0x50000100)]
+        ref = struct.pack("<QH", 4097 | (0x10 << 20), 3)
+        self.assertEqual(il.array(V, b"", blocks, ref, 0), (V, 0x110, 3))
+
+
 class MeasureTests(unittest.TestCase):
     def setUp(self):
         self.V, self.P = resource()

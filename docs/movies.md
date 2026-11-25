@@ -114,8 +114,9 @@ and then only to a temporary file that is deleted.
 
 On this archive both tools find the same 515 streams, the same 8,831,336,892 bytes, 1,094,744 bytes of zero
 padding and 22,812 bytes after the last stream. Those 22,812 are 3,884 zero bytes and the 18,928-byte RPF trailer
-(counted by reading the tail directly); `bink_index.py` now counts them as zero padding and `rpf_trailer`, which for
-this archive gives `unread_bytes` 0 and zero padding 1,098,628 (derived from the measured tail, not a rerun). Running `bink_index.py` on the 515 carved
+(counted by reading the tail directly). A read-only rerun of `bink_index.py` at `2d53a8055` on 2026-11-23
+confirmed 1,098,628 bytes of zero padding, 18,928 trailer bytes and 0 unread bytes. The archive matched the
+1.0.2.1 manifest by size and SHA-256. Running `bink_index.py` on the 515 carved
 `.bk2` files finds 515 streams with zero unread bytes, which confirms the stored sizes cover each file exactly.
 
 ## 4. Decoding

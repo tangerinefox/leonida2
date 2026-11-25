@@ -53,12 +53,15 @@ the layout the comments at their top describe (`/opt/leonida` for traces, overla
   `__GL_SHADER_DISK_CACHE_SKIP_CLEANUP=1`.
 - **Input:** a pad through GameInput/SDL3, or the keyboard pad (`LEONIDA_KEYBOARD_PAD=always`), or a script:
   `LEONIDA_INPUT_SCRIPT=a@210,a@240` presses A at those seconds (any length since this branch; it was cut at 63
-  characters before).
+  characters before). The script also works in a build without SDL3, where it drives one scripted pad
+  ([docs/gameinput.md](gameinput.md#scripted-input-without-sdl3)); pads and the keyboard pad need SDL3.
 - **Window:** frames are presented in the title's own window; `LEONIDA_PRESENT_WINDOW=own|hidden` chooses otherwise.
 
 Three setup mistakes each give a blank or empty picture without an error: the executable's embedded shaders missing
-from the library (`exe/index.json`), a build without SDL3 (no pad), and a BCPack predictor file that was never
-generated (`tools/build_dstorage_history.py`; without it the loading art and most BC7 textures stay empty).
+from the library (`exe/index.json`), a build without SDL3 and without `LEONIDA_INPUT_SCRIPT` (no pad, so nothing
+gets past the first prompt; set a script, or build with SDL3 for a pad or the keyboard pad), and a BCPack predictor
+file that was never generated (`tools/build_dstorage_history.py`; without it the loading art and most BC7 textures
+stay empty).
 
 ## Running the game under Wine with one command
 

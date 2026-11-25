@@ -333,20 +333,24 @@ def main(argv=None):
     except runner.Unavailable as exc:
         print(f"SKIP: {exc}", file=sys.stderr)
         return 77
-    if asm.family(oracle.arch) != "gfx10":
-        print(f"SKIP: {oracle.arch} is not GFX10 (RDNA1/RDNA2)", file=sys.stderr)
-        return 77
-    out = {"arch": oracle.arch, "waves": {}}
-    for wave in waves:
-        report = sweep(oracle, asm, wave)
-        out["waves"][str(wave)] = report
-        print_table(report, wave)
-    if args.json_out is not None:
-        err = write_json_report(args.json_out, out)
-        if err:
-            print(f"error: {err}", file=sys.stderr)
-            return 1
-    return 0
+    try:
+        if asm.family(oracle.arch) != "gfx10":
+            print(f"SKIP: {oracle.arch} is not GFX10 (RDNA1/RDNA2)", file=sys.stderr)
+            return 77
+        out = {"arch": oracle.arch, "waves": {}}
+        for wave in waves:
+            report = sweep(oracle, asm, wave)
+            out["waves"][str(wave)] = report
+            print_table(report, wave)
+        if args.json_out is not None:
+            err = write_json_report(args.json_out, out)
+            if err:
+                print(f"error: {err}", file=sys.stderr)
+                return 1
+        return 0
+    finally:
+        if hasattr(oracle, "close"):
+            oracle.close()
 
 
 if __name__ == "__main__":

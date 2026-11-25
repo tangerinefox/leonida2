@@ -24,3 +24,8 @@ A language is added when a contributor volunteers to maintain it and keeps the s
 | Deutsch (`de`) | [`de/quickstart.md`](de/quickstart.md) | `aa2988cc` | `@zGLados` |
 | Italiano (`it`) | [`it/quickstart.md`](it/quickstart.md) | `49475796` | `@MeNoSkills` |
 | العربية (`ar`) | [`ar/quickstart.md`](ar/quickstart.md) | `561b65a` | `@Mohamed-Leo` |
+
+## Other community translations
+
+- French translation of [`CONTRIBUTING.md`](../../CONTRIBUTING.md): [`fr/contributing.md`](fr/contributing.md), synced
+  with commit `1ab957b3`. No maintainer is named in the file.

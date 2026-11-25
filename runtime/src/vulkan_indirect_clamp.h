@@ -135,7 +135,8 @@ public:
 
     IndirectArgumentClamp(PFN_vkGetDeviceProcAddr get, VkDevice device, const VkPhysicalDeviceMemoryProperties& memory,
                           const VkPhysicalDeviceLimits& limits, Allocate allocate,
-                          DeviceFaultDiagnostics* diagnostics = nullptr);
+                          DeviceFaultDiagnostics* diagnostics = nullptr,
+                          std::vector<std::uint32_t> families = {});
     ~IndirectArgumentClamp();
     IndirectArgumentClamp(const IndirectArgumentClamp&) = delete;
     IndirectArgumentClamp& operator=(const IndirectArgumentClamp&) = delete;
@@ -189,7 +190,14 @@ public:
                 if (counted) owner_.release_one(slot);
                 return false;
             }
-            if (counted) slots_.push_back(slot);
+            if (counted) {
+                try {
+                    slots_.push_back(slot);
+                } catch (...) {
+                    owner_.release_one(slot);
+                    throw;
+                }
+            }
             return true;
         }
 
@@ -240,7 +248,7 @@ private:
     VkDevice device_;
     VkPhysicalDeviceMemoryProperties memory_{};
     VkPhysicalDeviceLimits limits_{};
-    DeviceFaultDiagnostics* diagnostics_ = nullptr;
+    std::vector<std::uint32_t> families_;
     ScratchBuffers scratch_;
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
     VkPipeline pipeline_ = VK_NULL_HANDLE;
@@ -281,9 +289,10 @@ inline constexpr VkBufferUsageFlags indirect_clamp_scratch_usage =
 inline IndirectArgumentClamp::IndirectArgumentClamp(PFN_vkGetDeviceProcAddr get, VkDevice device,
                                                     const VkPhysicalDeviceMemoryProperties& memory,
                                                     const VkPhysicalDeviceLimits& limits, Allocate allocate,
-                                                    DeviceFaultDiagnostics* diagnostics)
-    : get_(get), device_(device), memory_(memory), limits_(limits), diagnostics_(diagnostics),
-      scratch_(get, device, std::move(allocate), diagnostics, detail::indirect_clamp_scratch_usage) {}
+                                                    DeviceFaultDiagnostics* diagnostics,
+                                                    std::vector<std::uint32_t> families)
+    : get_(get), device_(device), memory_(memory), limits_(limits), families_(std::move(families)),
+      scratch_(get, device, std::move(allocate), diagnostics, detail::indirect_clamp_scratch_usage, families_) {}
 
 inline IndirectArgumentClamp::~IndirectArgumentClamp() {
     const auto destroy_pipeline = fn<PFN_vkDestroyPipeline>("vkDestroyPipeline");
@@ -354,7 +363,17 @@ inline bool IndirectArgumentClamp::make_area() {
     VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     info.size = VkDeviceSize(area.slots) * HostArea::slot_bytes;
     info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    // Direct and async-compute queues copy counter slots into the same HostArea buffer concurrently.
+    share_across_queue_families(info, families_);
     if (create_buffer(device_, &info, nullptr, &area.buffer) != VK_SUCCESS) return false;
+    const auto destroy_buffer = fn<PFN_vkDestroyBuffer>("vkDestroyBuffer");
+    const auto free_memory = fn<PFN_vkFreeMemory>("vkFreeMemory");
+    const auto cleanup = [&] {
+        if (area.buffer && destroy_buffer) destroy_buffer(device_, area.buffer, nullptr);
+        if (area.memory && free_memory) free_memory(device_, area.memory, nullptr);
+        area.buffer = VK_NULL_HANDLE;
+        area.memory = VK_NULL_HANDLE;
+    };
     VkMemoryRequirements requirements{};
     requirements_fn(device_, area.buffer, &requirements);
     VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
@@ -371,16 +390,23 @@ inline bool IndirectArgumentClamp::make_area() {
         }
         bound = bind_fn(device_, area.buffer, area.memory, 0) == VK_SUCCESS;
         if (bound) break;
+        if (free_memory) free_memory(device_, area.memory, nullptr);
+        area.memory = VK_NULL_HANDLE;
     }
     if (!bound || map_fn(device_, area.memory, 0, info.size, 0, reinterpret_cast<void**>(&area.host)) != VK_SUCCESS) {
-        const auto destroy_buffer = fn<PFN_vkDestroyBuffer>("vkDestroyBuffer");
-        const auto free_memory = fn<PFN_vkFreeMemory>("vkFreeMemory");
-        if (area.buffer && destroy_buffer) destroy_buffer(device_, area.buffer, nullptr);
-        if (area.memory && free_memory) free_memory(device_, area.memory, nullptr);
+        cleanup();
         return false;
     }
     std::memset(area.host, 0, size_t(info.size));
-    for (std::uint32_t i = 0; i < area.slots; ++i) free_slots_.push_back({std::uint32_t(areas_.size()), i});
+    try {
+        free_slots_.reserve(free_slots_.size() + area.slots);
+        areas_.reserve(areas_.size() + 1);
+    } catch (...) {
+        cleanup();
+        throw;
+    }
+    const auto area_index = std::uint32_t(areas_.size());
+    for (std::uint32_t i = 0; i < area.slots; ++i) free_slots_.push_back({area_index, i});
     areas_.push_back(area);
     return true;
 }
@@ -408,12 +434,15 @@ inline void IndirectArgumentClamp::release(std::vector<Slot>& slots, bool read) 
         for (const Slot& slot : slots) {
             if (read && slot.area < areas_.size() && slot.index < areas_[slot.area].slots) {
                 const HostArea& area = areas_[slot.area];
-                const std::uint32_t* words =
-                    reinterpret_cast<const std::uint32_t*>(area.host + std::size_t(slot.index) * HostArea::slot_bytes);
+                auto* words =
+                    reinterpret_cast<std::uint32_t*>(area.host + std::size_t(slot.index) * HostArea::slot_bytes);
                 delta.records_clamped += words[0];
                 delta.counts_clamped += words[1];
                 delta.over_budget += words[2];
                 delta.zeroed += words[3];
+                // Clear after reading so a later aborted batch that reuses this slot without submitting never
+                // double-counts a previous submission's counters.
+                std::memset(words, 0, 4 * sizeof(std::uint32_t));
             }
             free_slots_.push_back(slot);
         }
@@ -461,8 +490,9 @@ inline bool IndirectArgumentClamp::prepare(VkBuffer arguments, VkDeviceSize argu
                                            std::uint32_t max_count, Slot slot, ClampedIndirect& out) {
     out = {};
     const std::uint32_t record_size = indirect_clamp_record_size(kind);
-    if (kind > indirect_clamp_mesh || !arguments || !max_count || stride < record_size || stride % 4) {
-        fallback("an argument stride this pass does not handle");
+    if (kind > indirect_clamp_mesh || !arguments || !max_count || stride < record_size || stride % 4 ||
+        (argument_offset % 4) != 0 || (count && (count_offset % 4) != 0)) {
+        fallback("an argument stride or offset this pass does not handle");
         return false;
     }
     const VkDeviceSize records_bytes = VkDeviceSize(max_count) * record_size;
@@ -514,10 +544,10 @@ inline bool IndirectArgumentClamp::prepare(VkBuffer arguments, VkDeviceSize argu
     out.stats = address + stats_scratch;
     out.list_budget = out.stats + 4 * sizeof(std::uint32_t);
     out.stats_scratch_offset = offset + stats_scratch;
-    out.stats_buffer = slot.area == no_slot ? VK_NULL_HANDLE : areas_[slot.area].buffer;  // no_slot: no copy-back
     out.stats_offset = slot.area == no_slot ? 0 : VkDeviceSize(slot.index) * HostArea::slot_bytes;
     {
         std::lock_guard lock(mutex_);
+        out.stats_buffer = slot.area == no_slot ? VK_NULL_HANDLE : areas_[slot.area].buffer;  // no_slot: no copy-back
         ++counters_.calls;
         counters_.records += max_count;
     }

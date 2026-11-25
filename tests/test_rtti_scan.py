@@ -371,6 +371,23 @@ class RttiScanCoreTest(unittest.TestCase):
         struct.pack_into("<I", pe, section_virtual_size, 0x208)
         self.assertEqual(rtti_scan.scan_pe64_rtti(pe)["vtables"][0]["slots"], 2)
 
+    def test_col_pointer_in_the_last_qword_of_a_section_is_scanned(self):
+        rdata = bytearray(0x1000)
+        rdata[0x10:0x1D] = b".?AVProbe@@\x00\x00"
+        struct.pack_into("<6I", rdata, 0x40, 1, 0, 0, 0x2000, 0, 0x2040)
+        # The COL pointer fills the last aligned 8 bytes of .rdata (VirtualSize 0x200): a vtable with no slot
+        # inside the section.
+        struct.pack_into("<Q", rdata, 0x1F8, self.image_base + 0x2040)
+        pe = bytearray(make_synthetic_pe(rdata_bytes=rdata))
+        section_virtual_size = 0x80 + 24 + 240 + 40 + 8
+        struct.pack_into("<I", pe, section_virtual_size, 0x200)
+        vtables = rtti_scan.scan_pe64_rtti(pe)["vtables"]
+        self.assertEqual(vtables, [{"rva": 0x2200, "class": "Probe", "offset_in_object": 0, "slots": 0}])
+
+        # One byte less and the pointer no longer fits in the section.
+        struct.pack_into("<I", pe, section_virtual_size, 0x1FF)
+        self.assertEqual(rtti_scan.scan_pe64_rtti(pe)["vtables"], [])
+
     def test_col_validation_rejects_corrupted_locators(self):
         rdata = bytearray(0x1000)
 

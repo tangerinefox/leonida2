@@ -5,6 +5,9 @@
 stream passes when its bytes form exactly one tree under that reading:
 
 * header: the dehydrated flag is set, and the leaf records and the box groups fit in the declared structure;
+* parent table (not shipped): the bytes from the header end to `offsetToElements` are zero; `offsetToParents` is
+  `0x40 - (((offsetToNodes - offsetToElements) / 16) & ~127)`, and with a box root `offsetToElements` is the end of
+  one entry per box unit (BOX16 one, BOX32 two) from the first box node's entry, rounded up to 128;
 * level table: the last word is the level count; before it, the level ends are in order, a multiple of the node
   size apart, and end before the table;
 * groups: every group's node words, child pointers and stored values fit in the bytes its nodes occupy;
@@ -68,6 +71,24 @@ def _valid_order_table():
 
 
 VALID_ORDER = _valid_order_table()
+
+
+def parent_table(offset_to_elements, offset_to_nodes):
+    """(offsetToParents, first box entry) the console builder writes (docs/bvh.md §3.1).
+
+    The entry for unit u is at offsetToParents + 4 * (u - offsetToElements / 64). The element units' entries take
+    4 bytes each, (offsetToNodes - offsetToElements) / 16 in all; their whole 128-byte blocks fall below the header
+    end, so the first box node's entry lands in [0x40, 0xc0). The first value is the u32 the header holds, the
+    second a signed offset from the header.
+    """
+    leaf_bytes = (offset_to_nodes - offset_to_elements) >> 4
+    start = 0x40 - (leaf_bytes & ~127)
+    return start & R.M32, start + leaf_bytes
+
+
+def elements_after_parents(first_box_entry, box_units):
+    """offsetToElements: the end of the box nodes' entries (one per 64-byte box unit) rounded up to 128."""
+    return (first_box_entry + 4 * box_units + 127) & ~127
 
 
 def mapped_bounds(hdr):
@@ -135,6 +156,16 @@ def check_stream(buf, at=0):
         return res
     if n and elements + 64 * n > nodes:
         res.fail("leaves_overlap_nodes")
+    # Parent table (docs/bvh.md §3.1): not shipped, so the bytes from the header end to the elements are zero, and
+    # offsetToParents follows from the element region alone.
+    first_entry = None
+    if nodes >= elements:
+        want, first_entry = parent_table(elements, nodes)
+        if hdr.offset_to_parents != want:
+            res.fail("parent_offset")
+    area = src[64:elements]
+    if area.count(0) != len(area):
+        res.fail("parent_area_nonzero")
     remaining, chunk = n, 0
     while remaining > 0:
         c = min(R.LEAVES_PER_CHUNK, remaining)
@@ -187,6 +218,9 @@ def check_stream(buf, at=0):
             runs.append((level, wide, first, count, nid))
             nid += count
     st["box_nodes"] += nid
+    box_units = sum(count * (2 if wide else 1) for _, wide, _, count, _ in runs)
+    if first_entry is not None and elements != elements_after_parents(first_entry, box_units):
+        res.fail("parent_extent")
     if hdr.root not in node_of:
         res.fail("root_not_a_node")
         return res

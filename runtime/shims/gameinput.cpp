@@ -52,6 +52,7 @@
 
 #include "gameinput.h"
 #include "gameinput_abi.h"
+#include "gameinput_script.h"
 #include "shims.h"
 
 using namespace gi;
@@ -132,18 +133,30 @@ const rt::gameinput::HapticApi& haptics() { return *g_haptic_api.load(); }
 
 // ---- configuration ----------------------------------------------------------------------------------------------
 
-std::string env(const char* name) {
-    // Any length: an input script (LEONIDA_INPUT_SCRIPT) is easily longer than a fixed buffer, and a value that did
-    // not fit used to read as unset.
-    const DWORD need = GetEnvironmentVariableA(name, nullptr, 0);  // with the terminator
-    if (need == 0) return {};
-    std::string s(need, '\0');
-    const DWORD n = GetEnvironmentVariableA(name, s.data(), need);
-    if (n == 0 || n >= need) return {};
-    s.resize(n);
-    for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    return s;
+std::string env(const char* name) { return rt::gameinput::script::env_lower(name); }
+
+// The script's button numbers are SDL's (gameinput_script.h shares them with the shim built without SDL3).
+constexpr bool script_buttons_match_sdl() {
+    const struct {
+        uint32_t bit;
+        SDL_GamepadButton sdl;
+    } expected[] = {{GameInputGamepadA, SDL_GAMEPAD_BUTTON_SOUTH},          {GameInputGamepadB, SDL_GAMEPAD_BUTTON_EAST},
+                    {GameInputGamepadX, SDL_GAMEPAD_BUTTON_WEST},           {GameInputGamepadY, SDL_GAMEPAD_BUTTON_NORTH},
+                    {GameInputGamepadMenu, SDL_GAMEPAD_BUTTON_START},       {GameInputGamepadView, SDL_GAMEPAD_BUTTON_BACK},
+                    {GameInputGamepadLeftShoulder, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER},
+                    {GameInputGamepadRightShoulder, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER},
+                    {GameInputGamepadDPadUp, SDL_GAMEPAD_BUTTON_DPAD_UP},   {GameInputGamepadDPadDown, SDL_GAMEPAD_BUTTON_DPAD_DOWN},
+                    {GameInputGamepadDPadLeft, SDL_GAMEPAD_BUTTON_DPAD_LEFT},
+                    {GameInputGamepadDPadRight, SDL_GAMEPAD_BUTTON_DPAD_RIGHT}};
+    if (std::size(expected) != std::size(rt::gameinput::script::kButtons)) return false;
+    for (const auto& e : expected) {
+        bool found = false;
+        for (const auto& b : rt::gameinput::script::kButtons) found |= b.bit == e.bit && b.sdl == e.sdl;
+        if (!found) return false;
+    }
+    return true;
 }
+static_assert(script_buttons_match_sdl(), "gameinput_script.h's SDL button numbers drifted from SDL_GamepadButton");
 
 rt::gameinput::Config read_config() {
     rt::gameinput::Config c;
@@ -1103,30 +1116,7 @@ Snapshot read_pad(Device* d) {
         }
     }
 
-    // UI navigation derived from the gamepad (VERIFY against the console's own mapping).
-    const uint32_t b = s.gamepad.buttons;
-    const float t = 0.5f;
-    uint32_t& u = s.ui;
-    if (b & GameInputGamepadMenu) u |= GameInputUiNavigationMenu;
-    if (b & GameInputGamepadView) u |= GameInputUiNavigationView;
-    if (b & GameInputGamepadA) u |= GameInputUiNavigationAccept;
-    if (b & GameInputGamepadB) u |= GameInputUiNavigationCancel;
-    if (b & GameInputGamepadX) u |= GameInputUiNavigationContext1;
-    if (b & GameInputGamepadY) u |= GameInputUiNavigationContext2;
-    if (b & GameInputGamepadLeftThumbstick) u |= GameInputUiNavigationContext3;
-    if (b & GameInputGamepadRightThumbstick) u |= GameInputUiNavigationContext4;
-    if ((b & GameInputGamepadDPadUp) || s.gamepad.leftThumbstickY > t) u |= GameInputUiNavigationUp;
-    if ((b & GameInputGamepadDPadDown) || s.gamepad.leftThumbstickY < -t) u |= GameInputUiNavigationDown;
-    if ((b & GameInputGamepadDPadLeft) || s.gamepad.leftThumbstickX < -t) u |= GameInputUiNavigationLeft;
-    if ((b & GameInputGamepadDPadRight) || s.gamepad.leftThumbstickX > t) u |= GameInputUiNavigationRight;
-    if (b & GameInputGamepadLeftShoulder) u |= GameInputUiNavigationPageLeft;
-    if (b & GameInputGamepadRightShoulder) u |= GameInputUiNavigationPageRight;
-    if (s.gamepad.leftTrigger > t) u |= GameInputUiNavigationPageUp;
-    if (s.gamepad.rightTrigger > t) u |= GameInputUiNavigationPageDown;
-    if (s.gamepad.rightThumbstickY > t) u |= GameInputUiNavigationScrollUp;
-    if (s.gamepad.rightThumbstickY < -t) u |= GameInputUiNavigationScrollDown;
-    if (s.gamepad.rightThumbstickX < -t) u |= GameInputUiNavigationScrollLeft;
-    if (s.gamepad.rightThumbstickX > t) u |= GameInputUiNavigationScrollRight;
+    s.ui = rt::gameinput::script::ui_navigation(s.gamepad);
     return s;
 }
 
@@ -1897,80 +1887,29 @@ void update_keyboard_pad() {
     for (const auto& b : kKeyBindings) SDL_SetJoystickVirtualButton(g_keyboard.js, b.sdl_button, down[b.sdl_button]);
     // LEONIDA_INPUT_SCRIPT="a@70,a@85,start@120" (with LEONIDA_KEYBOARD_PAD=always): timed presses on the keyboard
     // pad, in seconds since the pad's first update, each held 300 ms. For unattended boots: the title's first prompt
-    // waits for a button with no timeout (docs/re/notes/firstframe.md, step 5). Buttons: a b x y start back lb rb
-    // up down left right. The rsup and rsdown entries replay the right-stick throws logged below.
+    // waits for a button with no timeout (docs/re/notes/firstframe.md, step 5). The parser, the timeline and the
+    // button names are gameinput_script.h's, shared with the scripted pad of a build without SDL3.
+    namespace script = rt::gameinput::script;
     int right_y = g_keyboard.right_y;
-    struct ScriptedPress {
-        SDL_GamepadButton button;
-        double at;
-        int right_y = 0;
-    };
-    static const std::vector<ScriptedPress> script = [] {
-        std::vector<ScriptedPress> out;
-        static const std::pair<const char*, SDL_GamepadButton> names[] = {
-            {"a", SDL_GAMEPAD_BUTTON_SOUTH},        {"b", SDL_GAMEPAD_BUTTON_EAST},
-            {"x", SDL_GAMEPAD_BUTTON_WEST},         {"y", SDL_GAMEPAD_BUTTON_NORTH},
-            {"start", SDL_GAMEPAD_BUTTON_START},    {"back", SDL_GAMEPAD_BUTTON_BACK},
-            {"lb", SDL_GAMEPAD_BUTTON_LEFT_SHOULDER}, {"rb", SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER},
-            {"up", SDL_GAMEPAD_BUTTON_DPAD_UP},     {"down", SDL_GAMEPAD_BUTTON_DPAD_DOWN},
-            {"left", SDL_GAMEPAD_BUTTON_DPAD_LEFT}, {"right", SDL_GAMEPAD_BUTTON_DPAD_RIGHT}};
-        const std::string text = env("LEONIDA_INPUT_SCRIPT");
-        if (text.empty()) return out;
-        constexpr char whitespace[] = " \t\r\n\f\v";
-        size_t items = 0;
-        for (size_t at = 0, end; at <= text.size(); at = end + 1) {
-            ++items;
-            end = std::min(text.find(',', at), text.size());
-            const std::string item = text.substr(at, end - at);
-            const size_t first = item.find_first_not_of(whitespace);
-            const size_t sep = item.find('@');
-            if (sep == std::string::npos || first >= sep) continue;
-            const char* time = item.c_str() + sep + 1;
-            char* tail;
-            const double seconds = std::strtod(time, &tail);
-            if (tail == time || !std::isfinite(seconds) || seconds < 0 ||
-                item.find_first_not_of(whitespace, tail - item.c_str()) != std::string::npos) continue;
-            if (item.compare(first, sep - first, "rsup") == 0 || item.compare(first, sep - first, "rsdown") == 0) {
-                const bool up = item.compare(first, sep - first, "rsup") == 0;
-                out.push_back({SDL_GAMEPAD_BUTTON_INVALID, seconds, up ? -kStickFull : kStickFull});
-                continue;
-            }
-            for (const auto& [name, button] : names) {
-                if (item.compare(first, sep - first, name) == 0) {
-                    out.push_back({button, seconds});
-                    break;
-                }
-            }
-        }
-        std::fprintf(stderr, "[rt] gameinput: LEONIDA_INPUT_SCRIPT: %zu scripted press(es), %zu rejected\n",
-                     out.size(), items - out.size());
-        return out;
+    static const script::Script scripted = [] {
+        script::Script s = script::parse(env("LEONIDA_INPUT_SCRIPT"));
+        if (!s.empty() || s.rejected)
+            std::fprintf(stderr, "[rt] gameinput: LEONIDA_INPUT_SCRIPT: %zu scripted press(es), %zu rejected\n",
+                         s.presses.size(), s.rejected);
+        return s;
     }();
-    if (!script.empty()) {
+    if (!scripted.empty()) {
         static const ULONGLONG origin = GetTickCount64();
         const double now = (GetTickCount64() - origin) / 1000.0;
-        // One decision per button: a later entry for the same button must not release what an earlier entry holds
-        // (it did: with several entries only the last one ever reached the title).
-        bool scripted[SDL_GAMEPAD_BUTTON_COUNT] = {};
-        bool named[SDL_GAMEPAD_BUTTON_COUNT] = {};
-        for (const auto& press : script) {
-            const bool held = now >= press.at && now < press.at + 0.3;
-            if (press.right_y) {
-                if (held) right_y = press.right_y;
-            } else {
-                named[press.button] = true;
-                scripted[press.button] |= held;
-            }
+        const script::Held held = script::held_at(scripted, now);
+        if (held.stick) right_y = held.stick > 0 ? -kStickFull : kStickFull;  // SDL's +Y is down
+        for (const script::Button& b : script::kButtons) {
+            if (!(scripted.named & b.bit)) continue;
+            const auto button = static_cast<SDL_GamepadButton>(b.sdl);
+            SDL_SetJoystickVirtualButton(g_keyboard.js, button, (held.buttons & b.bit) || down[button]);
         }
-        for (int button = 0; button < SDL_GAMEPAD_BUTTON_COUNT; ++button) {
-            if (!named[button]) continue;
-            SDL_SetJoystickVirtualButton(g_keyboard.js, static_cast<SDL_GamepadButton>(button),
-                                         scripted[button] || down[button]);
-            static bool was[SDL_GAMEPAD_BUTTON_COUNT] = {};
-            if (scripted[button] && !was[button])
-                std::fprintf(stderr, "[rt] gameinput: scripted press of button %d at %.1f s\n", button, now);
-            was[button] = scripted[button];
-        }
+        static uint32_t was = 0;
+        script::log_scripted(held.buttons, &was, now);
     }
     const int reach = lx && ly ? kStickDiagonal : kStickFull;
     SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_LEFTX, static_cast<Sint16>(lx * reach));
@@ -2053,26 +1992,10 @@ void poll_once() {
         {
             static const bool log_presses = env("LEONIDA_INPUT_LOG") != "0";
             static const ULONGLONG log_origin = GetTickCount64();
-            if (log_presses) {
-                static const std::pair<uint32_t, const char*> kNames[] = {
-                    {GameInputGamepadA, "a"},  {GameInputGamepadB, "b"},
-                    {GameInputGamepadX, "x"},  {GameInputGamepadY, "y"},
-                    {GameInputGamepadMenu, "start"},  {GameInputGamepadView, "back"},
-                    {GameInputGamepadLeftShoulder, "lb"},  {GameInputGamepadRightShoulder, "rb"},
-                    {GameInputGamepadDPadUp, "up"},  {GameInputGamepadDPadDown, "down"},
-                    {GameInputGamepadDPadLeft, "left"},  {GameInputGamepadDPadRight, "right"}};
-                const double at = (GetTickCount64() - log_origin) / 1000.0;
-                const uint32_t pressed = snap.gamepad.buttons & ~d->last_snap.gamepad.buttons;
-                for (const auto& n : kNames)
-                    if (pressed & n.first)
-                        std::fprintf(stderr, "[rt] gameinput: press %s@%.1f (%s)\n", n.second, at, d->name.c_str());
-                const auto throw_of = [](float y) { return y > 0.6f ? 1 : y < -0.6f ? -1 : 0; };
-                const int was = throw_of(d->last_snap.gamepad.rightThumbstickY);
-                const int is = throw_of(snap.gamepad.rightThumbstickY);
-                if (is != was && is != 0)
-                    std::fprintf(stderr, "[rt] gameinput: press %s@%.1f (%s)\n", is > 0 ? "rsup" : "rsdown", at,
-                                 d->name.c_str());
-            }
+            if (log_presses)
+                rt::gameinput::script::log_presses(snap.gamepad.buttons & ~d->last_snap.gamepad.buttons,
+                                                   d->last_snap.gamepad.rightThumbstickY, snap.gamepad.rightThumbstickY,
+                                                   (GetTickCount64() - log_origin) / 1000.0, d->name.c_str());
         }
         d->last_snap = snap;
         // A newly opened pad's first sample here is its baseline (active_input.h), so connecting a pad with a button

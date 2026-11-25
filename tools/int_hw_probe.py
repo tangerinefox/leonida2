@@ -57,7 +57,9 @@ for p in (HERE, os.path.join(ROOT, "tests", "semantic")):
         sys.path.insert(0, p)
 
 import rdna2spirv  # noqa: E402
+import replace_retry  # noqa: E402
 import spirv_mini_interp  # noqa: E402
+from file_mode import published_mode  # noqa: E402
 
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
 SENTINEL = 0x5A5A5A5A
@@ -877,6 +879,8 @@ def _validate_json_out(raw_path):
     """Validate --json output path before running translator/hardware cases; return (abs_path, err_msg)."""
     if not raw_path.strip():
         return None, "ERROR: --json path must not be empty"
+    if raw_path.endswith(os.sep) or (os.altsep and raw_path.endswith(os.altsep)):
+        return None, f"ERROR: --json path must name a file, not a directory: {raw_path}"
     out_path = os.path.abspath(raw_path)
     if os.path.isdir(out_path):
         return None, f"ERROR: --json path is a directory: {out_path}"
@@ -891,6 +895,34 @@ def _validate_json_out(raw_path):
             break
         cur = parent
     return out_path, None
+
+
+def _write_json_atomic(path, payload):
+    dest = os.path.realpath(path)
+    parent = os.path.dirname(dest)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=parent or ".", prefix=".int-hw-probe-", suffix=".tmp")
+    try:
+        try:
+            f = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
+        except BaseException:
+            os.close(fd)
+            raise
+        with f:
+            json.dump(payload, f, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, published_mode(dest))
+        replace_retry.replace(tmp, dest)
+    except BaseException:
+        try:
+            os.chmod(tmp, 0o600)
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def main(argv=None):
@@ -993,12 +1025,7 @@ def main(argv=None):
 
     if out_path is not None:
         try:
-            parent = os.path.dirname(out_path)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            with open(out_path, "w", encoding="utf-8", newline="\n") as f:
-                json.dump({"device": hw_device, "waves": list(waves), "cases": records}, f, indent=2)
-                f.write("\n")
+            _write_json_atomic(out_path, {"device": hw_device, "waves": list(waves), "cases": records})
         except OSError as e:
             print(f"ERROR: failed to write --json {out_path}: {e}", file=sys.stderr)
             return 2

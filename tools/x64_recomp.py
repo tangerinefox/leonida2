@@ -153,6 +153,9 @@ for _i in range(16):
     PRIMARY[0x70 + _i] = ("jcc", "Jb")
 for _i in range(1, 8):
     PRIMARY[0x90 + _i] = ("xchg", "Oq Oq")
+# 0x90 is handled below as NOP, PAUSE, or XCHG r8, RAX when REX.B is set.
+# Keep it in the table so that special case is reached by the decoder.
+PRIMARY[0x90] = ("nop", "")
 for _i in range(8):
     PRIMARY[0xD8 + _i] = ("x87", "E")
 
@@ -361,6 +364,9 @@ def _finish(buf, pos, end, ins, start, mnem, opspec, state, addr, opcode_byte):
             ops.append(("a", addr + pos + v, 0))
         elif t == "A":
             ops.append(("r", 0, _size_of(s, opsize, rexw)))
+        elif t == "R":
+            # Fixed RAX operand, unaffected by REX.B.
+            ops.append(("r", 0, _size_of(s, opsize, rexw), False))
         elif t == "c":
             ops.append(("r", 1, 1))
         elif t == "1":
@@ -601,7 +607,9 @@ def decode_one(buf, pos, end, addr):
         mnem, opspec = spec
         if op == 0x90:
             if rexb:
-                mnem, opspec = "xchg", "Oq Oq"
+                # The opcode-embedded register is extended by REX.B; RAX is
+                # the fixed accumulator operand and must not be extended.
+                mnem, opspec = "xchg", "Oq Rq"
             else:
                 mnem, opspec = ("pause" if rep == "f3" else "nop"), ""
 

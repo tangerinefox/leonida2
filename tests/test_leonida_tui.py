@@ -4,6 +4,7 @@
 """
 import ctypes
 import os
+import io
 import sys
 import tempfile
 import unittest
@@ -441,6 +442,52 @@ class SetupDefaultsTest(unittest.TestCase):
             cfg = leonida_tui.run_setup(4, default_overlap=True)
         self.assertEqual(cfg.jobs, 3)
         self.assertFalse(cfg.overlap)
+
+
+
+class UnexpectedStageExceptionTest(unittest.TestCase):
+    """A stage that raises outright (not through fail()) must still print a stage + exception
+    diagnostic once, in both overlap modes; the failure itself surfaces as before."""
+
+    def _run(self, overlap):
+        def boom(*a, **k):
+            raise PermissionError(13, "Permission denied", "synthetic-output")
+
+        err = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            game = os.path.join(tmp, "g")
+            out = os.path.join(tmp, "o")
+            work = os.path.join(tmp, "w")
+            os.makedirs(game)
+            with mock.patch.object(make_game, "shaders", side_effect=boom), \
+                    mock.patch.object(make_game, "assets"), \
+                    mock.patch.object(make_game, "runtime"), \
+                    mock.patch.object(make_game, "pipelines"), \
+                    mock.patch.object(make_game, "log"), \
+                    mock.patch.object(make_game, "pipeline_check_exe", return_value="x"), \
+                    mock.patch.object(make_game.sys, "stderr", err), \
+                    self.assertRaises(SystemExit) as ctx:
+                make_game.run_build_stages(
+                    ["shaders", "assets", "runtime", "pipelines"],
+                    game=game, work=work, out=out, v={}, wav=False, jobs=2,
+                    runtime_build=None, emulate=False, keep_emulated=True, fallbacks=(),
+                    overlap=overlap)
+        return ctx.exception.code, err.getvalue()
+
+    def test_overlap_false_reports_stage_and_exception(self):
+        code, err = self._run(overlap=False)
+        self.assertEqual(code, 1)
+        self.assertIn("shaders", err)
+        self.assertIn("PermissionError", err)
+        self.assertEqual(err.count("failed with an unexpected exception"), 1)
+
+    def test_overlap_true_reports_stage_and_exception(self):
+        code, err = self._run(overlap=True)
+        self.assertEqual(code, 1)
+        self.assertIn("shaders", err)
+        self.assertIn("PermissionError", err)
+        # wait() and the final drain must not report the same stage twice
+        self.assertEqual(err.count("failed with an unexpected exception"), 1)
 
 
 if __name__ == "__main__":

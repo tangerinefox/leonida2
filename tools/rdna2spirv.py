@@ -420,6 +420,7 @@ class Gen:
                                   # single defining plain v_mov of it); valid I/J sources (SHADER-177)
         self.blocks = []      # per basic block: list of SPIR-V lines (dispatch-loop form), empty = straight-line
         self.succ = []        # per basic block: the blocks it can go to next (none = the program ends there)
+        self.out_pcs = None   # per basic block: exact set of %pc values written (including cfg_structure.END)
         self.desc_fn = None   # lines of the descriptor-lookup function, once an instruction needs it
         self.tbuffer_norm_fns: dict[int, list[str]] = {}  # one exact quotient per used magnitude width
         self.fmt_fn = None    # lines of the typed-buffer format-decode function, once a dynamic-format load needs it
@@ -5575,6 +5576,27 @@ class Gen:
         self.emit(f"{v} = OpLoad %uint {p}")
         return v
 
+    def x_lane_word(self, idx, lane):
+        """The data slot `idx` of lane `lane` (0-63) of this wave, read in an exchange. A lane of a partial last wave
+        that doesn't exist reads as 0 (as a source that isn't running does for ds_swizzle / ds_bpermute on the
+        hardware): the value is selected by the lane's place in the workgroup, not left to the zeroed slot, because
+        RADV (Mesa 26.3.1) turns a store, barrier and load of another lane's slot into a subgroup swizzle that
+        fetches the missing lane's register instead. Full waves read the slot as before."""
+        v = self.x_word(idx)
+        size = (self.cs or self.ms)["size"]
+        threads = size[0] * size[1] * size[2]
+        if threads >= self.x_lanes:
+            return v
+        if self.x_lanes == 64:
+            at = lane
+        else:
+            at = self.tmp()
+            self.emit(f"{at} = OpIAdd %uint %x_wbase {lane}")
+        ok, r = self.tmp(), self.tmp()
+        self.emit(f"{ok} = OpULessThan %bool {at} {self.cu(threads)}")
+        self.emit(f"{r} = OpSelect %uint {ok} {v} {self.cu(0)}")
+        return r
+
     def x_mask_slot(self, it):
         """Index of the wave's first mask word in the slot of round `it`."""
         s, a, b, c = (self.tmp() for _ in range(4))
@@ -5720,11 +5742,11 @@ class Gen:
                     if w == 1:
                         j = self.tmp()
                         self.emit(f"{j} = OpIAdd %uint {data_base} {lane}")
-                        return self.x_word(j)
+                        return self.x_lane_word(j, lane)
                     i, j = self.tmp(), self.tmp()
                     self.emit(f"{i} = OpIAdd %uint {data_base} %x_wbase")
                     self.emit(f"{j} = OpIAdd %uint {i} {lane}")
-                    return self.x_word(j)
+                    return self.x_lane_word(j, lane)
                 return read, None
             if data is None and bits is not None and bits[0] is not None and bits[1] is None:
                 fn = self._ensure_x_pre_fn("vote")
@@ -5769,11 +5791,11 @@ class Gen:
                 if w == 1:
                     j = self.tmp()
                     self.emit(f"{j} = OpIAdd %uint {base} {lane}")
-                    return self.x_word(j)
+                    return self.x_lane_word(j, lane)
                 i, j = self.tmp(), self.tmp()
                 self.emit(f"{i} = OpIAdd %uint {base} %x_wbase")
                 self.emit(f"{j} = OpIAdd %uint {i} {lane}")
-                return self.x_word(j)
+                return self.x_lane_word(j, lane)
             return read, res
         it = self.tmp()
         self.emit(f"{it} = OpLoad %uint %x_it")
@@ -5811,7 +5833,7 @@ class Gen:
             self.emit(f"{i} = OpIAdd %uint {base} %x_wbase")
             j = self.tmp()
             self.emit(f"{j} = OpIAdd %uint {i} {lane}")
-            return self.x_word(j)
+            return self.x_lane_word(j, lane)
         return read, res
 
     def x_memory_order(self, op):
@@ -7350,7 +7372,10 @@ class Gen:
         if args[1].get("sext"):
             raise Unsupported("DPP sext")
         src = args[1]
-        src_val = self.src_u(src)    # neg/abs are lane-uniform, so before or after the shuffle is the same
+        raw_src = dict(src)
+        raw_src.pop("neg", None)
+        raw_src.pop("abs", None)
+        src_val = self.src_u(raw_src)
 
         lane = self.wave_lane()
         group_bits = 7 if dpp8 is not None else 15
@@ -7521,6 +7546,7 @@ class Gen:
         zero = self.cu(0)
         src0 = self.tmp()
         self.emit(f"{src0} = OpSelect %uint {src_ok} {shuffled} {zero}")
+        src0 = self.modify(src0, src)
         if dpp8 is not None or bound:
             write = enabled
         else:
@@ -16505,7 +16531,7 @@ def assemble(gen):
         helpers.extend(function)
     for function in gen.x_round_fns.values():
         helpers.extend(function)
-    tree, nesting = (capped_tree(gen.succ) if gen.blocks and not gen.emulate and not gen.bar_rounds
+    tree, nesting = (capped_tree(gen.succ, gen.out_pcs) if gen.blocks and not gen.emulate and not gen.bar_rounds
                      else (None, None))
     if nesting is not None:
         gen.nesting = nesting
@@ -17546,6 +17572,110 @@ def restore_mix_inline_literal(ins, raw, literal):
     ins["enc"] = raw.hex()
 
 
+def skipped_form(ins, blob, at):
+    """Whether rdna2_decode's instruction at blob offset ``at`` is one of the forms llvm-mc skips that
+    restore_vcc_tuples takes from the blob: a tuple that reaches vcc (SGPRs 106 and 107), a VOPC f32 compare in DPP
+    form (docs/design.md, "DPP on a VOPC compare"), or the measured v_dot4_i32_i8 with op_sel 2 / op_sel_hi 5 and no
+    clamp or neg, all reserved bits clear (tedin7, upstream PR #281; docs/fspx.md). shader_disasm.py prints the last
+    two itself; this covers a listing made without that pass (#984)."""
+    op = ins["op"]
+    if op.startswith("v_cmp_") and op.endswith("_f32_dpp"):
+        return True
+    if op == "v_dot4_i32_i8" and int.from_bytes(blob[at:at + 4], "little") >> 8 == 0xCC1650 and blob[at + 7] >> 3 == 1:
+        return True
+    return any(a["k"] == "slist" and ("vcc_lo" in a["r"] or "vcc_hi" in a["r"]) for a in ins["args"])
+
+
+def restore_vcc_tuples(insns, blob, code_start, code_end, wave32=True):
+    """Decode from the blob the instructions llvm-mc rejects because a scalar tuple runs into vcc.
+
+    SGPRs 106 and 107 are vcc, and llvm-mc refuses to print a tuple that crosses into them (s_buffer_load_dwordx8 into
+    s[100:107], a buffer resource in s[104:107]): it skips the first word as invalid and then prints the second word
+    as an instruction of its own, one that is junk or does not match the blob (docs/shader_library.md section 5).
+    The pure-Python decoder reads such a word as a VCCTuple list, [s100,...,s105,vcc_lo,vcc_hi], the form the
+    translator takes for these instructions. Only uncovered offsets reached from code_start by fall-through or
+    branches (including folded far branches) are offered to it, so unreachable embedded data words skipped by a
+    branch or after s_endpgm are never decoded across a following branch target; the instruction is used only if
+    its operands hold such a list and no reachable branch targets its interior dwords. Instructions printed inside
+    the words of a restored one are dropped. The instructions already carry their blob offsets in "pc"; returns
+    the list sorted by it.
+
+    The junk can be longer than the second word it starts at, and then it also swallows the instruction after the
+    tuple, which no printed instruction covers once the junk is dropped. The words after a restored instruction are
+    therefore decoded the same way until the stream is back at an instruction llvm-mc printed there. A word that
+    llvm-mc itself rejected, inside no printed instruction, is not one of those and stays undecodable. wave32 is the
+    shader's wave size: a swallowed VOP3 compare writes one SGPR in wave32 and a pair in wave64."""
+    import rdna2_decode
+    printed, covered, starts = set(), set(), set()
+    unplaced = None    # the pc of the first junk since an instruction that matched the blob
+    for ins in insns:
+        if ins.get("normalized"):
+            # Its pc is a lower bound: the word llvm-mc rejected before it was not counted.
+            unplaced = ins["pc"] if unplaced is None else unplaced
+            continue
+        if unplaced is not None:
+            printed.update(range(unplaced, ins["pc"], 4))
+            unplaced = None
+        words = range(ins["pc"], ins["pc"] + len(ins["enc"]) // 2, 4)
+        printed.update(words)
+        starts.add(ins["pc"])
+        covered.update(words)
+    folded = fold_far_branches(insns)
+    by_pc = {ins["pc"]: ins for ins in folded
+             if all(o in covered for o in range(ins["pc"], ins["pc"] + len(ins["enc"]) // 2, 4))}
+    stop = min(len(blob), code_end if code_end is not None else len(blob))
+    runs, restored_covered, reachable_targets = [], set(), set()    # runs: a tuple and the instructions after it
+    seen, work = set(), [code_start]
+    while work:
+        at = work.pop()
+        run = None      # the run the previous instruction was restored into, or None after a printed one
+        while code_start <= at < stop and at not in seen:
+            ins = by_pc.get(at)
+            if ins is not None:
+                run = None
+            else:
+                # inside junk llvm-mc printed, not at a start: the words after a restored instruction are code
+                resync = run is not None and at in printed and at not in starts
+                if at in restored_covered or (at in covered and not resync):
+                    break
+                found = rdna2_decode.decode_bytes(blob[at:min(at + 20, stop)], wave32=wave32)["insns"][:1]
+                if not (found and found[0]["pc"] == 0 and (resync or skipped_form(found[0], blob, at))):
+                    break
+                ins = found[0]
+                end = at + len(ins["enc"]) // 2
+                if end > stop or any(o in restored_covered for o in range(at, end, 4)):
+                    break
+                ins["pc"] = at
+                if not resync:
+                    run = []
+                    runs.append(run)
+                run.append(ins)
+                restored_covered.update(range(at, end, 4))
+            seen.add(at)
+            op = base_op(ins["op"])
+            at += len(ins["enc"]) // 2
+            if op in BRANCHES:
+                imm = next((x for x in ins["args"] if x["k"] == "imm"), None)
+                v = (imm["v"] & 0xFFFF) if imm else 0
+                tgt = ins["target"] if "target" in ins else at + 4 * (v - 0x10000 if v & 0x8000 else v)
+                reachable_targets.add(tgt)
+                work.append(tgt)
+            # shortcut: a swallowed far branch is not followed, so a tuple only it reaches stays refused
+            if op in ("s_branch", "s_endpgm", "s_setpc_b64"):
+                break
+    restored = []
+    for run in runs:
+        for r in run:
+            if any(o in reachable_targets for o in range(r["pc"] + 4, r["pc"] + len(r["enc"]) // 2, 4)):
+                break       # not an instruction, so the words after it are not known to be code either
+            restored.append(r)
+    if not restored:
+        return insns
+    spans = [(r["pc"], r["pc"] + len(r["enc"]) // 2) for r in restored]
+    kept = [i for i in insns if not any(i["pc"] < hi and i["pc"] + len(i["enc"]) // 2 > lo for lo, hi in spans)]
+    return sorted(kept + restored, key=lambda i: i["pc"])
+
+
 def widen_wave64_masks(insns):
     """In place: the lane-mask SGPR operands of VALU instructions become the pairs they are in wave64.
 
@@ -17569,55 +17699,6 @@ def widen_wave64_masks(insns):
         for i in at:
             if i < len(a) and a[i]["k"] == "sgpr" and a[i].get("n", 1) == 1:
                 a[i] = dict(a[i], n=2)
-# Adapted from tedin7 via Andretuta, ubiquitarianism/leonida PR #327.
-def restore_skipped_instructions(insns, blob, code_start, code_end):
-    """Recover known LLVM gaps from their original instruction words.
-
-    llvm-mc rejects a tuple that reaches SGPRs 106 and 107 (s_load_dwordx8 into s[100:107], an image resource in
-    s[100:107], a buffer resource in s[104:107]): it skips the first word as invalid and then prints the second word
-    as an instruction of its own, one that is junk or does not match the blob (docs/shader_library.md section 5).
-    The pure-Python decoder reads such a word as a VCCTuple list, [s100,...,s105,vcc_lo,vcc_hi], the form the
-    translator takes for these instructions. Every blob dword in the code range that no matched instruction covers
-    is offered to it. Recover VCC tuples, DPP comparisons and the measured signed-byte dot half swap.
-    Instructions printed inside the words of a restored one are dropped. The instructions already carry
-    their blob offsets in "pc"; returns the list sorted by it."""
-    import rdna2_decode
-    covered = set()
-    for ins in insns:
-        if not ins.get("normalized"):
-            covered.update(range(ins["pc"], ins["pc"] + len(ins["enc"]) // 2, 4))
-    stop = min(len(blob), code_end if code_end is not None else len(blob))
-    restored, at = [], code_start
-    while at + 8 <= stop:
-        found = None if at in covered else rdna2_decode.decode_bytes(blob[at:min(at + 20, stop)])["insns"][:1]
-        if found and found[0]["pc"] == 0 and (
-                (found[0]["op"].startswith("v_cmp_") and found[0]["op"].endswith("_f32_dpp"))
-                # tedin7 (upstream PR #281): LLVM skips this VOP3P form. Admit only opcode 0x16,
-                # op_sel=2, op_sel_hi=5, no clamp or neg, with all reserved encoding bits clear.
-                or (found[0]["op"] == "v_dot4_i32_i8" and
-                    int.from_bytes(blob[at:at + 4], "little") >> 8 == 0xCC1650 and blob[at + 7] >> 3 == 1)
-                or any(a["k"] == "slist" and ("vcc_lo" in a["r"] or "vcc_hi" in a["r"]) for a in found[0]["args"])):
-            ins = found[0]
-            nbytes = len(ins["enc"]) // 2
-            if at + nbytes <= stop:
-                ins["pc"] = at
-                restored.append(ins)
-                at += nbytes
-                continue
-        at += 4
-    if not restored:
-        return insns
-    # Both streams are in program order. A shader can contain thousands of recovered tuples.
-    spans = iter((r["pc"], r["pc"] + len(r["enc"]) // 2) for r in restored)
-    span = next(spans, None)
-    kept = []
-    for ins in insns:
-        pc = ins["pc"]
-        while span and span[1] <= pc:
-            span = next(spans, None)
-        if not span or pc + len(ins["enc"]) // 2 <= span[0]:
-            kept.append(ins)
-    return sorted(kept + restored, key=lambda i: i["pc"])
 
 
 def output_signature(path, name):
@@ -17845,6 +17926,36 @@ def fspx_wave_size(path, name):
     return None if not isinstance(wave32, bool) else (32 if wave32 else 64)
 
 
+def fssm_wave_size(path, name):
+    """32 or 64 from the FSSM header flags, or None when the program has no FSSM blob."""
+    try:
+        with open(native_paths(path, name)[0], "rb") as f:
+            return fssm_header.wave_size(f.read(fssm_header.WAVE_FLAGS_OFFSET + 4))
+    except OSError:
+        return None
+
+
+def wave_markers(insns):
+    """The wave size the code itself shows: (strict wave64 ops, any wave64 use, any wave32 EXEC op)."""
+    w64_marks = {base_op(i["op"]) for i in insns
+                 if WAVE64_RE.search(" ".join([i["op"]] + [x.get("t", "") for x in i["args"]]))}
+    code_w64 = bool(w64_marks) or any(base_op(i["op"]).endswith("_b64") and any(x.get("t") in ("exec", "vcc")
+                                                                            for x in i["args"]) for i in insns)
+    code_w32 = any(WAVE32_RE.search(i["op"]) for i in insns)
+    return w64_marks, code_w64, code_w32
+
+
+def marker_wave64(path, name, stage, insns):
+    """Whether a program whose header and dispatch state hold no wave size is wave64, from its code."""
+    w64_marks, code_w64, code_w32 = wave_markers(insns)
+    if (stage in ("vs", "ps") and code_w64 and code_w32 and not (w64_marks - {"s_bfm_b64"})
+            and os.path.isfile(native_paths(path, name)[1]) and source_wave_size(path, name) == 32):
+        # A library program can use s_bfm_b64 as scalar data. Use the matching source's
+        # wave32 flags only when this program's own EXEC instructions corroborate them.
+        return False
+    return code_w64 or stage == "ms"    # NGG mesh shaders here are wave64 (thread = wave id * 64 + lane)
+
+
 def translate(path):
     info = parse_file(path)
     stage = stage_of(info["name"], path)
@@ -17924,7 +18035,11 @@ def translate(path):
                 ins["normalized"] = True
             ins["pc"] = at
             pos = at + len(enc)
-        insns = restore_skipped_instructions(insns, blob, info["code_start"], info.get("code_end"))
+        wave = fssm_wave_size(path, info["name"]) or fspx_wave_size(path, info["name"])
+        if wave is None:
+            matched = [i for i in insns if not i.get("normalized")]
+            wave = 64 if marker_wave64(path, info["name"], stage, matched) else 32
+        insns = restore_vcc_tuples(insns, blob, info["code_start"], info.get("code_end"), wave32=wave == 32)
         insns = fold_far_branches(insns)
         insns = reachable_code(insns, info.get("code_end"))
         if any(i.get("normalized") for i in insns):
@@ -17946,23 +18061,12 @@ def translate(path):
     g.round_mode = any(i["op"] == "s_round_mode" or
                        (i["op"].startswith("s_setreg") and "HW_REG_MODE" in i["args"][0].get("t", ""))
                        for i in insns)
-    w64_marks = {base_op(i["op"]) for i in insns
-                 if WAVE64_RE.search(" ".join([i["op"]] + [x.get("t", "") for x in i["args"]]))}
-    strict_w64 = bool(w64_marks)
-    code_w64 = strict_w64 or any(base_op(i["op"]).endswith("_b64") and any(x.get("t") in ("exec", "vcc")
-                                                                            for x in i["args"]) for i in insns)
-    code_w32 = any(WAVE32_RE.search(i["op"]) for i in insns)
+    w64_marks, code_w64, code_w32 = wave_markers(insns)
     # Authoritative wave size from the FSSM header flags at 0xD4 bit 5 (0x20 = wave32, 0 = wave64;
     # verified with 0 contradictions across all 26,503 corpus blobs). Falls back to the code-marker
     # heuristic (+ wave64 default for NGG mesh shaders) when no FSSM sidecar is present (FSPX or
     # synthetic listings).
-    fssm_path, fspx_path, _ = native_paths(path, info["name"])
-    fssm_ws = None
-    try:
-        with open(fssm_path, "rb") as f:
-            fssm_ws = fssm_header.wave_size(f.read(fssm_header.WAVE_FLAGS_OFFSET + 4))
-    except OSError:
-        pass
+    fssm_ws = fssm_wave_size(path, info["name"])
     # An FSPX program (the FidelityFX DLL's) has no FSSM header; its kind-0 dispatch state carries the wave size
     # instead (word 4 bit 20 = wave32, docs/fspx.md). Only the strict markers count against it: a _b64 op on vcc or
     # exec is not one, since these programs move vcc as an ordinary SGPR pair (s_mov_b64 vcc, s[..]) in wave32 code.
@@ -17981,13 +18085,8 @@ def translate(path):
         if fspx_ws == 64 and code_w32:
             raise Unsupported("FSPX wave64 dispatch state contradicts wave32 code")
         g.wave64 = fspx_ws == 64
-    elif (stage in ("vs", "ps") and code_w64 and code_w32 and not (w64_marks - {"s_bfm_b64"})
-          and os.path.isfile(fspx_path) and source_wave_size(path, info["name"]) == 32):
-        # A library program can use s_bfm_b64 as scalar data. Use the matching source's
-        # wave32 flags only when this program's own EXEC instructions corroborate them.
-        g.wave64 = False
     else:
-        g.wave64 = code_w64 or stage == "ms"   # NGG mesh shaders here are wave64 (thread = wave id * 64 + lane)
+        g.wave64 = marker_wave64(path, info["name"], stage, insns)
     if g.wave64:
         widen_wave64_masks(insns)
     # A wave32 program using VCC as an SMEM pointer needs both scalar words. Mark its pair producers
@@ -18298,6 +18397,7 @@ def translate(path):
                 g.cu(n)
             raw_edges = split_edges
     succ = [list(dict.fromkeys(e)) for e in raw_edges]
+    g.out_pcs = _block_out_pcs(blocks, raw_edges, succ)
     g.vm_latch = stage == "ps" and exec_changes_after_vm(blocks, succ)
     g.park_masks((blocks, succ))
     halves_analysis(g, blocks, succ)
@@ -18577,14 +18677,34 @@ def finish_module(g):
     return spirv_loop_guard.add_guards(text, LOOP_LIMIT)
 
 
-def capped_tree(succ):
+def _block_out_pcs(blocks, raw_edges, succ):
+    """Possible `%pc` values each basic block can store (`cfg_structure.END` when the block can end the shader).
+    A conditional branch with no fallthrough block (`len(raw_edges[b]) == 1`, i.e. the last block or a split clone
+    of it) emits `OpSelect %uint cond tgt len(blocks)` and therefore writes either `tgt` or `END`."""
+    out_pcs = {}
+    for b, blk in enumerate(blocks):
+        pcs = set(succ[b])
+        if not pcs:
+            pcs.add(cfg_structure.END)
+        elif len(raw_edges[b]) == 1:
+            last = next((i for i in blk if base_op(i["op"]) == "s_endpgm" or base_op(i["op"]) in BRANCHES), None)
+            if last is not None and base_op(last["op"]) in BRANCHES and base_op(last["op"]) != "s_branch":
+                pcs.add(cfg_structure.END)
+        out_pcs[b] = frozenset(pcs)
+    return out_pcs
+
+
+def capped_tree(succ, out_pcs=None):
     """(tree, nesting): the structured tree for `succ` and its depth, or (None, None) under --dispatch-loop or when
     cfg_structure can't structure it; tree is None (nesting still the measured depth) when it nests deeper than
     MAX_STRUCTURED_DEPTH. assemble() emits exactly this tree, and needs_barrier_rounds() decides from the same one
     (SHADER-427 review): a barrier in a tree that falls back to the dispatch loop isn't at a structured top level."""
-    tree = cfg_structure.structure(succ) if STRUCTURED else None
+    if out_pcs is None:
+        out_pcs = {b: (set(succ[b]) if succ[b] else {cfg_structure.END}) for b in range(len(succ))}
+    tree = cfg_structure.structure(succ, out_pcs=out_pcs) if STRUCTURED else None
     if tree is None:
         return None, None
+    tree = cfg_structure.unwrap_known_pc_guards(tree, out_pcs)
     nesting = cfg_structure.depth(tree)
     if MAX_STRUCTURED_DEPTH and nesting > MAX_STRUCTURED_DEPTH:
         return None, nesting                         # too deep to validate cheaply: use the flat form
@@ -18611,7 +18731,7 @@ def needs_barrier_rounds(g, blocks, succ):
                 break
     if not with_barrier:
         return False
-    tree, _ = capped_tree(succ)         # the tree assemble() emits: over MAX_STRUCTURED_DEPTH it's the dispatch loop
+    tree, _ = capped_tree(succ, g.out_pcs)  # the tree assemble() emits: over MAX_STRUCTURED_DEPTH it's the dispatch loop
     top = {it[1] for it in tree if it[0] == "block"} if tree is not None else set()
     return not with_barrier <= top
 

@@ -1326,12 +1326,13 @@ public:
     // device-local memory, and must set VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT. LEONIDA_INDIRECT_CLAMP=0 turns the
     // pass off at replay time.
     void enable_indirect_clamp(PFN_vkGetDeviceProcAddr get, const VkPhysicalDeviceMemoryProperties& memory,
-                               const VkPhysicalDeviceLimits& limits, ScratchBuffers::Allocate allocate) {
+                               const VkPhysicalDeviceLimits& limits, ScratchBuffers::Allocate allocate,
+                               std::vector<std::uint32_t> families = {}) {
         std::unique_lock lock(resource_mutex_);
         replay_.require_indirect_clamp = indirect_clamp_enabled();
         if (!replay_.require_indirect_clamp) return;
         indirect_clamp_ = std::make_unique<IndirectArgumentClamp>(get, device_, memory, limits, std::move(allocate),
-                                                                 device_fault_.get());
+                                                                 device_fault_.get(), std::move(families));
         if (!indirect_clamp_->loaded()) {
             indirect_clamp_.reset();
             return;
@@ -1545,32 +1546,42 @@ public:
     }
 
     // Pipelines are registered by an opaque id (the PSO object) for as long as the PSO lives.
+    // Guarded by pipeline_mutex_ (separate from resource_mutex_) so shader compilation on one queue does not block
+    // resource registration or destruction on the render thread.
     void add_pipeline(std::uintptr_t id, const ComputePipeline& pipeline, const char* shader = nullptr) {
-        std::unique_lock lock(resource_mutex_);
+        std::unique_lock lock(pipeline_mutex_);
         pipelines_[id] = pipeline;
         if (shader && device_fault_) device_fault_->pipeline_names[id] = {shader};
     }
     void remove_pipeline(std::uintptr_t id) {
-        std::unique_lock lock(resource_mutex_);
+        std::unique_lock lock(pipeline_mutex_);
         pipelines_.erase(id);
         graphics_pipelines_.erase(id);
         if (device_fault_) device_fault_->pipeline_names.erase(id);
     }
     void add_graphics_pipeline(std::uintptr_t id, const GraphicsPipeline& pipeline,
                                const CheckpointShaders* shaders = nullptr) {
-        std::unique_lock lock(resource_mutex_);
+        std::unique_lock lock(pipeline_mutex_);
         graphics_pipelines_[id] = pipeline;
         if (shaders && device_fault_) device_fault_->pipeline_names[id] = *shaders;
     }
-    // Workers for the pipelines a submission needs and that are not built yet. Null (the default): each is built where
-    // prepare() meets it, on the submitting thread. Replacing it waits for submissions that are compiling, and ends the
-    // workers it had.
+    // Workers for the pipelines a submission needs and that are not built yet. Null (the default): compiled serially on
+    // the submitting thread once resource_mutex_ is released. Replacing it waits for submissions that are compiling, and
+    // ends the workers it had.
     void set_pipeline_workers(std::unique_ptr<PipelineWorkers> workers) {
-        std::unique_lock lock(resource_mutex_);
+        std::unique_lock lock(pipeline_mutex_);
         pipeline_workers_.swap(workers);
     }
+    // For the large pipelines of a submission: the memory they may use while they compile together
+    // (PipelineCompiles::build), and what is kept while they do (LargeModuleGate::Demand). None (the default): they compile
+    // one after another.
+    void set_large_compiles(std::function<std::uint64_t()> budget, std::function<std::shared_ptr<void>()> demand) {
+        std::unique_lock lock(pipeline_mutex_);
+        large_compile_budget_ = std::move(budget);
+        large_compile_demand_ = std::move(demand);
+    }
     PipelineWorkers::Stats pipeline_worker_stats() {
-        std::shared_lock lock(resource_mutex_);
+        std::shared_lock lock(pipeline_mutex_);
         return pipeline_workers_ ? pipeline_workers_->stats() : PipelineWorkers::Stats{};
     }
     // Configure before queue creation, when the selected queue family supports compute.
@@ -1774,7 +1785,7 @@ public:
         return true;
     }
     const char* diagnostic_compute_name(std::uintptr_t id) {
-        std::shared_lock lock(resource_mutex_);
+        std::shared_lock lock(pipeline_mutex_);
         if (!device_fault_) return nullptr;
         const auto it = device_fault_->pipeline_names.find(id);
         return it == device_fault_->pipeline_names.end() ? nullptr : it->second[0];
@@ -2166,6 +2177,7 @@ private:
     bool ray_tracing_ = false;
     std::unique_ptr<XdxrBuilder> xdxr_;   // set: acceleration structures are XDXR BVH4 records
     std::atomic<bool> device_lost_{false};
+    alignas(64) std::shared_mutex pipeline_mutex_;  // shared for prepare/compile/emit pipeline lookups, unique for add/remove/workers
     alignas(64) std::shared_mutex resource_mutex_;  // shared for prepare lookups, unique for add/remove
     alignas(64) std::mutex tracker_mutex_;
     alignas(64) std::mutex views_mutex_;
@@ -2185,6 +2197,8 @@ private:
     std::unordered_map<std::uintptr_t, ComputePipeline> pipelines_;
     std::unordered_map<std::uintptr_t, GraphicsPipeline> graphics_pipelines_;
     std::unique_ptr<PipelineWorkers> pipeline_workers_;
+    std::function<std::uint64_t()> large_compile_budget_;
+    std::function<std::shared_ptr<void>()> large_compile_demand_;
     std::unordered_map<std::uint64_t, VkAccelerationStructureKHR> acceleration_structures_;
     LayoutTracker tracker_;
     std::mutex storage_mutex_;  // a leaf lock: guards storage_pending_ and zero_pending_ only
@@ -2899,11 +2913,15 @@ private:
             }
         } khr_guard{this};
         std::function<void(bool)> bindless_commit;
-        // Lock hierarchy: resource_mutex_ -> tracker_mutex_ -> submit_mutex_.
-        // Shared read-lock allows concurrent prepare() across queues; tracker_mutex_ is acquired lazily during
-        // prepare() only if a list actually converts a depth24_as_float copy, and otherwise right before
-        // bindless_prepare_/emit() through submit() so bindless flushes, layout emits, and submissions stay in order.
-        std::shared_lock resource_lock(context_.resource_mutex_);
+        // Lock hierarchy: state_mutex_ -> pipeline_mutex_ -> resource_mutex_ -> tracker_mutex_ -> submit_mutex_.
+        // Shared pipeline_lock keeps registered pipelines, pipeline_names, and pipeline_workers_ alive across
+        // preparation, compilation, and emit. Shared resource_lock allows concurrent prepare() across queues and is
+        // released while unbuilt pipelines compile so add_resource()/remove_resource() never stall behind shader
+        // compiles; tracker_mutex_ is acquired lazily during prepare() only if a list uses a shared helper, and
+        // otherwise right before bindless_prepare_/emit() through submit() so bindless flushes, layout emits, and
+        // submissions stay in order.
+        std::shared_lock pipeline_lock(context_.pipeline_mutex_);
+        std::shared_lock resource_lock(context_.resource_mutex_, std::defer_lock);
         std::unique_lock tracker_lock(context_.tracker_mutex_, std::defer_lock);
         // Declared after tracker_lock so any early return after depth24_->prepare() retires uncommitted scratch/pools
         // with ticket 0 while tracker_lock is still held.
@@ -2914,7 +2932,7 @@ private:
             ~Depth24Guard() {
                 if (active && d24) d24->retire(progress, 0);
             }
-        } depth24_guard{context_.depth24_.get(), progress_, false};
+        } depth24_guard{nullptr, progress_, false};
         struct ScratchGuard {  // the same for the copy scratch
             ScratchBuffers* scratch = nullptr;
             VkSemaphore progress = VK_NULL_HANDLE;
@@ -2922,7 +2940,7 @@ private:
             ~ScratchGuard() {
                 if (active && scratch) scratch->retire(progress, 0);
             }
-        } scratch_guard{context_.scratch_.get(), progress_, false};
+        } scratch_guard{nullptr, progress_, false};
         struct ClampGuard {  // and for the ExecuteIndirect clamp's record scratch
             IndirectArgumentClamp* clamp = nullptr;
             VkSemaphore progress = VK_NULL_HANDLE;
@@ -2930,9 +2948,8 @@ private:
             ~ClampGuard() {
                 if (active && clamp) clamp->retire(progress, 0);
             }
-        } clamp_guard{context_.indirect_clamp_.get(), progress_, false};
+        } clamp_guard{nullptr, progress_, false};
         const bool transfer_only = family_ == context_.transfer_only_family_;
-        if (!transfer_only) bindless_commit = context_.bindless_commit_;
         // Kept between executions: prepare refills each list's entries in the storage the last execution left, where
         // making them fresh for every command was about half the layer's CPU cost per command (replay_cpu_bench).
         auto& prepared = prepared_;
@@ -2940,42 +2957,9 @@ private:
         // a queue that sees 8 lists and then 1 in every frame would rebuild them on each execution. The loops below
         // use only the first lists.size() entries, so stale entries are never prepared, queried or emitted.
         if (prepared.size() < lists.size()) prepared.resize(lists.size());
-        ReplayFunctions replay = context_.replay_;
+        ReplayFunctions replay{};
         unsigned mesh_draws = 0;
-        if (pipeline_profile::enabled()) replay.mesh_draw_count = &mesh_draws;
         std::vector<VulkanContext::GeometryUpload> geometry;
-        if (context_.geometry_provider_) {
-            replay.title_memory = [&](std::uint64_t va, std::uint64_t bytes, VkBuffer& buffer, VkDeviceSize& offset) {
-                if (!va || !bytes || bytes>UINT64_MAX-va) return false;
-                for (const auto& upload : geometry) {
-                    if (va < upload.source || va-upload.source > upload.size || bytes > upload.size-(va-upload.source)) continue;
-                    buffer=upload.buffer; offset=upload.offset+(va-upload.source);
-                    return true;
-                }
-                VulkanContext::GeometryUpload upload;
-                if (!context_.geometry_provider_(va,bytes,upload)) return false;
-                buffer=upload.buffer;offset=upload.offset;
-                geometry.push_back(std::move(upload));
-                return true;
-            };
-        }
-        replay.graphics_family = family_ == context_.graphics_family_;
-        replay.queue_stages = kind_ == QueueKind::copy      ? detail::queue_stages_copy
-                              : kind_ == QueueKind::compute ? detail::queue_stages_compute
-                                                            : 0;
-        replay.prepare_khr_instances = [this, &replay, &khr_guard](const BuildAccelerationStructure& build,
-                                                                   VkDeviceAddress& address) {
-            return stage_khr_instances(replay, build, khr_guard.stages, address);
-        };
-        replay.prepare_xdxr_table = [this, &khr_guard](VkDeviceAddress& address, std::uint32_t& count) {
-            return stage_xdxr_table(khr_guard.stages, address, count);
-        };
-        if (replay.write_acceleration_structures_properties) {
-            replay.prepare_khr_postbuild = [this, &khr_guard](std::uint32_t count, VkQueryPool& pool,
-                                                              std::uint32_t& first) {
-                return allocate_khr_as_queries(count, khr_guard.as_queries, pool, first);
-            };
-        }
         std::uint64_t captures = 0;
         for (const auto* list : lists)
             for (const auto& command : list->commands())
@@ -2984,149 +2968,239 @@ private:
         std::unique_ptr<PredicatedBufferCopier::Batch> copy_batch;
         std::unique_ptr<IndirectDispatchCounter::Batch> counted_batch;
         std::unique_ptr<IndirectArgumentClamp::Batch> clamp_batch;
-        if (captures) {
-            if (kind_ == QueueKind::copy || !context_.predicate_reducer_ || family_ != context_.predicate_family_)
-                return queue_unsupported(__LINE__);
-            // The helper's lazy pipeline is shared by queues. Serialize preparation with the tracker lock,
-            // retaining main's resource -> tracker -> submit lock order through emit and submission.
-            if (!tracker_lock.owns_lock()) tracker_lock.lock();
-            batch = context_.predicate_reducer_->batch(captures);
-            if (!batch) return queue_unsupported(__LINE__);
-            replay.prepare_predicate = [&](VkBuffer buffer, VkDeviceSize offset, PredicateCapture& out) {
-                return batch->prepare(buffer, offset, out);
-            };
-            replay.capture_predicate = [&](VkCommandBuffer cb, const PredicateCapture& p) {
-                context_.predicate_reducer_->capture(cb, p);
-            };
-            if (context_.predicated_copier_) {
-                copy_batch = context_.predicated_copier_->batch();
-                replay.prepare_predicated_copy = [&](VkBuffer source, VkBuffer destination, VkDeviceSize src,
-                                                     VkDeviceSize dst, VkDeviceSize size,
-                                                     std::vector<PredicatedCopyDispatch>& out) {
-                    return copy_batch->prepare(source, destination, src, dst, size, out);
-                };
-                replay.emit_predicated_copy = [&](VkCommandBuffer cb, const std::vector<PredicatedCopyDispatch>& jobs) {
-                    context_.predicated_copier_->emit(cb, jobs);
-                };
-            }
-        }
-        if (context_.scratch_) {
-            replay.copy_scratch = [this, &tracker_lock, &scratch_guard](VkDeviceSize bytes, VkBuffer& buffer,
-                                                                        VkDeviceSize& offset) {
-                if (!tracker_lock.owns_lock()) tracker_lock.lock();
-                if (!scratch_guard.active) {
-                    context_.scratch_->collect();
-                    scratch_guard.active = true;
-                }
-                return context_.scratch_->get(bytes, buffer, offset);
-            };
-        }
-        if (kind_ != QueueKind::copy && context_.indirect_clamp_) {
-            // The record scratch belongs to this submission: collected here, retired below with its ticket. The
-            // counter slots are read back once that ticket completes (the batch's destructor).
-            replay.prepare_indirect_clamp = [this, &tracker_lock, &clamp_batch, &clamp_guard](
-                                                VkBuffer arguments, VkDeviceSize argument_offset, VkBuffer count,
-                                                VkDeviceSize count_offset, std::uint32_t kind, std::uint32_t stride,
-                                                std::uint32_t max_count, ClampedIndirect& out) {
-                // Pipeline creation is lazy and shared across queues; serialize it with other replay preparation.
-                if (!tracker_lock.owns_lock()) tracker_lock.lock();
-                if (!clamp_batch) clamp_batch = context_.indirect_clamp_->batch();
-                if (!clamp_guard.active) {
-                    context_.indirect_clamp_->collect();
-                    clamp_guard.active = true;
-                }
-                return clamp_batch->prepare(arguments, argument_offset, count, count_offset, kind, stride, max_count,
-                                            out);
-            };
-        }
-        if (kind_ != QueueKind::copy && context_.counted_dispatch_) {
-            replay.prepare_counted_dispatch = [this, &tracker_lock, &counted_batch](
-                VkBuffer args, VkDeviceSize args_offset, VkBuffer count, VkDeviceSize count_offset,
-                std::uint32_t stride, std::uint32_t maximum, CountedDispatch& out) {
-                // Pipeline creation is lazy and shared across queues; serialize it with other replay preparation.
-                if (!tracker_lock.owns_lock()) tracker_lock.lock();
-                if (!counted_batch) counted_batch = context_.counted_dispatch_->batch();
-                return counted_batch->prepare(args, args_offset, count, count_offset, stride, maximum, out);
-            };
-            replay.emit_counted_dispatch = [this](VkCommandBuffer cb, const CountedDispatch& job) {
-                context_.counted_dispatch_->emit(cb, job);
-            };
-        }
-        if (kind_ != QueueKind::copy && context_.quad_indices_ && context_.scratch_) {
-            replay.prepare_quad_indices = [this, &tracker_lock](
-                VkBuffer indices, VkDeviceSize offset, VkIndexType type, std::uint64_t readable, std::uint32_t quads,
-                VkBuffer scratch, VkDeviceSize scratch_offset, QuadIndexExpansion& out) {
-                // Pipeline creation is lazy and shared across queues; serialize it with other replay preparation.
-                if (!tracker_lock.owns_lock()) tracker_lock.lock();
-                return context_.quad_indices_->prepare(indices, offset, type, readable, quads, scratch,
-                                                       scratch_offset, out);
-            };
-            replay.emit_quad_indices = [this](VkCommandBuffer cb, const QuadIndexExpansion& job) {
-                context_.quad_indices_->emit(cb, job);
-            };
-        }
-        if (context_.depth24_ && !transfer_only) {
-            replay.depth24_prepare = [this, &tracker_lock, &depth24_guard](Depth24Job& job,
-                                                                           std::vector<Depth24Job>& parts) {
-                if (!tracker_lock.owns_lock()) tracker_lock.lock();
-                if (!depth24_guard.active) {
-                    context_.depth24_->collect();
-                    depth24_guard.active = true;
-                }
-                return context_.depth24_->prepare(job, parts);
-            };
-        }
         const auto& occlusion_memory = context_.occlusion_resolve_memory_;
         const bool can_resolve_occlusion = occlusion_memory.memoryTypeCount != 0;
-        if (can_resolve_occlusion) {
-            replay.sum_occlusion = [this](VkCommandBuffer cb, VkQueryPool pool, std::uint32_t first,
-                                          std::uint32_t count, VkBuffer dst, VkDeviceSize offset) {
-                occlusion_resolve_->sum(cb, pool, first, count, dst, offset);
-            };
-            replay.resolve_binary_occlusion = [this](VkCommandBuffer cb, VkQueryPool pool, std::uint32_t first,
-                                                      std::uint32_t count, VkBuffer dst, VkDeviceSize offset) {
-                occlusion_resolve_->normalize(cb, pool, first, count, dst, offset);
-            };
-            replay.sum_statistics = [this](VkCommandBuffer cb, VkQueryPool pool, VkQueryPool mesh_pool,
-                                           VkQueryPool primitives_pool, const std::uint8_t* mesh,
-                                           std::uint32_t first, std::uint32_t count, VkBuffer dst,
-                                           VkDeviceSize offset) {
-                occlusion_resolve_->sum_statistics(cb, pool, mesh_pool, primitives_pool, mesh, first, count, dst,
-                                                  offset);
-            };
-            replay.sum_binary_occlusion = [this](VkCommandBuffer cb, VkQueryPool pool, std::uint32_t first,
-                                                 std::uint32_t count, VkBuffer dst, VkDeviceSize offset) {
-                occlusion_resolve_->sum_binary(cb, pool, first, count, dst, offset);
-            };
-        }
         const auto resolve = [this](ResourceId id) { return context_.resolve(id); };
         std::uint32_t segments = 0, statistics_segments = 0;
         bool has_queries = false;
-        // With workers, the pipelines the lists need and that are not built yet are compiled together below instead of
-        // one after another in prepare(). resource_lock is held until they are all built, which keeps the pipeline
-        // states that own them alive (remove_pipeline takes it uniquely).
-        PipelineCompiles compiles;
-        if (context_.pipeline_workers_) replay.compiles = &compiles;
-        ReplayResult prepare_result = ReplayResult::success;
-        for (std::size_t i = 0; i < lists.size(); ++i) {
-            const auto result = prepare(*lists[i], resolve, replay, prepared[i], can_resolve_occlusion);
-            if (result != ReplayResult::success) {
-                prepare_result = result;
-                break;
+        const auto run_compiles = [this](std::size_t count, const std::function<void(std::size_t)>& job) {
+            context_.pipeline_workers_->run(count, job);
+        };
+        PipelineCompiles prior_compiles;
+        bool has_prior_compiles = false;
+        for (int pass = 0;; ++pass) {
+            resource_lock.lock();
+            bindless_commit = !transfer_only ? context_.bindless_commit_ : std::function<void(bool)>{};
+            replay = context_.replay_;
+            mesh_draws = 0;
+            if (pipeline_profile::enabled()) replay.mesh_draw_count = &mesh_draws;
+            if (context_.geometry_provider_) {
+                replay.title_memory = [&](std::uint64_t va, std::uint64_t bytes, VkBuffer& buffer, VkDeviceSize& offset) {
+                    if (!va || !bytes || bytes>UINT64_MAX-va) return false;
+                    for (const auto& upload : geometry) {
+                        if (va < upload.source || va-upload.source > upload.size || bytes > upload.size-(va-upload.source)) continue;
+                        buffer=upload.buffer; offset=upload.offset+(va-upload.source);
+                        return true;
+                    }
+                    VulkanContext::GeometryUpload upload;
+                    if (!context_.geometry_provider_(va,bytes,upload)) return false;
+                    buffer=upload.buffer;offset=upload.offset;
+                    geometry.push_back(std::move(upload));
+                    return true;
+                };
             }
-            if (prepared[i].segment_count > UINT32_MAX - segments ||
-                prepared[i].statistics_segment_count > UINT32_MAX - statistics_segments)
-                return queue_unsupported(__LINE__);
-            segments += prepared[i].segment_count;
-            statistics_segments += prepared[i].statistics_segment_count;
-            has_queries = has_queries || !prepared[i].queries.empty();
+            replay.graphics_family = family_ == context_.graphics_family_;
+            replay.queue_stages = kind_ == QueueKind::copy      ? detail::queue_stages_copy
+                                  : kind_ == QueueKind::compute ? detail::queue_stages_compute
+                                                                : 0;
+            replay.prepare_khr_instances = [this, &replay, &khr_guard](const BuildAccelerationStructure& build,
+                                                                       VkDeviceAddress& address) {
+                return stage_khr_instances(replay, build, khr_guard.stages, address);
+            };
+            replay.prepare_xdxr_table = [this, &khr_guard](VkDeviceAddress& address, std::uint32_t& count) {
+                return stage_xdxr_table(khr_guard.stages, address, count);
+            };
+            if (replay.write_acceleration_structures_properties) {
+                replay.prepare_khr_postbuild = [this, &khr_guard](std::uint32_t count, VkQueryPool& pool,
+                                                                  std::uint32_t& first) {
+                    return allocate_khr_as_queries(count, khr_guard.as_queries, pool, first);
+                };
+            }
+            if (captures) {
+                if (kind_ == QueueKind::copy || !context_.predicate_reducer_ || family_ != context_.predicate_family_)
+                    return queue_unsupported(__LINE__);
+                // The helper's lazy pipeline is shared by queues. Serialize preparation with the tracker lock,
+                // retaining pipeline -> resource -> tracker -> submit lock order through emit and submission.
+                if (!tracker_lock.owns_lock()) tracker_lock.lock();
+                batch = context_.predicate_reducer_->batch(captures);
+                if (!batch) return queue_unsupported(__LINE__);
+                replay.prepare_predicate = [&](VkBuffer buffer, VkDeviceSize offset, PredicateCapture& out) {
+                    return batch->prepare(buffer, offset, out);
+                };
+                replay.capture_predicate = [&](VkCommandBuffer cb, const PredicateCapture& p) {
+                    context_.predicate_reducer_->capture(cb, p);
+                };
+                if (context_.predicated_copier_) {
+                    copy_batch = context_.predicated_copier_->batch();
+                    replay.prepare_predicated_copy = [&](VkBuffer source, VkBuffer destination, VkDeviceSize src,
+                                                         VkDeviceSize dst, VkDeviceSize size,
+                                                         std::vector<PredicatedCopyDispatch>& out) {
+                        return copy_batch->prepare(source, destination, src, dst, size, out);
+                    };
+                    replay.emit_predicated_copy = [&](VkCommandBuffer cb, const std::vector<PredicatedCopyDispatch>& jobs) {
+                        context_.predicated_copier_->emit(cb, jobs);
+                    };
+                }
+            }
+            if (context_.scratch_) {
+                replay.copy_scratch = [this, &tracker_lock, &scratch_guard](VkDeviceSize bytes, VkBuffer& buffer,
+                                                                            VkDeviceSize& offset) {
+                    if (!tracker_lock.owns_lock()) tracker_lock.lock();
+                    if (!scratch_guard.active) {
+                        scratch_guard.scratch = context_.scratch_.get();
+                        context_.scratch_->collect();
+                        scratch_guard.active = true;
+                    }
+                    return context_.scratch_->get(bytes, buffer, offset);
+                };
+            }
+            if (kind_ != QueueKind::copy && context_.indirect_clamp_) {
+                // The record scratch belongs to this submission: collected here, retired below with its ticket. The
+                // counter slots are read back once that ticket completes (the batch's destructor).
+                replay.prepare_indirect_clamp = [this, &tracker_lock, &clamp_batch, &clamp_guard](
+                                                    VkBuffer arguments, VkDeviceSize argument_offset, VkBuffer count,
+                                                    VkDeviceSize count_offset, std::uint32_t kind, std::uint32_t stride,
+                                                    std::uint32_t max_count, ClampedIndirect& out) {
+                    // Pipeline creation is lazy and shared across queues; serialize it with other replay preparation.
+                    if (!tracker_lock.owns_lock()) tracker_lock.lock();
+                    if (!clamp_batch) clamp_batch = context_.indirect_clamp_->batch();
+                    if (!clamp_guard.active) {
+                        clamp_guard.clamp = context_.indirect_clamp_.get();
+                        context_.indirect_clamp_->collect();
+                        clamp_guard.active = true;
+                    }
+                    return clamp_batch->prepare(arguments, argument_offset, count, count_offset, kind, stride,
+                                                max_count, out);
+                };
+            }
+            if (kind_ != QueueKind::copy && context_.counted_dispatch_) {
+                replay.prepare_counted_dispatch = [this, &tracker_lock, &counted_batch](
+                    VkBuffer args, VkDeviceSize args_offset, VkBuffer count, VkDeviceSize count_offset,
+                    std::uint32_t stride, std::uint32_t maximum, CountedDispatch& out) {
+                    // Pipeline creation is lazy and shared across queues; serialize it with other replay preparation.
+                    if (!tracker_lock.owns_lock()) tracker_lock.lock();
+                    if (!counted_batch) counted_batch = context_.counted_dispatch_->batch();
+                    return counted_batch->prepare(args, args_offset, count, count_offset, stride, maximum, out);
+                };
+                replay.emit_counted_dispatch = [this](VkCommandBuffer cb, const CountedDispatch& job) {
+                    context_.counted_dispatch_->emit(cb, job);
+                };
+            }
+            if (kind_ != QueueKind::copy && context_.quad_indices_ && context_.scratch_) {
+                replay.prepare_quad_indices = [this, &tracker_lock](
+                    VkBuffer indices, VkDeviceSize offset, VkIndexType type, std::uint64_t readable, std::uint32_t quads,
+                    VkBuffer scratch, VkDeviceSize scratch_offset, QuadIndexExpansion& out) {
+                    // Pipeline creation is lazy and shared across queues; serialize it with other replay preparation.
+                    if (!tracker_lock.owns_lock()) tracker_lock.lock();
+                    return context_.quad_indices_->prepare(indices, offset, type, readable, quads, scratch,
+                                                           scratch_offset, out);
+                };
+                replay.emit_quad_indices = [this](VkCommandBuffer cb, const QuadIndexExpansion& job) {
+                    context_.quad_indices_->emit(cb, job);
+                };
+            }
+            if (context_.depth24_ && !transfer_only) {
+                replay.depth24_prepare = [this, &tracker_lock, &depth24_guard](Depth24Job& job,
+                                                                               std::vector<Depth24Job>& parts) {
+                    if (!tracker_lock.owns_lock()) tracker_lock.lock();
+                    if (!depth24_guard.active) {
+                        depth24_guard.d24 = context_.depth24_.get();
+                        context_.depth24_->collect();
+                        depth24_guard.active = true;
+                    }
+                    return context_.depth24_->prepare(job, parts);
+                };
+            }
+            if (can_resolve_occlusion) {
+                replay.sum_occlusion = [this](VkCommandBuffer cb, VkQueryPool pool, std::uint32_t first,
+                                              std::uint32_t count, VkBuffer dst, VkDeviceSize offset) {
+                    occlusion_resolve_->sum(cb, pool, first, count, dst, offset);
+                };
+                replay.resolve_binary_occlusion = [this](VkCommandBuffer cb, VkQueryPool pool, std::uint32_t first,
+                                                          std::uint32_t count, VkBuffer dst, VkDeviceSize offset) {
+                    occlusion_resolve_->normalize(cb, pool, first, count, dst, offset);
+                };
+                replay.sum_statistics = [this](VkCommandBuffer cb, VkQueryPool pool, VkQueryPool mesh_pool,
+                                               VkQueryPool primitives_pool, const std::uint8_t* mesh,
+                                               std::uint32_t first, std::uint32_t count, VkBuffer dst,
+                                               VkDeviceSize offset) {
+                    occlusion_resolve_->sum_statistics(cb, pool, mesh_pool, primitives_pool, mesh, first, count, dst,
+                                                      offset);
+                };
+                replay.sum_binary_occlusion = [this](VkCommandBuffer cb, VkQueryPool pool, std::uint32_t first,
+                                                     std::uint32_t count, VkBuffer dst, VkDeviceSize offset) {
+                    occlusion_resolve_->sum_binary(cb, pool, first, count, dst, offset);
+                };
+            }
+            segments = 0;
+            statistics_segments = 0;
+            has_queries = false;
+            // Collect unbuilt pipelines via PipelineCompiles (whether pipeline_workers_ is enabled or serial).
+            // On pass 0, if any pipeline must be compiled, release pass-0 transient state along with tracker_lock
+            // and resource_lock before invoking the compiler (keeping pipeline_lock so registered pipelines and
+            // workers stay alive), then re-prepare on pass 1 against current resources.
+            PipelineCompiles compiles;
+            replay.compiles = &compiles;
+            ReplayResult prepare_result = ReplayResult::success;
+            for (std::size_t i = 0; i < lists.size(); ++i) {
+                const auto result = prepare(*lists[i], resolve, replay, prepared[i], can_resolve_occlusion);
+                if (result != ReplayResult::success) {
+                    prepare_result = result;
+                    break;
+                }
+                if (prepared[i].segment_count > UINT32_MAX - segments ||
+                    prepared[i].statistics_segment_count > UINT32_MAX - statistics_segments)
+                    return queue_unsupported(__LINE__);
+                segments += prepared[i].segment_count;
+                statistics_segments += prepared[i].statistics_segment_count;
+                has_queries = has_queries || !prepared[i].queries.empty();
+            }
+            if (pass == 0 && !compiles.empty()) {
+                if (depth24_guard.active) {
+                    context_.depth24_->retire(progress_, 0);
+                    depth24_guard.active = false;
+                }
+                if (scratch_guard.active) {
+                    context_.scratch_->retire(progress_, 0);
+                    scratch_guard.active = false;
+                }
+                if (clamp_guard.active) {
+                    context_.indirect_clamp_->retire(progress_, 0);
+                    clamp_guard.active = false;
+                }
+                batch.reset();
+                copy_batch.reset();
+                counted_batch.reset();
+                clamp_batch.reset();
+                if (tracker_lock.owns_lock()) tracker_lock.unlock();
+                resource_lock.unlock();
+                recycle_khr_stages(khr_guard.stages);
+                recycle_khr_as_queries(khr_guard.as_queries);
+                geometry.clear();
+
+                std::shared_ptr<void> demand;
+                if (context_.large_compile_demand_ && compiles.any_large()) demand = context_.large_compile_demand_();
+                if (context_.pipeline_workers_)
+                    compiles.build(run_compiles, context_.large_compile_budget_);
+                else
+                    compiles.build_serial();
+                demand.reset();
+                const ReplayResult compile_result = check_compiled_pipelines(compiles, prepare_result);
+                if (compile_result != ReplayResult::success) return compile_result;
+                prior_compiles = std::move(compiles);
+                has_prior_compiles = true;
+                continue;
+            }
+            const PipelineCompiles* prior = has_prior_compiles ? &prior_compiles : nullptr;
+            prepare_result = context_.pipeline_workers_
+                                 ? build_pipelines(compiles, std::span(prepared).first(lists.size()), prepare_result,
+                                                   run_compiles, context_.large_compile_budget_, prior)
+                                 : build_pipelines_serial(compiles, std::span(prepared).first(lists.size()),
+                                                          prepare_result, prior);
+            replay.compiles = nullptr;
+            if (prepare_result != ReplayResult::success) return prepare_result;
+            break;
         }
-        prepare_result = build_pipelines(
-            compiles, std::span(prepared).first(lists.size()), prepare_result,
-            [this](std::size_t count, const std::function<void(std::size_t)>& job) {
-                context_.pipeline_workers_->run(count, job);
-            });
-        if (prepare_result != ReplayResult::success) return prepare_result;
         const auto segment_pool = [this](VkQueryType type, std::uint32_t count,
                                          std::shared_ptr<OcclusionSegmentPool>& out) {
             const auto& vk = context_.vk;
@@ -3253,6 +3327,7 @@ private:
             const bool ended = context_.observe_result(context_.vk.vkEndCommandBuffer(command_buffer),
                                                       "vkEndCommandBuffer") == VK_SUCCESS;
             resource_lock.unlock();
+            pipeline_lock.unlock();
             const bool submitted = ended && submit(command_buffer, VK_NULL_HANDLE, 0);
             if (!submitted) discard();
             if (depth24_guard.active) {
@@ -3386,7 +3461,8 @@ private:
         }
         const bool ended = context_.observe_result(context_.vk.vkEndCommandBuffer(command_buffer),
                                                   "vkEndCommandBuffer") == VK_SUCCESS;
-        resource_lock.unlock();  // release resource_mutex_ before vkQueueSubmit while keeping tracker_lock held
+        resource_lock.unlock();  // release resource_mutex_ and pipeline_mutex_ before vkQueueSubmit while keeping tracker_lock held
+        pipeline_lock.unlock();
         const bool wait_previous = ordered_timestamps && submitted_;
         if (wait_previous) {
             waits_.push_back(progress_);
@@ -4071,7 +4147,8 @@ private:
     std::vector<PreparedList> prepared_;
     std::uint32_t open_labels_ = 0;  // queue labels begun and not ended
     bool ok_ = false;
-    // Wait-before-Signal. state_mutex_ is outermost (before resource_mutex_ -> tracker_mutex_ -> submit_mutex_) and
+    // Wait-before-Signal. state_mutex_ is outermost (before pipeline_mutex_ -> resource_mutex_ -> tracker_mutex_ ->
+    // submit_mutex_) and
     // guards the members above that execute, signal, wait and marker touch.
     std::mutex state_mutex_;
     std::deque<Deferred> held_;

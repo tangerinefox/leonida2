@@ -174,8 +174,11 @@ class Reader:
             return {"$ref": a["ref"]}
         kids = list(el)
         if not kids:
+            text = (el.text or "").strip()
+            if t is not None and not text:
+                return self._typed_object(t, {})
             self.stats["text"] += 1
-            return (el.text or "").strip()
+            return text
         return self._typed_object(t, self.children(kids))
 
     def _typed_object(self, t, value):

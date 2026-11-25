@@ -1,10 +1,15 @@
 """tools/ps_helper_probe.py: the analysis on a CPU model of what gfx1036 does (each check, and that it fails when the
 model breaks that rule), the programs' shape, and (with LEONIDA_PS_ORACLE_BUILD set to a runtime build
 and an AMD GPU selected) the measurement itself. Standard library only."""
+import contextlib
+import io
+import json
 import os
 import struct
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -105,6 +110,89 @@ class Programs(unittest.TestCase):
                 self.assertEqual(lines[-1], "s_endpgm")
                 self.assertEqual(sum(ln.startswith("exp ") for ln in lines), 1)
                 self.assertEqual("s_wqm_b64 exec, exec" in lines, H.PROGRAMS[name][0])
+
+
+class CliAndJsonTests(unittest.TestCase):
+    def test_empty_coverage_does_not_crash_and_fails_coverage_checks(self):
+        res = {name: {(x, y): H.CLEAR for y in range(Hh) for x in range(W)} for name in H.PROGRAMS}
+        checks = H.analyze(res)
+        self.assertEqual(len(checks), 10)
+        by_name = {name: ok for name, ok, _ in checks}
+        for name, ok in by_name.items():
+            if not name.startswith("an exp"):
+                self.assertFalse(ok, f"expected {name!r} to fail when nothing is covered")
+
+    def test_json_preflight_rejects_bad_paths_before_measure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            blocker = os.path.join(tmp, "not_a_dir")
+            with open(blocker, "w", encoding="utf-8", newline="\n") as f:
+                f.write("x")
+            for bad in ("", "   ", tmp, tmp + os.sep, os.path.join(blocker, "out.json")):
+                with self.subTest(bad=bad):
+                    err = io.StringIO()
+                    with mock.patch.object(H, "measure", side_effect=AssertionError("should not run GPU")), \
+                            contextlib.redirect_stderr(err):
+                        rc = H.main(["--build", "dummy", "--json", bad])
+                    self.assertEqual(rc, 2)
+                    self.assertTrue(err.getvalue().strip())
+
+    def test_json_write_is_atomic_has_trailing_newline_and_preserves_existing_on_failure(self):
+        res = model()
+        with tempfile.TemporaryDirectory() as tmp:
+            out_json = os.path.join(tmp, "nested", "probe.json")
+            with mock.patch.object(H, "measure", return_value=("mock-gpu", res)), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                rc = H.main(["--build", "dummy", "--json", out_json])
+            self.assertEqual(rc, 0)
+            with open(out_json, "rb") as f:
+                raw = f.read()
+            self.assertTrue(raw.endswith(b"\n"))
+            self.assertNotIn(b"\r\n", raw)
+            doc = json.loads(raw.decode("utf-8"))
+            self.assertEqual(doc["device"], "mock-gpu")
+
+            before = b'{"keep": true}\n'
+            with open(out_json, "wb") as f:
+                f.write(before)
+            nested_dir = os.path.dirname(out_json)
+
+            def fail_dump(*_args, **_kwargs):
+                raise OSError("disk full")
+
+            for target_obj, attr, side_effect in (
+                (H.json, "dump", fail_dump),
+                (os, "replace", OSError("replace failed")),
+            ):
+                with self.subTest(mock_attr=attr):
+                    err = io.StringIO()
+                    with mock.patch.object(H, "measure", return_value=("mock-gpu", res)), \
+                            mock.patch.object(target_obj, attr, side_effect=side_effect), \
+                            contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                        rc = H.main(["--build", "dummy", "--json", out_json])
+                    self.assertEqual(rc, 2)
+                    self.assertNotIn("Traceback", err.getvalue())
+                    with open(out_json, "rb") as f:
+                        self.assertEqual(f.read(), before)
+                    self.assertEqual(sorted(os.listdir(nested_dir)), ["probe.json"])
+
+    def test_symlinked_json_updates_target_in_place(self):
+        res = model()
+        with tempfile.TemporaryDirectory() as tmp:
+            real_path = os.path.join(tmp, "real.json")
+            with open(real_path, "wb") as f:
+                f.write(b"{}\n")
+            link_path = os.path.join(tmp, "link.json")
+            try:
+                os.symlink(real_path, link_path)
+            except OSError as exc:
+                self.skipTest(f"symlink unavailable: {exc}")
+            with mock.patch.object(H, "measure", return_value=("mock-gpu", res)), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                rc = H.main(["--build", "dummy", "--json", link_path])
+            self.assertEqual(rc, 0)
+            self.assertTrue(os.path.islink(link_path))
+            with open(real_path, encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["device"], "mock-gpu")
 
 
 @unittest.skipUnless(os.environ.get("LEONIDA_PS_ORACLE_BUILD"), "set LEONIDA_PS_ORACLE_BUILD to a runtime build "

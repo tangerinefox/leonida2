@@ -1455,6 +1455,11 @@ def test_mesh_s3_wave_id_emits_local_index_shift_and_bfe(make_shader):
     asm = shader.translate()
     shader.validate(asm)
     assert "%wave = OpShiftRightLogical %uint %lidx %c6" in asm
+    # SHADER-STRUCTURED-PC-UNWRAP: blk2 post-dominates blk0/blk1 and carries s_barrier, so its tautological
+    # pc == 2 guard must be unwrapped (keeping OpControlBarrier in uniform top-level control flow for AMD LLPC).
+    blk2_pos = asm.index("%blk2 = OpLabel")
+    before_blk2 = asm[asm.index("%blk1 = OpLabel"):blk2_pos]
+    assert "OpBranchConditional" not in before_blk2, before_blk2
     assert "%mwi = OpShiftLeftLogical %uint %wave %c18" in asm
     assert "OpStore %s3p %mwi" in asm
     assert "OpBitFieldUExtract %uint" in asm

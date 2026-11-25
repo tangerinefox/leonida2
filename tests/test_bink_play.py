@@ -1,5 +1,6 @@
 """tools/bink_play.py: name matching and the name-table cache. Synthetic names only, no game files."""
 import sys
+from io import StringIO
 import tempfile
 import threading
 import unittest
@@ -175,6 +176,72 @@ class CacheTest(unittest.TestCase):
                     worker.join()
             self.assertEqual(got, {"first": "Stinger/first.bk2", "second": "Stinger/second.bk2"})
             self.assertEqual(sorted(p.name for p in (d / "cache").iterdir()), ["bink_names.csv"])
+
+
+class NoCacheTest(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name)
+        self.archive = self.directory / "streams.csv"
+        self.mount = self.directory / "mount.xml"
+        self.archive.write_text("source,offset,size,width,height,frames\nsample,32,64,16,16,2\n",
+                                encoding="utf-8", newline="\n")
+        self.mount.write_text("<filename>$(common)/movies/synthetic.bk2</filename>",
+                              encoding="utf-8", newline="\n")
+        self.cache = self.directory / "cache" / "names.csv"
+        self.expected = [("synthetic.bk2", 32, "16", "16", "2")]
+
+    def test_cli_lists_without_accessing_an_unusable_cache_directory(self):
+        self.cache.parent.write_bytes(b"unrelated file, not a directory")
+        with mock.patch.object(bink_play, "cache_path", return_value=self.cache), \
+                mock.patch.object(sys, "stdout", new_callable=StringIO) as stdout:
+            rc = bink_play.main(["--game-dir", str(self.directory), "--archive", self.archive.name,
+                                 "--mount", self.mount.name, "--no-cache", "--list"])
+        self.assertEqual(rc, 0)
+        self.assertIn("synthetic.bk2  16x16, 2 frames", stdout.getvalue().splitlines())
+        self.assertEqual(self.cache.parent.read_bytes(), b"unrelated file, not a directory")
+
+    def test_no_cache_does_not_create_a_persistent_cache_directory(self):
+        with mock.patch.object(bink_play, "cache_path", return_value=self.cache):
+            self.assertEqual(bink_play.load_names(self.archive, self.mount, use_cache=False), self.expected)
+        self.assertFalse(self.cache.parent.exists())
+
+    def test_existing_cache_is_untouched_and_temporary_report_is_removed(self):
+        self.cache.parent.mkdir()
+        self.cache.write_bytes(b"existing cache must remain unchanged")
+        reports = []
+        real_names = bink_play.bink_names.main
+
+        def generate(argv):
+            reports.append(Path(argv[argv.index("--out") + 1]))
+            return real_names(argv)
+
+        with mock.patch.object(bink_play, "cache_path", return_value=self.cache) as cache_path, \
+                mock.patch.object(bink_play.bink_names, "main", side_effect=generate):
+            self.assertEqual(bink_play.load_names(self.archive, self.mount, use_cache=False), self.expected)
+        cache_path.assert_not_called()
+        self.assertEqual(self.cache.read_bytes(), b"existing cache must remain unchanged")
+        self.assertEqual(list(self.cache.parent.iterdir()), [self.cache])
+        self.assertEqual(len(reports), 1)
+        self.assertFalse(reports[0].exists())
+
+    def test_failed_no_cache_generation_removes_temporary_report(self):
+        reports = []
+
+        def fail(argv):
+            path = Path(argv[argv.index("--out") + 1])
+            reports.append(path)
+            path.write_bytes(b"partial report")
+            raise OSError("synthetic report failure")
+
+        with mock.patch.object(bink_play, "cache_path", return_value=self.cache), \
+                mock.patch.object(bink_play.bink_names, "main", side_effect=fail):
+            with self.assertRaisesRegex(OSError, "synthetic report failure"):
+                bink_play.load_names(self.archive, self.mount, use_cache=False)
+        self.assertEqual(len(reports), 1)
+        self.assertFalse(reports[0].exists())
+        self.assertFalse(self.cache.parent.exists())
 
 
 if __name__ == "__main__":

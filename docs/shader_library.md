@@ -223,8 +223,13 @@ What stops the rest, by the translator's message:
   `gfx1030` they don't either. The FSSM shaders don't use these tuples; the pipeline builds use them often. The translator
   now decodes these words from the blob with `rdna2_decode` (`restore_vcc_tuples`) and reads them as the
   `[s100,...,vcc_lo,vcc_hi]` lists it already takes (design.md *Scalar/buffer memory*); synthetic cases are in
-  `tests/semantic/test_vcc_tuple_fallback.py`. The count above was measured before this change; it has not been
-  re-run on the real library.
+  `tests/semantic/test_vcc_tuple_fallback.py`. The junk llvm-mc prints at such a word's second dword is often longer
+  than that dword (an 8-byte `exp`, say) and swallows the instruction after the tuple too, so the words after a restored
+  instruction are decoded from the blob until the stream is back at one llvm-mc printed. A word llvm-mc itself rejected
+  is not taken for swallowed code and stays refused. They are decoded for the program's own wave size: in wave64 a
+  swallowed VOP3 compare writes an SGPR pair. The table above was measured before both changes. Measured since,
+  over the 2,684 compute programs (llvm-mc 21.1.8): 1,816 translate with the tuples alone and 2,567 with the swallowed
+  instructions, all of which pass `spirv-val`; the modules of the 1,816 are byte-identical.
 * **443: an instruction llvm-mc prints with another encoding than the blob's** (`v_fma_mix*`, `v_interp_p2_f16`):
   the existing `check_printed_encodings` refusal.
 * **90 CS: "CS thread-group-size SGPR"**: RSRC2 `TG_SIZE_EN`, which no FSSM compute shader sets.

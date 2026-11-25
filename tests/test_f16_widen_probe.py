@@ -208,6 +208,42 @@ class Contracts(unittest.TestCase):
             self.assertIn("disk full", err.getvalue())
             self.assertNotIn("Traceback", err.getvalue())
 
+    def test_oracle_closed_on_success(self):
+        fake = FakeOracle()
+        mock_close = unittest.mock.MagicMock()
+        fake.close = mock_close
+        rc, out = run_main(fake, "--waves", "32")
+        self.assertEqual(rc, 0)
+        mock_close.assert_called_once()
+
+    def test_oracle_closed_on_non_gfx10_skip(self):
+        fake = FakeOracle()
+        fake.arch = "gfx900"
+        mock_close = unittest.mock.MagicMock()
+        fake.close = mock_close
+        err = io.StringIO()
+        with (
+            unittest.mock.patch.object(hw_runner, "open_oracle", return_value=fake),
+            unittest.mock.patch.object(hw_asm, "family", return_value="gfx9"),
+            redirect_stderr(err),
+        ):
+            rc = probe.main(["--waves", "32"])
+        self.assertEqual(rc, 77)
+        mock_close.assert_called_once()
+
+    def test_oracle_closed_on_sweep_exception(self):
+        fake = FakeOracle()
+        mock_close = unittest.mock.MagicMock()
+        fake.close = mock_close
+        with (
+            unittest.mock.patch.object(hw_runner, "open_oracle", return_value=fake),
+            unittest.mock.patch.object(hw_asm, "family", return_value="gfx10"),
+            unittest.mock.patch.object(probe, "sweep", side_effect=RuntimeError("sweep fail")),
+        ):
+            with self.assertRaises(RuntimeError):
+                probe.main(["--waves", "32"])
+        mock_close.assert_called_once()
+
     def test_kernels_stage_then_load_the_same_half(self):
         k = probe._kernel(hw_asm, "buffer_load_format_xy", 29, 0x7FE6, 64)
         self.assertEqual(k.wave, 64)

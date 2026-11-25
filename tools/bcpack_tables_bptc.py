@@ -140,35 +140,45 @@ def _bc7_static():
     return _BC7_STATIC_CACHE
 
 
+def _load_json_file(path):
+    """Load and cache a JSON object file, keyed by resolved realpath and stat identity."""
+    real = os.path.realpath(path)
+    st = os.stat(real)
+    cache_key = (st.st_mtime_ns, st.st_size, st.st_dev, st.st_ino)
+    cached = _FILE_CACHE.get(real)
+    if cached is not None and cached[0] == cache_key:
+        return cached[1]
+    with open(real, "r", encoding="utf-8-sig") as fh:
+        try:
+            data = json.load(fh)
+        except RecursionError:
+            raise ValueError(f"{path}: JSON nesting too deep") from None
+    if not isinstance(data, dict):
+        raise ValueError(f"{path}: expected a JSON object")
+    _FILE_CACHE[real] = (cache_key, data)
+    return data
+
+
 def _read_history_section(history, codec_key, marker_key):
     """Resolve `history` (None, dict, JSON file, or directory) for one codec."""
     if history is None:
         return None
     if isinstance(history, dict):
-        if codec_key in history:
-            return history[codec_key]
-        return history if marker_key in history else None
-    path = os.fspath(history)
-    if os.path.isdir(path):
-        candidate = os.path.join(path, f"{codec_key}.json")
-        if not os.path.isfile(candidate):
-            return None
-        path = candidate
-    abspath = os.path.abspath(path)
-    st = os.stat(abspath)
-    cache_key = (st.st_mtime_ns, st.st_size)
-    cached = _FILE_CACHE.get(abspath)
-    if cached is not None and cached[0] == cache_key:
-        data = cached[1]
+        container = history
     else:
-        with open(abspath, "r", encoding="utf-8-sig") as fh:
-            data = json.load(fh)
-        if not isinstance(data, dict):
-            raise ValueError(f"{path}: expected a JSON object")
-        _FILE_CACHE[abspath] = (cache_key, data)
-    if codec_key in data:
-        return data[codec_key]
-    return data if marker_key in data else None
+        path = os.fspath(history)
+        if os.path.isdir(path):
+            candidate = os.path.join(path, f"{codec_key}.json")
+            if not os.path.isfile(candidate):
+                return None
+            path = candidate
+        container = _load_json_file(path)
+    if codec_key in container:
+        sec = container[codec_key]
+        if sec is not None and not isinstance(sec, dict):
+            raise ValueError(f"{codec_key} history section must be a JSON object")
+        return sec
+    return container if marker_key in container else None
 
 
 def _iter_entries(obj, count=256):
@@ -227,11 +237,13 @@ def load_bc6h(history=None, *, with_confirmed_bits=False):
     ec = list(_EMPTY_BC6H_CLS)
     ic = list(_EMPTY_BC6H_CLS)
     for i, channels in _iter_entries(sec.get("endpointHistory")):
-        if len(channels) != 3 or any(len(ch) != 4 for ch in channels):
+        if not isinstance(channels, (list, tuple)) or len(channels) != 3 or any(
+            not isinstance(ch, (list, tuple)) or len(ch) != 4 for ch in channels
+        ):
             raise ValueError(f"BC6H endpointHistory[{i}] must be 3x4 integers")
         eh[i] = tuple(tuple(int(v) for v in ch) for ch in channels)
     for i, pixels in _iter_entries(sec.get("indexHistory")):
-        if len(pixels) != 16:
+        if not isinstance(pixels, (list, tuple)) or len(pixels) != 16:
             raise ValueError(f"BC6H indexHistory[{i}] must have 16 integers")
         ih[i] = tuple(int(v) for v in pixels)
     for i, cls in _iter_entries(sec.get("endpointClass")):
@@ -250,12 +262,14 @@ def load_bc6h(history=None, *, with_confirmed_bits=False):
         target[:] = empty
         for i, row in _iter_entries(sec[key]):
             if key == "endpointConfirmedBits":
-                if len(row) != 3 or any(len(ch) != 4 for ch in row):
+                if not isinstance(row, (list, tuple)) or len(row) != 3 or any(
+                    not isinstance(ch, (list, tuple)) or len(ch) != 4 for ch in row
+                ):
                     raise ValueError(f"BC6H {key}[{i}] must be 3x4 integers")
                 value = tuple(tuple(int(v) for v in ch) for ch in row)
                 valid = all(0 <= v <= widths[q] for ch in value for q, v in enumerate(ch))
             else:
-                if len(row) != 16:
+                if not isinstance(row, (list, tuple)) or len(row) != 16:
                     raise ValueError(f"BC6H {key}[{i}] must have 16 integers")
                 value = tuple(int(v) for v in row)
                 valid = all(0 <= v <= 4 for v in value)
@@ -318,26 +332,47 @@ def load_bc7(history=None):
             )
     # Optional same-stream red parity fits, applied after midpoint fill. Preserve
     # all leading sibling/reference bits and keep the available precision unchanged.
-    for k, field, low in sec.get("historyEndpointLow2Fits") or ():
-        if not (0 <= k < 256 and field in (0, 4, 8, 12, 16, 20) and 0 <= low < 4):
-            raise ValueError("invalid BC7 low-bit endpoint fit")
-        depth = ep_b[k][field]
-        old = ep[k][field]
-        value = (old & ~3) | low
-        if not 4 <= depth < 8 or (old ^ value) >> (8 - max(depth, ep_cb[k][field])):
-            raise ValueError("BC7 low-bit fit changes a known prefix")
-        row = list(ep[k])
-        row[field] = value
-        ep[k] = tuple(row)
+    low2 = sec.get("historyEndpointLow2Fits")
+    if low2 is not None:
+        if not isinstance(low2, (list, tuple)):
+            raise ValueError("historyEndpointLow2Fits must be a list")
+        for item in low2:
+            if not isinstance(item, (list, tuple)) or len(item) != 3 or not all(type(x) is int for x in item):
+                raise ValueError("invalid BC7 low-bit endpoint fit")
+            k, field, low = item
+            if not (0 <= k < 256 and field in (0, 4, 8, 12, 16, 20) and 0 <= low < 4):
+                raise ValueError("invalid BC7 low-bit endpoint fit")
+            depth = ep_b[k][field]
+            cb = ep_cb[k][field]
+            if not 0 <= cb <= 8:
+                raise ValueError("BC7 confirmed bit depth out of bounds")
+            old = ep[k][field]
+            value = (old & ~3) | low
+            if not 4 <= depth < 8 or (old ^ value) >> (8 - max(depth, cb)):
+                raise ValueError("BC7 low-bit fit changes a known prefix")
+            row = list(ep[k])
+            row[field] = value
+            ep[k] = tuple(row)
     last_resort = set()
-    for item in sec.get("historyEndpointLastResort") or ():
-        if len(item) == 4:
-            k, sub, e, c = (int(x) for x in item)
-            last_resort.add((k, sub * 8 + e * 4 + c))
-        elif len(item) == 2:
-            last_resort.add((int(item[0]), int(item[1])))
-        else:
-            raise ValueError("historyEndpointLastResort entries must have 2 or 4 integers")
+    last_resort_raw = sec.get("historyEndpointLastResort")
+    if last_resort_raw is not None:
+        if not isinstance(last_resort_raw, (list, tuple)):
+            raise ValueError("historyEndpointLastResort must be a list")
+        for item in last_resort_raw:
+            if not isinstance(item, (list, tuple)):
+                raise ValueError("historyEndpointLastResort entries must have 2 or 4 integers")
+            if len(item) == 4:
+                k, sub, e, c = (int(x) for x in item)
+                if not (0 <= k < 256 and 0 <= sub < 3 and 0 <= e < 2 and 0 <= c < 4):
+                    raise ValueError("historyEndpointLastResort index out of bounds")
+                last_resort.add((k, sub * 8 + e * 4 + c))
+            elif len(item) == 2:
+                k, field = int(item[0]), int(item[1])
+                if not (0 <= k < 256 and 0 <= field < 24):
+                    raise ValueError("historyEndpointLastResort index out of bounds")
+                last_resort.add((k, field))
+            else:
+                raise ValueError("historyEndpointLastResort entries must have 2 or 4 integers")
     return {
         **static,
         "history_endpoints": tuple(ep),
@@ -387,18 +422,7 @@ def load_bc_history(codec, history=None):
             if not os.path.isfile(candidate):
                 return None
             path = candidate
-        abspath = os.path.abspath(path)
-        st = os.stat(abspath)
-        cache_key = (st.st_mtime_ns, st.st_size)
-        cached = _FILE_CACHE.get(abspath)
-        if cached is not None and cached[0] == cache_key:
-            data = cached[1]
-        else:
-            with open(abspath, "r", encoding="utf-8-sig") as fh:
-                data = json.load(fh)
-            if not isinstance(data, dict):
-                raise ValueError(f"{path}: expected a JSON object")
-            _FILE_CACHE[abspath] = (cache_key, data)
+        data = _load_json_file(path)
         if codec_key in data:
             sec = data[codec_key]
         elif data.get("codec") == codec_key:

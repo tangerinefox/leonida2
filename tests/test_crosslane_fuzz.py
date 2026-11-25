@@ -483,6 +483,74 @@ class GpuEnv(unittest.TestCase):
                          str(max(len(X.OUT_REGS), 64)))
 
 
+class PcTailUbo(unittest.TestCase):
+    """--pc-tail-ubo (or LEONIDA_PC_TAIL_UBO) translates with rdna2spirv.py --pc-tail-ubo and runs vk_compute_test
+    with LEONIDA_PC_TAIL_UBO=1, as lds_fuzz.py and valu_fuzz.py do (128-byte push constants, e.g. AMD iGPUs)."""
+
+    def test_translate_forwards_the_flag(self):
+        cmds = []
+
+        def fake(cmd, **kw):
+            cmds.append(list(cmd))
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with tempfile.TemporaryDirectory() as work, \
+                mock.patch.object(X.subprocess, "run", side_effect=fake):
+            X.translate(work, False)
+            X.translate(work, False, pc_tail=True)
+        self.assertNotIn("--pc-tail-ubo", cmds[0])
+        self.assertIn("--pc-tail-ubo", cmds[1])
+
+    def test_gpu_env_sets_the_harness_variable(self):
+        prog = X.Program("p", 32, 64, [], {}, [])
+        self.assertNotIn("LEONIDA_PC_TAIL_UBO", X.gpu_env(prog, False, "d.bin", base={}))
+        self.assertEqual(X.gpu_env(prog, False, "d.bin", base={}, pc_tail=True)["LEONIDA_PC_TAIL_UBO"], "1")
+
+    def test_flag_or_env_turns_it_on(self):
+        seen_t, seen_g, names = [], [], []
+
+        def fake_translate(work, emulate, pc_tail=False):
+            seen_t.append(pc_tail)
+            spdir = os.path.join(work, "spirv_emu" if emulate else "spirv_nat")
+            os.makedirs(spdir, exist_ok=True)
+            for name in names:
+                open(os.path.join(spdir, name + ".spv"), "wb").close()
+            return spdir, ""
+
+        def fake_run_gpu(exe, spv, prog, work, emulate, pc_tail=False):
+            seen_g.append(pc_tail)
+            return [0] * (prog.group * len(X.OUT_REGS))
+
+        for extra, env_val, want in (
+            ([], "", False),
+            (["--pc-tail-ubo"], "", True),
+            ([], "1", True),
+            ([], "yes", True),
+            ([], "0", False),
+        ):
+            with self.subTest(extra=extra, env_val=env_val):
+                seen_t.clear()
+                seen_g.clear()
+                names.clear()
+                env = {k: v for k, v in os.environ.items() if k != "LEONIDA_PC_TAIL_UBO"}
+                if env_val:
+                    env["LEONIDA_PC_TAIL_UBO"] = env_val
+                with tempfile.TemporaryDirectory() as build:
+                    exe = os.path.join(build, "vk_compute_test.exe")   # only has to exist: run_gpu is replaced
+                    open(exe, "wb").close()
+                    with mock.patch.dict(os.environ, env, clear=True), \
+                            mock.patch.object(X, "assemble", side_effect=lambda mc, p, *a: names.append(p.name)), \
+                            mock.patch.object(X, "translate", side_effect=fake_translate), \
+                            mock.patch.object(X, "run_gpu", side_effect=fake_run_gpu), \
+                            mock.patch.object(sys, "argv", ["crosslane_fuzz.py", "--exe", exe, "--programs", "1",
+                                                             "--wave", "32", "--modes", "native", "--no-maskdata",
+                                                             *extra]), \
+                            contextlib.redirect_stdout(io.StringIO()):
+                        X.main()
+                self.assertEqual(seen_t, [want])
+                self.assertEqual(seen_g, [want])
+
+
 class UnpinnedSubgroup(unittest.TestCase):
     """A wave32 run vk_compute_test couldn't pin to 32 lanes is a skip; an emulated wave64 one is still compared."""
 
@@ -597,7 +665,7 @@ class HarnessErrors(unittest.TestCase):
 
     def _main(self, run_gpu, argv):
         """main() with the assembler, translator and GPU replaced: every program 'translates'."""
-        def translate(work, emulate):
+        def translate(work, emulate, pc_tail=False):
             spdir = os.path.join(work, "spirv_emu" if emulate else "spirv_nat")
             os.makedirs(spdir, exist_ok=True)
             for name in names:
@@ -628,7 +696,7 @@ class HarnessErrors(unittest.TestCase):
     def test_run_goes_on_after_a_hang_and_exits_2(self):
         calls = []
 
-        def run_gpu(exe, spv, prog, work, emulate):
+        def run_gpu(exe, spv, prog, work, emulate, pc_tail=False):
             calls.append(prog.name)
             if len(calls) == 2:
                 raise X.HarnessError("vk_compute_test timed out after 60 s")
@@ -645,7 +713,7 @@ class HarnessErrors(unittest.TestCase):
         self.assertEqual(kept, [f"{calls[1]}_native.asm"])
 
     def test_every_program_skipped_exits_2(self):
-        def run_gpu(exe, spv, prog, work, emulate):
+        def run_gpu(exe, spv, prog, work, emulate, pc_tail=False):
             raise X.Unpinned("the device can't run it at 32 lanes")
 
         code, out = self._main(run_gpu, ["--programs", "4", "--wave", "32", "--modes", "native"])
@@ -655,7 +723,7 @@ class HarnessErrors(unittest.TestCase):
         self.assertNotIn("mismatch;", out)
 
     def test_skips_beside_matches_exit_0(self):
-        def run_gpu(exe, spv, prog, work, emulate):
+        def run_gpu(exe, spv, prog, work, emulate, pc_tail=False):
             if prog.wave == 32:
                 raise X.Unpinned("the device can't run it at 32 lanes")
             return self._expected_words(prog)
@@ -667,7 +735,7 @@ class HarnessErrors(unittest.TestCase):
         self.assertIn("wave64 emulate: programs 2, match 2", out)
 
     def test_clean_run_still_exits_0(self):
-        code, out = self._main(lambda exe, spv, prog, work, emulate: self._expected_words(prog),
+        code, out = self._main(lambda exe, spv, prog, work, emulate, pc_tail=False: self._expected_words(prog),
                                ["--programs", "3", "--wave", "32", "--modes", "native", "--no-maskdata"])
         self.assertEqual(code, 0)
         self.assertIn("match 3, mismatch 0, hyp_only 0, rejected 0, harness_errors 0", out)

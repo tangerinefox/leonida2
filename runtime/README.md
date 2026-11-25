@@ -288,7 +288,9 @@ Current limits, by design:
   lightbar. Optional and CMake-only: built when an installed SDL3 is found,
   or with `-DLEONIDA_SDL3_FETCH=ON` to download the pinned release; nothing is downloaded otherwise, and the
   `scripts/build_runtime.ps1` cl.exe fallback never builds it. See [docs/gameinput.md](../docs/gameinput.md) for the mapping, the `LEONIDA_DS_*` settings and what is
-  unverified.
+  unverified. A build without SDL3 links `shims/gameinput_no_sdl.cpp` instead: no devices, or with
+  `LEONIDA_INPUT_SCRIPT` set one scripted pad driven by the script alone, so a headless or CI build can get past the
+  title's first prompt ([docs/gameinput.md](../docs/gameinput.md#scripted-input-without-sdl3)).
 
 ### What `xgameruntime.dll` reports: environment overrides
 
@@ -319,7 +321,8 @@ ones marked *diagnostic* only add log lines or exist to compare a run with and w
 | `LEONIDA_LAZY_PIPELINES` | on | Graphics pipelines are built at their first draw. `0` builds each at `CreatePipelineState`, as before; the title creates far more pipelines at startup than it draws with. |
 | `LEONIDA_LAZY_COMPUTE` | on | Compute pipelines are built at the first dispatch that names them, or earlier by the warm-up thread. `0` builds each at `CreateComputePipelineState`. |
 | `LEONIDA_COMPUTE_WARMUP_MAX_BYTES` | `1048576` | The largest SPIR-V module, in bytes, the background warm-up thread (`LEONIDA_COMPUTE_WARMUP`) builds ahead of its first dispatch. Larger modules wait for that dispatch. |
-| `LEONIDA_SERIAL_BIG_COMPILES` | on | Compute modules over 128 KiB of SPIR-V compile one at a time, because the driver's compiler needs hundreds of MiB for each. `0` lets them compile side by side. |
+| `LEONIDA_SERIAL_BIG_COMPILES` | unset | Large pipelines (compute modules over 128 KiB of SPIR-V, graphics pipelines of 1 MiB or more) compile side by side while their estimates, 512 bytes of memory for each byte of SPIR-V, fit a budget (`LEONIDA_BIG_COMPILE_BUDGET_MB`): one always does, what a submission waits for goes before the warm-up, and the warm-up takes a quarter of the budget at most. `1` compiles the compute ones one at a time, and the graphics ones of a submission one after another, as before there was a budget. `0` lets all of them compile side by side. |
+| `LEONIDA_BIG_COMPILE_BUDGET_MB` | unset | The budget, in MiB: a fixed number (`0`: one large pipeline at a time) instead of three quarters of the memory that is free at the moment, which is the smaller of the free RAM and the room under the commit limit, read again for each pipeline. Text that is not a number is ignored. |
 | `LEONIDA_CONSOLE_FORMATS` | on | Texture descriptions the console accepts and a PC GPU may not (an R9G9B9E5 render target, an sRGB RGBA8 or BGRA8 texture with unordered access) get a host format that can do the job. `0` refuses them, as a PC D3D12 runtime does. |
 | `LEONIDA_CONSOLE_HEAP_SHADOW` | on | A console descriptor heap has a copy in the descriptor arena that the shaders read. `0` keeps its bytes in the title's memory only (the comparison for a run that misbehaves with the copy). |
 | `LEONIDA_IMPORT_BELOW_ARENA` | unset | `1` keeps a host-memory import that the driver put below the GPU address arena. By default such an import is not used and the shadow buffer in the arena answers, because a V# cannot name an address below the arena. |
@@ -340,6 +343,7 @@ ones marked *diagnostic* only add log lines or exist to compare a run with and w
 | `LEONIDA_VOLUME_MIPS` | on | The XG layout of a 3D texture with mips or a block format is computed (`shims/xg_xs_layout.h`). `0` refuses it. |
 | `LEONIDA_TITLE_WATCHDOG` | unset (armed) | The title's own hang watchdog stays armed by default, as on the console: if the game's main loop does not report for 30 seconds, the title ends itself. `0` makes `gta6rt --run` keep it from firing while the game thread waits for the driver, for example on the first boot after a driver update (`src/main.cpp`), and only in the build the watchdog was measured in. |
 | `LEONIDA_PEEK_SECONDS` | `10` | *Diagnostic.* The period of the `LEONIDA_PEEK` thread (`src/main.cpp`), which prints 8-byte values of the title's image. |
+| `LEONIDA_INPUT_SCRIPT` | unset | Timed pad presses, `button@seconds` separated by commas (`a@70,a@85,start@120`), each held 300 ms; the clock starts with the shim. Works with and without SDL3: with SDL3 it drives the keyboard pad (`LEONIDA_KEYBOARD_PAD=always`), without SDL3 one scripted pad that is the only device. Controllers and the keyboard pad still need SDL3. Format and buttons in [docs/gameinput.md](../docs/gameinput.md#environment-variables). |
 | `LEONIDA_INPUT_LOG` | on | The GameInput shim logs every press in `LEONIDA_INPUT_SCRIPT`'s form (`name@seconds`), so a session played by hand can be replayed. `0` turns the lines off. |
 | `LEONIDA_LOG_ALLOCINFO` | unset | *Diagnostic.* `1` logs every device slot 25 call (`GetResourceAllocationInfo`) with its thread, description and sizes (`shims/d3d12_xs_device.cpp`). |
 | `LEONIDA_LOG_EXE_PIPELINES` | unset | *Diagnostic.* When set, one line per distinct graphics pipeline that uses a program translated from the executable's inline containers. |
@@ -362,7 +366,7 @@ ones marked *diagnostic* only add log lines or exist to compare a run with and w
 | `LEONIDA_WINDOW` | unset | `WxH` resizes the title's window when the presenter attaches to it. |
 | `LEONIDA_PRESENT_DUMP` | unset | *Diagnostic.* `DIR` or `DIR,N` writes every Nth presented frame (60 by default) as a PNG into `DIR` (`src/present_dump.h`). The files are pictures of the title: keep them out of commits, issues and pull requests. |
 | `LEONIDA_LOCAL_SPEECH` | unset | `1` forwards the title's speech-synthesis calls to the host's installed `xgameruntime.dll` where there is one. Unset, and wherever that library is missing, the silent voice answers. No profile sets it. |
-| `LEONIDA_CONSOLE_FIX_US` | `4000` | Microseconds one submission may spend fixing the changed slots of a console descriptor heap's copy. Past it, each further changed slot is written as a null descriptor and queued for `LEONIDA_CONSOLE_RETRY_US`, so a shader reads it as empty until its turn comes. `0` removes the limit. |
+| `LEONIDA_CONSOLE_FIX_US` | `0` | Microseconds one submission may spend fixing the changed slots of a console descriptor heap's copy; `0` sets no limit. Past it, each further changed slot is written as a null descriptor and queued for `LEONIDA_CONSOLE_RETRY_US`, so a shader reads it as empty until its turn comes: a limit changes results, and can hang the GPU. |
 | `LEONIDA_CONSOLE_RETRY_US` | `500` | Microseconds one submission may spend retrying, round robin, the console heap slots not settled yet (a T# whose texture does not exist yet, or one deferred by `LEONIDA_CONSOLE_FIX_US`). `0` retries all of them at every submission. |
 | `LEONIDA_SHADOW_ALIAS_MS` | `0` | The shortest time, in milliseconds, between two copies of the title-memory pages that XMem maps at two addresses (no write guard can watch them) into the slot-133 shadows and title windows. `0` copies them at every submission; a larger value lets a GPU read of them be up to that many milliseconds behind the title's writes. |
 | `LEONIDA_REFRESH_PER_FRAME` | `0` | Trades correctness for speed. `1`: the slot-133 shadows, title windows and geometry copies are brought up to date only by the first submission after each present, not by every submission; `2`: the console descriptor heaps too. A GPU read of them can then be a frame behind the title's writes (wrong pixels). `0` refreshes all of them at every submission. |
@@ -454,6 +458,9 @@ SDK, or `-DLEONIDA_VULKAN_HEADERS_FETCH=ON` to download the pinned Khronos Vulka
 
 `gameinput_test` (only with SDL3; otherwise CTest lists `gameinput` as not run) drives the GameInput shim on SDL virtual joysticks (no controller needed): enumeration, readings
 and the button/axis mapping, rumble and trigger rumble, DualSense effect bytes, a dispatcher, and hot-plug.
+`gameinput_no_sdl_test` (only without SDL3) checks the shim a build without SDL3 links: `gameinput_no_sdl` the
+identity-only object, `gameinput_no_sdl_script` the scripted pad of `LEONIDA_INPUT_SCRIPT` on a fake clock (device
+callbacks, readings at chosen times, the reading history).
 `gameinput_probe [--seconds N] [--rumble] [--force-feedback]` is the manual check on a real pad: it prints live
 readings, plays each motor and trigger, and holds a constant force on a pad that reports a force-feedback motor.
 

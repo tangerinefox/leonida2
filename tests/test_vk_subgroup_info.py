@@ -49,7 +49,8 @@ class FakeDevice:
 
     name: str | bytes = "Synthetic GPU"
     api_version: int = vk_info.VK_API_VERSION_1_3
-    extension_names: tuple[bytes, ...] = ()
+    # Listed with the fragmentShaderBarycentric feature below, as a driver that exposes barycentrics lists both.
+    extension_names: tuple[bytes, ...] = (vk_info.FRAGMENT_SHADER_BARYCENTRIC_EXTENSION,)
     device_type: int = vk_info.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
     dynamic_rendering: bool = True
     synchronization2: bool = True
@@ -94,6 +95,7 @@ class FakeVulkan:
         self.props_calls = []
         self.features_calls = []
         self.queue_calls = []
+        self.ext_calls = []
         self.vkCreateInstance = _VkProc(self._create_instance)
         self.vkEnumeratePhysicalDevices = _VkProc(self._enumerate_physical_devices)
         self.vkEnumerateDeviceExtensionProperties = _VkProc(self._enumerate_device_extension_properties)
@@ -163,6 +165,7 @@ class FakeVulkan:
         count = ctypes.c_uint32.from_address(_ptr(p_count))
         addr = _ptr(p_entries)
         if addr is None:
+            self.ext_calls.append(_ptr(physical))
             count.value = len(names)
             return 0
         written = min(count.value, len(names))
@@ -831,12 +834,43 @@ class QueryTest(unittest.TestCase):
                 self.assertEqual(res["max_push_constants_size"], limit)
 
     def test_per_vertex_inputs(self):
-        """PerVertexKHR needs fragmentShaderBarycentric, and MoltenVK can't compile it to MSL either way."""
-        for label, bary, driver, want in (("amd", True, 1, True), ("no_barycentrics", False, 1, False),
-                                          ("moltenvk", True, vk_info.VK_DRIVER_ID_MOLTENVK, False)):
+        """PerVertexKHR needs fragmentShaderBarycentric with its extension listed, and MoltenVK can't compile it to MSL
+        either way. RADV (Mesa 26.2.6) sets the feature on a gfx90c iGPU that doesn't list the extension."""
+        ext = (vk_info.FRAGMENT_SHADER_BARYCENTRIC_EXTENSION,)
+        for label, bary, names, driver, want in (
+            ("amd", True, ext, 1, True),
+            ("no_barycentrics", False, ext, 1, False),
+            ("moltenvk", True, ext, vk_info.VK_DRIVER_ID_MOLTENVK, False),
+            ("radv_gfx90c_feature_without_extension", True, (), 3, False),
+            ("other_extensions_only", True, (b"VK_KHR_dynamic_rendering",), 3, False),
+        ):
             with self.subTest(case=label):
-                res, _vk = self._run_query(FakeDevice(fragment_shader_barycentric=bary, driver_id=driver))
+                res, _vk = self._run_query(FakeDevice(fragment_shader_barycentric=bary, extension_names=names,
+                                                      driver_id=driver))
                 self.assertIs(res["per_vertex_inputs"], want)
+
+    def test_per_vertex_inputs_reuses_vulkan12_extensions_and_defers_vulkan13(self):
+        """Vulkan 1.2 reuses the extension list fetched for eligibility; Vulkan 1.3 queries only the winning device."""
+        v12_base = (b"VK_KHR_dynamic_rendering", b"VK_KHR_synchronization2")
+        for label, names, want in (
+            ("v12_with_barycentric", v12_base + (vk_info.FRAGMENT_SHADER_BARYCENTRIC_EXTENSION,), True),
+            ("v12_without_barycentric", v12_base, False),
+        ):
+            with self.subTest(case=label):
+                res, vk = self._run_query(FakeDevice(api_version=vk_info.VK_API_VERSION_1_2,
+                                                     fragment_shader_barycentric=True, extension_names=names))
+                self.assertIs(res["per_vertex_inputs"], want)
+                self.assertEqual(len(vk.ext_calls), 1, "Vulkan 1.2 device should enumerate extensions once")
+
+        igpu = FakeDevice(name="Integrated GPU", device_type=1, fragment_shader_barycentric=True,
+                          extension_names=())
+        dgpu = FakeDevice(name="Discrete GPU", device_type=2, fragment_shader_barycentric=True,
+                          extension_names=(vk_info.FRAGMENT_SHADER_BARYCENTRIC_EXTENSION,))
+        res, vk = self._run_query(igpu, dgpu)
+        self.assertEqual(res["device"], "Discrete GPU")
+        self.assertTrue(res["per_vertex_inputs"])
+        self.assertEqual(vk.ext_calls, [vk._device_handles[1]],
+                         "Vulkan 1.3 should enumerate extensions only for the winning device")
 
     def test_barycentric_fallback(self):
         for label, driver, want in (("anv", vk_info.VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA, True),

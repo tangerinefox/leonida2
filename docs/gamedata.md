@@ -1416,7 +1416,8 @@ bounded by the largest field. The generic conversion follows the parser's own co
 - `x/y/z/w` is a vector tuple.
 - `content=` is the array body. `short_array`, `float_array` and `float16_array` give number lists;
   `vector2_array`, `vec3v_array`, `matrix33` and `matrix34` give tuples.
-- `type="Class"` is a polymorphic object `{"$type": ...}`, and `type="NULL"` is `None`.
+- `type="Class"` is a polymorphic object `{"$type": ...}`, including an empty object with no fields or text.
+  Explicit scalar/vector/array/reference conventions and nonempty text keep their values; `type="NULL"` is `None`.
 - `ref=` is `{"$ref": ...}`.
 - All-`Item` children are a list, or a dict when every one carries `key=`. A repeated tag is a list. A text-only
   element is its text. Any other attribute is kept as `"@name"`.
@@ -1440,10 +1441,12 @@ On the 1.0.2.1 carve of `common.rpf` the run takes about 5 s, with 0 conversion 
 | arrays | 13,449 |
 | lists | 13,465 |
 | keyed maps | 526 |
-| polymorphic objects | 6,490 (317 `type` classes over 6,903 typed elements) |
+| polymorphic objects | 6,663 (317 `type` classes over 6,903 typed elements) |
 | `NULL` pointers | 278 |
 | references | 924 |
 | elements with extra attributes | 5,262 |
+
+The object count includes 173 empty instances across 13 documents (54 types).
 
 The 7 roots missing from the 118 occur only in documents that are not well-formed. Counts only: the JSON that
 `--out` writes is the game's data and stays local. `tests/test_gamedata_reader.py` checks every convention,

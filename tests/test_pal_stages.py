@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -202,6 +203,56 @@ class TestCli(unittest.TestCase):
                 self.assertEqual(result.returncode, 2, f"--limit {value}: {result.stdout}")
                 self.assertIn("--limit", result.stderr)
                 self.assertIn("at least 1", result.stderr)
+
+    def test_corrupt_xbch_zlib_records_error_row_instead_of_crashing(self):
+        corrupt_zlib = b"\x78\x9c\xff\xff\xff\xff"
+        bad_xbch = b"XBCH" + struct.pack("<IIIII", 0, len(corrupt_zlib), 0, 0x300, 0) + corrupt_zlib
+        with tempfile.TemporaryDirectory() as folder:
+            with open(os.path.join(folder, "a_bad.dxbc"), "wb") as f:
+                f.write(make_dxbc([bad_xbch]))
+            with open(os.path.join(folder, "b_ok.fssm"), "wb") as f:
+                f.write(blob([(1, 5)]))
+            rows = pal_stages.blob_rows(folder)
+            self.assertEqual(len(rows), 2)
+            self.assertIn("error", rows[0])
+            self.assertEqual(rows[1]["payload"], "fssm")
+            result = subprocess.run([sys.executable, "-I", TOOL, folder, "--json"],
+                                    capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        doc = json.loads(result.stdout)
+        self.assertEqual(doc["tally"]["blobs"], 1)
+        self.assertEqual(doc["tally"]["errors"], 1)
+
+    def test_case_insensitive_extensions_and_deduplication(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with open(os.path.join(folder, "alpha.FSSM"), "wb") as f:
+                f.write(blob([(1, 5)]))
+            with open(os.path.join(folder, "alpha.dxbc"), "wb") as f:
+                f.write(make_dxbc([make_xbch(blob([(3, 6)]))]))
+            with open(os.path.join(folder, "beta.DXBC"), "wb") as f:
+                f.write(make_dxbc([make_xbch(blob([(6, 7)]))]))
+            rows = pal_stages.blob_rows(folder)
+        self.assertEqual([(r["name"], r["payload"]) for r in rows], [
+            ("alpha.FSSM", "fssm"),
+            ("beta.DXBC", "xdat0"),
+        ])
+
+    def test_deeply_nested_index_json_does_not_crash_main(self):
+        import io
+        import contextlib
+        with tempfile.TemporaryDirectory() as folder:
+            with open(os.path.join(folder, "shader.fssm"), "wb") as f:
+                f.write(blob([(1, 5)]))
+            with open(os.path.join(folder, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                f.write("[]")
+            out = io.StringIO()
+            with unittest.mock.patch.object(pal_stages.fssm_header.json, "load",
+                                            side_effect=RecursionError("deep nesting")), \
+                    contextlib.redirect_stdout(out):
+                rc = pal_stages.main([folder, "--json"])
+        self.assertEqual(rc, 0)
+        doc = json.loads(out.getvalue())
+        self.assertIsNone(doc["blobs"][0]["stage"])
 
 
 if __name__ == "__main__":

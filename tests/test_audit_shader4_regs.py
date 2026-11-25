@@ -168,7 +168,8 @@ class AuditShader4RegsTests(unittest.TestCase):
             self.assertEqual(report["rbw_vgpr_counts"], {"v2": 3, "v4": 3})
             self.assertEqual(report["s3_rbw_op_patterns"], {})
 
-    def test_negative_limit_is_rejected_before_output(self):
+    def test_limit_below_one_is_rejected_before_output(self):
+        # --limit 0 used to audit nothing and still print a full zero report with exit 0.
         with tempfile.TemporaryDirectory() as tmp:
             disasm = os.path.join(tmp, "disasm")
             os.mkdir(disasm)
@@ -179,20 +180,30 @@ class AuditShader4RegsTests(unittest.TestCase):
                 json.dump({"a_cs": {"stage": "cs"}, "b_cs": {"stage": "cs"}}, f)
 
             out_json = os.path.join(tmp, "report.json")
-            stdout, stderr = io.StringIO(), io.StringIO()
-            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-                with self.assertRaises(SystemExit) as ctx:
-                    audit_mod.main([disasm, "--limit", "-1", "--json", out_json])
-            self.assertEqual(ctx.exception.code, 2)
-            self.assertEqual(stdout.getvalue(), "")
-            self.assertEqual(len(stderr.getvalue().splitlines()), 1)
-            self.assertIn("--limit", stderr.getvalue())
-            self.assertFalse(os.path.exists(out_json))
+            for value in ("0", "-1", "x"):
+                with self.subTest(limit=value):
+                    stdout, stderr = io.StringIO(), io.StringIO()
+                    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                        with self.assertRaises(SystemExit) as ctx:
+                            audit_mod.main([disasm, "--limit", value, "--json", out_json])
+                    self.assertEqual(ctx.exception.code, 2)
+                    self.assertEqual(stdout.getvalue(), "")
+                    self.assertIn("error: argument --limit: must be at least 1", stderr.getvalue())
+                    self.assertNotIn("Traceback", stderr.getvalue())
+                    self.assertFalse(os.path.exists(out_json))
 
-            with self.assertRaisesRegex(ValueError, "limit"):
-                audit_mod.audit(disasm, limit=-1)
-            for limit, count in ((None, 2), (0, 0), (1, 1)):
+            for limit in (0, -1):
+                with self.subTest(audit_limit=limit), self.assertRaisesRegex(ValueError, "at least 1"):
+                    audit_mod.audit(disasm, limit=limit)
+            for limit, count in ((None, 2), (1, 1), (2, 2), (3, 2)):
                 self.assertEqual(audit_mod.audit(disasm, limit=limit)["cs"]["count"], count)
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                self.assertEqual(audit_mod.main([disasm, "--limit", "1", "--json", out_json]), 0)
+            self.assertIn("=== CS (1 shaders;", stdout.getvalue())
+            with open(out_json, encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["cs"]["count"], 1)
 
     def test_directory_named_like_shader_is_skipped_by_limit(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -368,7 +379,8 @@ class AuditShader4RegsTests(unittest.TestCase):
 
     def test_json_refuses_a_listing_even_when_limit_excludes_it(self):
         listing = self.make_temp_listing()
-        self.assert_json_refuses_input(listing.parent, listing, listing, "--limit", "0")
+        (listing.parent / "cs_first.s").write_bytes(b"\ts_endpgm\n")  # sorts first and takes the only --limit slot
+        self.assert_json_refuses_input(listing.parent, listing, listing, "--limit", "1")
 
     def test_synthetic_cs_ms_gs_audit_and_s3_patterns(self):
         with tempfile.TemporaryDirectory() as tmp:

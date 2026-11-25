@@ -29,15 +29,18 @@ import posixpath
 import re
 import struct
 import sys
+import tempfile
 
 # -I keeps the script directory off sys.path, so add it explicitly before importing sibling helpers.
 TOOLS = os.path.dirname(os.path.abspath(__file__))
 if TOOLS not in sys.path:
     sys.path.insert(0, TOOLS)
 
+from file_mode import published_mode  # noqa: E402
 import gamedata_index as gi  # noqa: E402
 import gamedata_maps as gm  # noqa: E402
 from hashdict import joaat  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 import sgd5_effects as se  # noqa: E402
 
@@ -208,10 +211,11 @@ def _load_from_source(rows: list[dict], read_row) -> list[dict]:
     return out
 
 
-def read_payloads(target: str) -> list[dict]:
+def read_payloads(target: str, rows: list[dict] | None = None) -> list[dict]:
     """Load SPS1 payloads from a carve directory, a raw .bin file, or an .rpf archive."""
     if os.path.isdir(target):
-        rows = gm._read_index_rows(target)
+        if rows is None:
+            rows = gm._read_index_rows(target)
         return _load_from_source(rows, lambda r: gm._read_row(target, r))
     if not os.path.isfile(target):
         raise FileNotFoundError(target)
@@ -322,6 +326,36 @@ def _public(payload: dict) -> dict:
     return {k: v for k, v in payload.items() if not k.startswith("_")}
 
 
+def _write_json_atomic(path: str, payload: dict) -> None:
+    dest = os.path.realpath(path)
+    parent = os.path.dirname(dest) or "."
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=parent, prefix=".tmp-", suffix=".json")
+    try:
+        try:
+            f = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
+        except BaseException:
+            os.close(fd)
+            raise
+        with f:
+            json.dump(payload, f, indent=1)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, published_mode(dest))
+        replace_retry(tmp, dest)
+    except BaseException:
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("target", help="rpf9_carve.py directory, common.rpf archive, or SPS1 .bin file")
@@ -337,6 +371,12 @@ def main(argv=None) -> int:
             ap.error("--preset-hash expects up to eight hexadecimal digits")
         target_hash = int(a.preset_hash, 16)
 
+    if a.json is not None:
+        if not a.json.strip():
+            ap.error("--json path must not be empty")
+        if a.json.endswith(("/", "\\")) or (os.sep and a.json.endswith(os.sep)):
+            ap.error(f"--json is a directory path: {a.json}")
+
     # A missing input path is a usage error (exit 2), not a failed run, as in BUILD-1046.
     for path in (a.target, a.shaders):
         if path is not None and not os.path.exists(path):
@@ -346,11 +386,12 @@ def main(argv=None) -> int:
     try:
         if a.json:
             check_report_path(a.json, a.target, a.shaders)
+        rows = None
         if os.path.isdir(a.target):
             rows = gm._read_index_rows(a.target)
             if a.json:
                 check_report_path(a.json, a.target, a.shaders, rows=rows)
-        payloads = read_payloads(a.target)
+        payloads = read_payloads(a.target, rows=rows)
         xref = cross_reference_sgd5(payloads, a.shaders) if a.shaders else None
         matches = lookup_preset_hash(payloads, target_hash) if target_hash is not None else None
     except (OSError, ValueError, KeyError, TypeError, struct.error, RuntimeError) as e:
@@ -387,9 +428,7 @@ def main(argv=None) -> int:
         if matches is not None:
             out["hash_matches"] = matches
         try:
-            gm._make_parent(a.json)
-            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(out, f, indent=1)
+            _write_json_atomic(a.json, out)
         except OSError as e:
             print(f"error: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)
             return 1

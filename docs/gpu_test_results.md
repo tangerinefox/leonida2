@@ -6,12 +6,17 @@ post counts and pass/fail lines there, never game shaders, logs or private paths
 
 | GPU | Driver, OS | Commit | build.py | check.py | run_gpu_tests.py | Failed | Entry |
 |---|---|---|---|---|---|---|---|
+| NVIDIA GeForce RTX 5070 Ti (Blackwell), subgroup 32 | NVIDIA 621.01, Windows 11 26300.9457 | `e0b08c7` | not run; pre-disassembled subset | run via run_gpu_tests.py | **Subset:** 82/98 passed, 16 skipped (native); 98/98 passed (`LEONIDA_W64_EMULATE=1`); Python assembler, no spirv-val. ctest 280/280 (MSVC) | none in the subset | [local note](../gpu-test-results/RTX5070Ti-62101.txt) |
 | NVIDIA GeForce RTX 3080 Ti (Ampere), subgroup 32..32 | NVIDIA 616.92, Windows 11 26300.9974 | `d478a92` | not run; pre-disassembled subset | run via run_gpu_tests.py | **Subset:** 81/97 passed, 16 skipped (native); 97/97 passed (`LEONIDA_W64_EMULATE=1`); Python assembler, no spirv-val | none in the subset | [local note](../gpu-test-results/RTX3080Ti-61692.txt) |
 | AMD Radeon RX 9070 GRE (RDNA4, GFX1201), subgroup 32..64 | RADV, Mesa 26.3.1-arch3.5, Vulkan 1.4.363, CachyOS | `05961f0` | 264/264 translated and valid | 203/206 pass, 3 skipped | 218/235 passed, 16 skipped (native and emulated) | `ms_wave_info_s3`, flaky (see below) | [local note](../gpu-test-results/RX9070GRE.txt) |
-| AMD Radeon RX 9070 XT (RDNA4, GFX1201), subgroup 32..64 | AMD 26.11.2 (LLPC), Vulkan 1.4.359, Windows 11 26300.9550 | `5d74c27` | not run | not run | 224/241 passed, 16 skipped, 1 failed (native); 225/241 passed, 0 failed (`LEONIDA_W64_EMULATE=1`) | `ms_wave_info_s3`, every native run, flaky emulated (see below) | [local note](../gpu-test-results/RX9070XT.txt) |
+| AMD Radeon RX 9070 XT (RDNA4, GFX1201), subgroup 32..64 | AMD 26.11.2 (LLPC), Vulkan 1.4.359, Windows 11 26200.9974 | `58be9cd` | exit 0 (native and emulated) | 219/222 pass, 3 skipped (mesh fixtures build.py does not build) | 236/252 passed, 16 skipped, 0 failed (native and `LEONIDA_W64_EMULATE=1`) | none | [local note](../gpu-test-results/RX9070XT.txt) |
+| AMD Radeon RX 9070 (RDNA4, GFX1201), subgroup 32..64 | AMD 26.11.2 (LLPC), 32.0.32029.2010, Vulkan 1.4.359, Windows 11 26200.9974 | `d0da7da` | not run | not run | 231/249 passed, 16 skipped, 2 failed (native and `LEONIDA_W64_EMULATE=1` alike) | `cs_imgload_tfe`, `cs_imgload_d16_tfe`: the fixtures' expectation (#98); `ms_wave_info_s3` passes | [local note](../gpu-test-results/RX9070.txt) |
+| AMD Radeon Graphics, Ryzen 5 7600X iGPU (RDNA2, gfx1036), subgroup 32..64 | AMD 26.11.2, 32.0.21045.29003, Vulkan 1.4.315, Windows 11 26200.9974 | `d0da7da` | not run | not run | 224/249 passed, 23 skipped, 2 failed (native and `LEONIDA_W64_EMULATE=1` alike) | `cs_imgload_tfe`, `cs_imgload_d16_tfe`: the fixtures' expectation (#98) | [local note](../gpu-test-results/Raphael-7600X-Win.txt) |
 | AMD Radeon RX 7900 GRE (RDNA3, gfx1100), subgroup 32..64 | AMD proprietary 26.11.2 (LLPC), Vulkan 1.4.359, Windows 11 x64 | `5d74c27` | 247/247 translated and valid | run via run_gpu_tests.py | 225/241 passed, 16 skipped | none | [#166](https://github.com/ItsNotRexed/Leonida/issues/166#issuecomment-7115041436) |
 | Intel Graphics (Meteor Lake, Xe-LPG), subgroup 8..32 | ANV, Mesa 26.2.7, Vulkan 1.4.354, Fedora 45 | `84347bb` | 279/279 translated and valid | 177/219 pass, 40 skipped, 2 failed | 194/248 passed, 52 skipped (native); 226/248 passed, 20 skipped (`LEONIDA_W64_EMULATE=1`) | `cs_imgload_tfe`, `cs_imgload_d16_tfe` (#31; pass with #98) | [local note](../gpu-test-results/IntelMTL.txt) |
+| NVIDIA GeForce RTX 5070 Ti (Blackwell), subgroup 32..32 | NVIDIA 617.42, Vulkan 1.4.351, Windows 11 Pro 26300 | `21625bc` | 257/257 translated and valid (run_gpu_tests.py) | run via run_gpu_tests.py | 197/248 passed, 49 skipped, 2 failed (native); 229/248 passed, 17 skipped, 2 failed (`LEONIDA_W64_EMULATE=1`) | `cs_imgload_tfe`, `cs_imgload_d16_tfe` (#31) | [local note](../gpu-test-results/RTX5070Ti.txt) |
 | Apple M5 Pro (16-core GPU, Metal 4), subgroup 4..32 | MoltenVK 1.4.2 (Homebrew), Vulkan 1.4.357, macOS 26.7.3 (25G342) | `d42773d07` | 280/280 translated and valid | 175/219 pass, 39 skipped, 5 failed | 183/248 passed, 61 skipped, 4 failed (native); 214/248 passed, 30 skipped, 4 failed (`LEONIDA_W64_EMULATE=1`) | `cs_fma_fused` (known row), `cs_imgload_tfe`, `cs_imgload_d16_tfe` (pass with #291), `ps_imgatomic` flake (#543) | [local note](../gpu-test-results/AppleM5Pro.txt) |
+| NVIDIA GeForce RTX 3080 (Ampere, GA102, 10 GB GDDR6X), subgroup 32..32 | NVIDIA 580.178.04, Vulkan 1.4.312, Ubuntu 26.04 LTS | `d2cd6c0` | not run | not run | 197/248 passed, 49 skipped, 2 failed (native); 229/248 passed, 17 skipped, 2 failed (`LEONIDA_W64_EMULATE=1`) | `cs_imgload_tfe`, `cs_imgload_d16_tfe` (#31; see #280) | [local note](../gpu-test-results/RTX3080.txt) |
 
 ## AMD Radeon RX 9070 GRE — 2026-11-23
 
@@ -37,43 +42,38 @@ Every pixel test other than the flaky mesh fixture was exact (4096/4096).
 AI-assisted (Hermes Agent): built `main` at `05961f0`, ran `build.py`, `check.py` and
 `run_gpu_tests.py` (native and emulated) on this GPU, and verified the isolated reruns of the one failure.
 
-## AMD Radeon RX 9070 XT — 2026-11-23
+## AMD Radeon RX 9070 XT — 2026-11-24
 
 ```
 GPU:        AMD Radeon RX 9070 XT (RDNA4 / GFX1201, Navi 48, PCI 1002:7550), subgroup 32..64
 Driver:     AMD proprietary 26.11.2 (LLPC), Vulkan 1.4.359
 Subgroup:   32..64 (minSubgroupSize 32, maxSubgroupSize 64; default 64, subgroupSizeControl)
-OS:         Windows 11, 10.0.26300.9550
-Commit:     5d74c272363f2703265d44e6aaab1a1df8ddfaf3 (main, 2026-11-23)
-Tools:      llvm-mc from ROCm/AOMP 18.0-12 (LLVM 19.0.0git), SPIRV-Tools v2026.4,
-            CMake 4.4.5, Visual Studio 17 2022 generator, MSVC 19.44.35230.0, Python 3.11.9
-run_gpu_tests.py: 247 shaders: 247 translated, 247 pass spirv-val
-            native:                 224/241 passed, 16 skipped, 1 failed
-            LEONIDA_W64_EMULATE=1:  225/241 passed, 16 skipped, 0 failed
-Failed:     ms_wave_info_s3: at (0,0) got (-1,-1,-1,-1), want (0.0078,0.0078,0.5,1.0).
-            Native: 3 of 3 isolated --filter reruns failed. Emulated: the full-suite
-            run passed it, then 1 of 3 isolated reruns passed, so the emulated path
-            is flaky here while native fails every time. Same signature as #6172 /
-            #5273 and as the RTX 4060 record (#8752), where it failed 3 of 3.
+OS:         Windows 11, 10.0.26200.9974
+Commit:     58be9cdf8df9a31bc7f6c068991f1aed381f7f4d (main, 2026-11-24)
+Tools:      llvm-mc LLVM 23.1.6 (conda-forge, AMDGPU target), SPIRV-Tools v2026.4,
+            CMake 4.4.4, Visual Studio 17 2022 generator, MSVC 14.44.35207, Python 3.12.10
+run_gpu_tests.py: 261 shaders: 261 translated, 261 pass spirv-val
+            native:                 236/252 passed, 16 skipped, 0 failed
+            LEONIDA_W64_EMULATE=1:  236/252 passed, 16 skipped, 0 failed
+build.py:   exit 0, native and emulated (6 mesh fixtures need a DXBC container and are not built)
+check.py:   219 of 222 pass, 3 skipped (those mesh fixtures), native and emulated
+Failed:     none
 Skipped:    16 skips are the documented "run by d3d12_*_test / w64_graphics.py" cases.
 ```
 
 Setup: `cmake -S runtime -B runtime/build` (default Visual Studio 17 2022 generator) and
-`cmake --build runtime/build --config RelWithDebInfo`. The suite ran on the AMD LLPC driver with
-the project's own `vk_harness`, `vk_compute_test` and `vk_store_test` binaries; no implicit layer
-beyond the Vulkan SDK's. Every other pixel and compute case was exact.
+`cmake --build runtime/build --config RelWithDebInfo`; then `run_gpu_tests.py`, and `build.py <out>` with
+`check.py <out> runtime/build/RelWithDebInfo`, each once without and once with `LEONIDA_W64_EMULATE=1`. The suites
+ran on the AMD LLPC driver with the project's own `vk_harness`, `vk_compute_test` and `vk_store_test` binaries; no
+implicit layer beyond the Vulkan SDK's.
 
-The one failure is worth a note for #6172: on this machine the native 64-wide path fails
-`ms_wave_info_s3` on every run, while `LEONIDA_W64_EMULATE=1` passes it most of the time, which is
-the shape a lane-set-dependent race takes rather than a driver-specific miscompile. It also
-reproduces with an AMD proprietary driver, so the symptom is not tied to RADV or to Mesa's shader
-cache.
+This replaces the 2026-11-23 record (`5d74c27`), which had `ms_wave_info_s3` failing on every native run and
+`build.py` / `check.py` not run. On `58be9cd` the same driver passes `ms_wave_info_s3` with 4096/4096 exact pixels in
+both full runs and in 3 of 3 isolated `--filter` reruns each way, and the D3D12-side columns are measured for the
+first time on this card. The two `cs_imgload*_tfe` failures of earlier runs are gone with the fixture fix (#892).
 
-`build.py` and `check.py` (the D3D12-side rows in the table) were not run here; the counts above
-come from `run_gpu_tests.py`, which builds and translates the same fixtures.
-
-AI-assisted (Cline): built `main` at `5d74c27` with MSVC, ran `run_gpu_tests.py` native and under
-`LEONIDA_W64_EMULATE=1`, and reran the failure in isolation three times each way.
+AI-assisted: built `main` at `58be9cd` with MSVC, ran the three scripts native and under `LEONIDA_W64_EMULATE=1`,
+and reran `ms_wave_info_s3` in isolation three times each way.
 
 ## AMD Radeon RX 7900 GRE — 2026-11-23
 

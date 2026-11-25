@@ -16,7 +16,7 @@ case-sensitive joaat of the GTA V class names, and the resource's own schema giv
                                                           RotationIdx @0xD
 
 Fields are read through the schema member table (by name hash), never at fixed offsets, and the tool counts how
-often the schema agrees with the offsets above. An InstanceList is an array: a u64 pointer whose low 12 bits are
+often the schema agrees with the offsets above. An InstanceList is an array: a u64 pointer whose low 20 bits are
 the 1-based block index and whose bits 20+ are the byte offset in that block, then a u16 count. The block table
 entry places the block in the virtual (0x5...) or physical (0x6...) buffer of the resource; the buffers are the
 first v and next p zlib streams of the resource, with v and p in the block map (+0x08 -> +8, +9).
@@ -101,7 +101,7 @@ def array(V, P, blocks, base_buf, at):
     count = struct.unpack_from("<H", base_buf, at + 8)[0]
     if count == 0:
         return "empty"
-    k = (p & 0xFFF) - 1
+    k = wi.split_pointer(p)[0] - 1
     if not 0 <= k < len(blocks):
         return None
     buf, boff = resolve(V, P, blocks[k][2])

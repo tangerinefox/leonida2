@@ -103,6 +103,42 @@ class Conventions(unittest.TestCase):
         self.assertEqual(reader.read(b'<R><Item value="1"/><Item value="2"/></R>')[2], [1, 2])
         self.assertEqual(reader.read(b'<R>leaf</R>')[2], "leaf")
 
+    def test_empty_typed_objects_keep_class_in_roots_lists_and_maps(self):
+        cases = (
+            (b'<Root type="CEmpty"/>', {"$type": "CEmpty"}, 1),
+            (b'<Root type="CEmpty"> \t\n </Root>', {"$type": "CEmpty"}, 1),
+            (b'<Root><Item type="CEmpty"/><Item type="CEmpty" name="named" userFlags="3">\n</Item></Root>',
+             [{"$type": "CEmpty"}, {"$type": "CEmpty", "@name": "named", "@userFlags": 3}], 2),
+            (b'<Root><Item key="first" type="CEmpty"/><Item key="second" type="CEmpty"/></Root>',
+             {"first": {"$type": "CEmpty"}, "second": {"$type": "CEmpty"}}, 2),
+        )
+        for raw, expected, object_count in cases:
+            with self.subTest(raw=raw):
+                stream_reader = R.Reader(root_handlers={}, type_handlers={})
+                whole_reader = R.Reader(root_handlers={}, type_handlers={})
+                self.assertEqual(stream_reader.read(raw)[2], expected)
+                self.assertEqual(whole_reader.convert(ET.fromstring(raw)), expected)
+                self.assertEqual(stream_reader.stats, whole_reader.stats)
+                self.assertEqual(stream_reader.types, {"CEmpty": object_count})
+                self.assertEqual(stream_reader.types, whole_reader.types)
+                self.assertEqual(stream_reader.stats["object"], object_count)
+                self.assertEqual(stream_reader.stats["text"], 0)
+
+    def test_empty_objects_do_not_change_other_leaf_conventions(self):
+        raw = (b'<Root><plain/><null type="NULL"/><text type="CText"> leaf </text>'
+               b'<scalar type="CScalar" value="0"/><vector type="CVector" x="1" y="2"/>'
+               b'<array type="CArray" content="short_array"/><ref type="CRef" ref="target"/></Root>')
+        expected = {"plain": "", "null": None, "text": "leaf", "scalar": 0, "vector": (1.0, 2.0),
+                    "array": [], "ref": {"$ref": "target"}}
+        stream_reader = R.Reader(root_handlers={}, type_handlers={})
+        whole_reader = R.Reader(root_handlers={}, type_handlers={})
+        self.assertEqual(stream_reader.read(raw)[2], expected)
+        self.assertEqual(whole_reader.convert(ET.fromstring(raw)), expected)
+        self.assertEqual(stream_reader.stats, whole_reader.stats)
+        self.assertEqual(stream_reader.types, whole_reader.types)
+        self.assertEqual(stream_reader.stats["object"], 0)
+        self.assertEqual(stream_reader.stats["text"], 2)
+
     def test_vector_with_extra_attributes_and_non_vector_xyzw(self):
         reader = R.Reader(root_handlers={}, type_handlers={})
         self.assertEqual(
@@ -165,6 +201,31 @@ class Conventions(unittest.TestCase):
 
 
 class Dispatch(unittest.TestCase):
+    def test_empty_type_handler_can_use_generic_class_without_double_counting(self):
+        def empty(el, reader):
+            generic = reader.convert(el, use_type_handler=False)
+            return {**generic, "default": 7}
+
+        raw = b'<Root><Item type="CEmpty" name="named"/></Root>'
+        reader = R.Reader(root_handlers={}, type_handlers={"CEmpty": empty})
+        self.assertEqual(reader.read(raw)[2], [{"$type": "CEmpty", "@name": "named", "default": 7}])
+        self.assertEqual(reader.types, {"CEmpty": 1})
+        self.assertEqual(reader.stats["type handler"], 1)
+        self.assertEqual(reader.stats["object"], 1)
+        self.assertEqual(reader.stats["extra attributes"], 1)
+
+        calls = []
+
+        def root(el, reader):
+            calls.append((el.tag, el.attrib["type"]))
+            return "root default"
+
+        root_reader = R.Reader(root_handlers={"Root": root}, type_handlers={"CEmpty": empty})
+        self.assertEqual(root_reader.read(b'<Root type="CEmpty"/>')[2], "root default")
+        self.assertEqual(calls, [("Root", "CEmpty")])
+        self.assertEqual(root_reader.stats["root handler"], 1)
+        self.assertEqual(root_reader.stats["type handler"], 0)
+
     def test_type_handler(self):
         calls = []
 

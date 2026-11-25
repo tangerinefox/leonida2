@@ -61,6 +61,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 
 if __name__ == "__main__" and sys.version_info < (3, 12):   # before code an older Python can't run
@@ -69,7 +70,7 @@ if __name__ == "__main__" and sys.version_info < (3, 12):   # before code an old
 ROOT = os.path.dirname(os.path.abspath(__file__))
 TOOLS = os.path.join(ROOT, "tools")
 sys.path.insert(0, TOOLS)
-from mc_command import install_hint as mc_install_hint, mc_command  # noqa: E402
+from mc_command import install_hint as mc_install_hint, mc_command, split_command  # noqa: E402
 import leonida_tui  # noqa: E402
 from shader_stage_manifest import shader_stems  # noqa: E402
 from replace_retry import replace as replace_retry  # noqa: E402
@@ -273,10 +274,11 @@ def py(tool: str, *args) -> None:
 
 def tool_available(cmd: str) -> bool:
     """A PATH name, a path, or a whole command line such as 'wsl -e /usr/lib/llvm-21/bin/llvm-mc'."""
-    cmd = cmd.strip().strip('"')
-    if os.path.isfile(cmd):
-        return True
-    head = cmd.split()[0].strip('"') if cmd.split() else ""
+    try:
+        parts = split_command(cmd)
+    except SystemExit:
+        return False
+    head = parts[0] if parts else ""
     return bool(head and (shutil.which(head) or os.path.isfile(head)))
 
 
@@ -373,14 +375,78 @@ def match_version(game: str):
     return next((v for v in versions() if not probe_mismatches(game, v)), None)
 
 
+def manifest_presence(game: str, version: dict) -> tuple[int, list[str], list[str], list[str]]:
+    """How much of a version's manifest the folder holds, from names and sizes only: (files present with the
+    manifest's size, the names that are missing or not a regular file, the names with another size, and
+    "name (reason)" for each file whose metadata can't be read). As in probe_mismatches(), only a name that is not
+    there counts as missing: a file that exists but can't be read (permissions, a drive error) is listed apart."""
+    matched, missing, wrong, unreadable = 0, [], [], []
+    for rel, info in version["files"].items():
+        try:
+            st = os.stat(os.path.join(game, *rel.split("/")))
+        except (FileNotFoundError, NotADirectoryError):
+            missing.append(rel)
+            continue
+        except OSError as error:
+            unreadable.append(f"{rel} ({error.strerror or error})")
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            missing.append(rel)
+        elif st.st_size != info["size"]:
+            wrong.append(rel)
+        else:
+            matched += 1
+    return matched, missing, wrong, unreadable
+
+
+def partial_version_message(game: str, version: dict) -> str | None:
+    """The message for a folder that holds at least half of a version's manifest files with their sizes but misses
+    a probe file, so it is an incomplete copy of that version rather than another game. None below half, and None
+    when a probe file is there with another size: a download that stopped early leaves files missing, while a probe
+    with another size (MicrosoftGame.Config above all) is what a complete copy of another build looks like, so
+    load_version() keeps its "not a supported version" message, which lists those sizes."""
+    total = len(version["files"])
+    matched, missing, wrong, unreadable = manifest_presence(game, version)
+    if not total or not matched or 2 * matched < total:
+        return None
+    if any(name in wrong for name in PROBES):
+        return None
+    files = version["files"]
+    name = f"{version['title']} {version['version']}"
+    head = f"an incomplete copy of {name}" if missing or wrong else f"{name}, but not every file could be checked"
+    lines = [f"This looks like {head}: {matched} of {total} manifest files are present with matching sizes."]
+    if missing:
+        lines.append(f"{len(missing)} file(s) missing ({sum(files[n]['size'] for n in missing):,} bytes):")
+        lines += [f"  missing  {n}" for n in missing]
+    if wrong:
+        lines.append(f"{len(wrong)} file(s) with another size (still being copied or downloaded?):")
+        lines += [f"  wrong size  {n} (expected {files[n]['size']:,} bytes)" for n in wrong]
+    if unreadable:
+        lines.append(f"Cannot read file metadata for {len(unreadable)} file(s) (not counted as missing):")
+        lines += [f"  cannot read  {n}" for n in unreadable]
+    if missing or wrong:
+        lines.append(f"Finish the download or copy of version {version['version']} into {game}, then build again.")
+    if unreadable:
+        lines.append("Make those files readable for this user (check their permissions and the drive), then build "
+                     "again.")
+    return "\n".join(lines)
+
+
 def load_version(game: str) -> dict:
-    reports = []
+    reports, candidates = [], []
     for version in versions():
         mismatches = probe_mismatches(game, version)
         if not mismatches:
             return version
+        candidates.append(version)
         reports.append(f"  {version['title']} {version['version']}\n    " + "\n    ".join(mismatches))
     notes = "".join(f"\n{container_message(p, h)}" for p, h in containers_in(game))
+    # A copy that stopped downloading early misses a probe file but holds most of one version: say which and what
+    # is missing instead of calling it unsupported. The closest version (most files present) is named.
+    partial = max(candidates, key=lambda v: manifest_presence(game, v)[0], default=None)
+    message = partial_version_message(game, partial) if partial else None
+    if message:
+        fail(message + notes)
     fail("This doesn't look like a supported version of the game. Point --game at the folder that holds "
          "MicrosoftGame.Config and the .rpf archives.\nSupported:\n"
          + "\n".join(reports or ["  No version manifests found."]) + notes)
@@ -887,6 +953,10 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
                 missing.append(pipeline_check_prerequisite(runtime_building))
     if missing:
         fail("Install these first, then run the build again:\n  - " + "\n  - ".join(dict.fromkeys(missing)))
+    if os.name == "nt" and "runtime" in stages and not runtime_build and not os.environ.get("VULKAN_SDK"):
+        log("warning: VULKAN_SDK is not set, so the runtime may be built without the Vulkan D3D12 device and "
+            "LEONIDA_D3D12=vulkan would then be ignored. Install the Vulkan SDK (https://vulkan.lunarg.com/), "
+            "reopen the terminal and run the build again to get it.")
     if "pipelines" in stages and "shaders" not in stages:
         require_translated_shaders(work)
     need = {s: MIN_FREE_GB.get(s, 0) for s in stages}
@@ -1079,7 +1149,7 @@ def ensure_submodule() -> None:
          "\"git submodule update --init --recursive\" in this folder and build again.")
 
 
-def check(game: str, full: bool) -> dict:
+def check(game: str, full: bool, *, jobs: int | None = None) -> dict:
     if not os.path.isdir(game):
         h = xvd_header(game) if os.path.isfile(game) else None
         fail(container_message(game, h) if h else f"Game folder not found: {game}")
@@ -1095,7 +1165,9 @@ def check(game: str, full: bool) -> dict:
     if bad:
         fail(f"{bad} file(s) missing or different. Use a complete, unmodified copy of version {v['version']}.")
     if full:
-        py("manifest.py", "verify", game, "--manifest", os.path.join(VERSIONS, f"xbox-{v['version']}.json"))
+        job_args = [] if jobs is None else ["--jobs", str(jobs)]
+        py("manifest.py", "verify", game, "--manifest",
+           os.path.join(VERSIONS, f"xbox-{v['version']}.json"), *job_args)
     exe = os.path.join(game, v["expected_exe"])
     log(f"check: all files present{' and hashes match' if full else ''}. "
         + ("Executable found." if os.path.isfile(exe) else
@@ -2912,6 +2984,20 @@ def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, w
         "pipelines": fn_pipelines,
     }
 
+    reported: set[str] = set()
+
+    def report_unexpected(name: str, exc: BaseException) -> None:
+        """A stage that fails through fail() already printed a diagnostic; one that raises outright did
+        not. Report the stage and the exception once per stage, so a failure is never silent."""
+        if isinstance(exc, RuntimeError) and str(exc).startswith("stage exited with "):
+            return  # fail() called sys.exit; its diagnostic already went out
+        key = f"{name}: {exc!r}"
+        if key in reported:
+            return
+        reported.add(key)
+        print(f"\nERROR: stage '{name}' failed with an unexpected exception: {exc!r}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+
     if not overlap:
         order = [s for s in ("shaders", "assets", "runtime", "pipelines") if s in stages]
         if not order:
@@ -2921,7 +3007,8 @@ def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, w
             try:
                 _invoke_stage(name, builders[name])
                 progress.complete(name)
-            except Exception:
+            except Exception as exc:
+                report_unexpected(name, exc)
                 sys.exit(1)
         return
 
@@ -2950,7 +3037,8 @@ def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, w
                 futures[name].result()
                 progress.complete(name)
                 return True
-            except Exception:
+            except Exception as exc:
+                report_unexpected(name, exc)
                 failed = True
                 return False
 
@@ -2968,7 +3056,8 @@ def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, w
             try:
                 fut.result()
                 progress.complete(name)
-            except Exception:
+            except Exception as exc:
+                report_unexpected(name, exc)
                 failed = True
         ex.shutdown(wait=True)
     except KeyboardInterrupt:
@@ -2996,7 +3085,8 @@ def main() -> int:
     ap.add_argument("--work", type=nonempty_path, help="folder for intermediate files (hundreds of GB; default <out>/work)")
     ap.add_argument("--stages", help="comma list from: " + ",".join(STAGES))
     ap.add_argument("--check", action="store_true", help="only check the game files")
-    ap.add_argument("--full-check", action="store_true", help="also compare SHA-256 of every file (slow)")
+    ap.add_argument("--full-check", action="store_true",
+                    help="also verify each manifest file's SHA-256 using --jobs workers (slow)")
     ap.add_argument("--wav", action="store_true",
                     help="also decode the Ogg Opus audio to 16-bit PCM WAV (much larger; needs ffmpeg)")
     ap.add_argument("--jobs", type=positive_int, default=max(1, (os.cpu_count() or 2) // 2))
@@ -3071,7 +3161,8 @@ def main() -> int:
     work = os.path.abspath(a.work or os.path.join(out, "work"))
     require_folder("--out", out)
     require_folder("--work", work)
-    v = check(game, a.full_check)
+    a.jobs = leonida_tui.clamp_jobs(a.jobs)
+    v = check(game, a.full_check, jobs=a.jobs)
     if a.check:
         return 0
     # Resolve existing parents too: a not-yet-created destination can be under a junction or symlink.
@@ -3153,7 +3244,6 @@ def main() -> int:
             a.pc_tail_ubo = True
     fallbacks = fallback_flags(a) if "shaders" in stages else ()
     overlap = True
-    a.jobs = leonida_tui.clamp_jobs(a.jobs)
     use_tui = leonida_tui.tui_eligible(a.no_tui)
     if use_tui:
         cfg = leonida_tui.run_setup(a.jobs, default_overlap=True)

@@ -139,6 +139,24 @@ re-measured on this package by `tools/navmesh_nodes.py`
 confirmed by the lane-graph heights. The label is consistent with the count, but not settled by it: nine in ten
 lane nodes stand on polygons with both bit 8 and bit 13, and which bit or combination means road surface is open.
 
+## Marvisak/VIctory
+
+<https://github.com/Marvisak/VIctory>
+
+A Windows compatibility project for Xbox Series. Its GPU layer translates console command streams to host
+Direct3D 12.
+
+**Licence:** **GPL-3.0-or-later**, as declared in the [workspace manifest][victory-workspace] and the
+[README][victory-readme]. The [GPU crate][victory-gpu] inherits the workspace licence.
+
+**What we use it for:** prior art for deferring CPU-side value writes until the recorded command-list work has
+completed, as discussed in [#622](https://github.com/ubiquitarianism/leonida/pull/622). That PR uses synthetic
+tests to verify the ordering of submissions and writes in Leonida's own implementation.
+
+[victory-workspace]: https://github.com/Marvisak/VIctory/blob/ffe310eb2098e52169f4c44db5ffdabf43a72622/Cargo.toml
+[victory-readme]: https://github.com/Marvisak/VIctory/blob/ffe310eb2098e52169f4c44db5ffdabf43a72622/README.md#license
+[victory-gpu]: https://github.com/Marvisak/VIctory/blob/ffe310eb2098e52169f4c44db5ffdabf43a72622/crates/victory-gpu/Cargo.toml
+
 ## microsoft/libHttpClient
 
 <https://github.com/microsoft/libHttpClient>

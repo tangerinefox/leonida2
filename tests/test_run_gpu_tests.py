@@ -937,5 +937,52 @@ class FmaFusedSuite(unittest.TestCase):
         self.assertIn("SKIP (unsupported: no VK_KHR_shader_fma)", out)
 
 
+
+class TbufferStoreVerdict(unittest.TestCase):
+    """cs_tbuffer_store (tbuffer_store_test): its verdict must reach the summary. The branch in run_suite used to
+    drop it, so a failing run printed no row and the total still counted the test as absent."""
+    NAME = "cs_tbuffer_store"
+
+    def run_suite(self, verdict):
+        def run_cmd(cmd, env=None, gpu=True):
+            if rgt.TRANSLATOR in cmd:   # the translator publishes a module for every input
+                out = cmd[cmd.index("--out") + 1]
+                for s in os.listdir(cmd[cmd.index(rgt.TRANSLATOR) + 1]):
+                    Path(out, Path(s).stem + ".spv").touch()
+                return 0, ""
+            return 0, ""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            args = SimpleNamespace(filter=self.NAME, build=tmp, llvm_mc="unused")
+            out = io.StringIO()
+            with (patch.object(rgt, "tbuffer_store_test", return_value=verdict),
+                  patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                  patch.object(rgt, "spirv_as"),
+                  patch.object(rgt, "run_cmd", side_effect=run_cmd),
+                  contextlib.redirect_stdout(out), contextlib.redirect_stderr(out)):
+                rc = rgt.run_suite(args, tmp)
+        return rc, out.getvalue()
+
+    def test_a_failure_is_recorded(self):
+        rc, out = self.run_suite("word 3: expected 0x40800000, got 0x0")
+        self.assertIn(f"FAIL  {self.NAME}", out)
+        self.assertIn("word 3: expected 0x40800000, got 0x0", out)
+        self.assertIn("0/1 passed", out)
+        self.assertEqual(rc, 1, out)
+
+    def test_a_pass_is_recorded(self):
+        rc, out = self.run_suite("")
+        self.assertIn(f"PASS  {self.NAME}", out)
+        self.assertIn("128/128 dumped words exact", out)
+        self.assertIn("1/1 passed", out)
+        self.assertEqual(rc, 0, out)
+
+    def test_a_device_skip_is_recorded_as_a_skip(self):
+        rc, out = self.run_suite(check.Skip("SKIP (unsupported: no Int64)"))
+        self.assertIn(f"SKIP  {self.NAME}", out)
+        self.assertIn("1 skipped", out)
+        self.assertEqual(rc, 0, out)
+
+
 if __name__ == "__main__":
     unittest.main()

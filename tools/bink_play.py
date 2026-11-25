@@ -11,7 +11,8 @@ Usage:
 
 ``--game-dir`` defaults to ``LEONIDA_GAME_DIR``. Naming the streams takes about half a minute, so the name table
 (names, offsets and frame sizes only, no movie data) is kept in ``%LOCALAPPDATA%\\Leonida\\bink_names.csv`` and rebuilt
-when the archive or mount source changes, or the cached table cannot be parsed. ``--no-cache`` skips it.
+when the archive or mount source changes, or the cached table cannot be parsed. ``--no-cache`` skips it and
+keeps its temporary report in the system temporary directory instead of the persistent cache directory.
 The names are a local work product: don't commit or post them.
 """
 import argparse
@@ -62,15 +63,18 @@ def _read_cache(cache, key):
 
 def load_names(archive, mount, use_cache=True):
     """[(path, offset, width, height, frames)] for the streams of ``archive``, named from ``mount``."""
-    cache = cache_path()
-    key = stamp(archive) + "|" + stamp(mount)  # the names come from the mount lists too
-    if use_cache and cache.is_file():
-        rows = _read_cache(cache, key)
-        if rows is not None:
-            return rows
-    cache.parent.mkdir(parents=True, exist_ok=True)
+    report_dir = None
+    if use_cache:
+        cache = cache_path()
+        key = stamp(archive) + "|" + stamp(mount)  # the names come from the mount lists too
+        if cache.is_file():
+            rows = _read_cache(cache, key)
+            if rows is not None:
+                return rows
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        report_dir = cache.parent
     # Each lookup gets its own report and staging file: two runs at once must not remove or replace each other's.
-    fd, name = tempfile.mkstemp(prefix="bink_names.", suffix=".tmp.csv", dir=cache.parent)
+    fd, name = tempfile.mkstemp(prefix="bink_names.", suffix=".tmp.csv", dir=report_dir)
     os.close(fd)
     tmp = Path(name)
     try:

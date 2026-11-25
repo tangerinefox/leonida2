@@ -43,7 +43,7 @@ class LibraryComputeForms(unittest.TestCase):
 
     def test_recovered_vcc_tuple(self):
         code = raw_words(fixture("vcc_tuple_word"))
-        self.assertEqual(rdna2spirv.restore_skipped_instructions([], code, 0, len(code))[0]["args"][0]["r"],
+        self.assertEqual(rdna2spirv.restore_vcc_tuples([], code, 0, len(code))[0]["args"][0]["r"],
                          [104, 105, "vcc_lo", "vcc_hi"])
 
     def run_wave32(self, name, memory):
@@ -94,8 +94,9 @@ class LibraryComputeForms(unittest.TestCase):
                 self.assertEqual((row["op"], row["args"][0]["t"], row["args"][1]["r"], row["args"][2]["r"]),
                                  ("v_cmp_gt_f32_dpp", "vcc_lo" if wave32 else "vcc", 7, 12))
                 self.assertIn(control, row["mods"])
-            junk = {"pc": 4, "enc": blob[4:].hex()}
-            recovered, = rdna2spirv.restore_skipped_instructions([junk], blob, 0, len(blob))
+            # a listing entry as llvm-mc prints the second word: restore_vcc_tuples reads its op, as it does a real one
+            junk = {"pc": 4, "enc": blob[4:].hex(), "op": "s_nop", "args": [{"k": "imm", "v": 0}], "mods": []}
+            recovered, = rdna2spirv.restore_vcc_tuples([junk], blob, 0, len(blob), wave32=wave32)
             self.assertEqual((recovered["pc"], recovered["enc"]), (0, blob.hex()))
             self.assertFalse(rdna2_decode.decode_bytes(blob[:4])["insns"])
 

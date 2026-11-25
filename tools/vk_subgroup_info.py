@@ -28,8 +28,10 @@ driver. Its shader compiler can crash in vkCreateComputePipelines on emulated wa
 (#857, reported on RX 5000, RX 6000 and RDNA2 iGPUs). make_game.py prefers native wave64 when the GPU can run it.
 
 per_vertex_inputs says whether the device can run a pixel shader with PerVertexKHR inputs (16-bit interpolation,
-docs/design.md): the fragmentShaderBarycentric feature, and a driver other than MoltenVK, whose SPIR-V to MSL
-conversion rejects the decoration ("PerVertexKHR decoration is not supported in MSL", MoltenVK 1.4.2). Where it is
+docs/design.md): the fragmentShaderBarycentric feature with VK_KHR_fragment_shader_barycentric in the device's
+extension list, and a driver other than MoltenVK, whose SPIR-V to MSL conversion rejects the decoration
+("PerVertexKHR decoration is not supported in MSL", MoltenVK 1.4.2). The feature alone is not enough: RADV (Mesa
+26.2.6) fills it with a one on a gfx90c iGPU (Vega 8, PCI 1002:15E7) that doesn't list the extension. Where it is
 false, the shaders are translated with --f16-interp-fallback.
 
 barycentric_fallback is true for Intel's open-source Mesa driver (ANV). SHADER-925 found that Mesa ANV 26.2.5
@@ -92,6 +94,7 @@ VK_API_VERSION_1_2 = (1 << 22) | (2 << 12)
 VK_API_VERSION_1_3 = (1 << 22) | (3 << 12)
 VK_INCOMPLETE = 5
 VULKAN_12_REQUIRED_EXTENSIONS = frozenset((b"VK_KHR_dynamic_rendering", b"VK_KHR_synchronization2"))
+FRAGMENT_SHADER_BARYCENTRIC_EXTENSION = b"VK_KHR_fragment_shader_barycentric"
 
 PROPS_SIZE = 824            # sizeof(VkPhysicalDeviceProperties) on 64-bit
 FEATURES2_SIZE = 240        # sizeof(VkPhysicalDeviceFeatures2): 16 + 55 VkBool32, padded to 8
@@ -264,6 +267,8 @@ def query(*, stage_caps=False) -> dict:
         device_filter = os.environ.get("LEONIDA_VK_DEVICE", "")
         wanted = device_filter.lower()
         chosen = None
+        chosen_d = None
+        chosen_extensions = None
         chosen_rank = -1
         for d in devs:
             d = ctypes.c_void_p(d)
@@ -327,6 +332,8 @@ def query(*, stage_caps=False) -> dict:
             rank = device_rank(dtype, vendor_id)
             if rank > chosen_rank:
                 chosen_rank = rank
+                chosen_d = d
+                chosen_extensions = None if core13 else extensions
                 chosen = (dev_name,
                           subgroup.subgroupSize, subgroup.supportedStages, sg.minSubgroupSize, sg.maxSubgroupSize,
                           sg.requiredSubgroupSizeStages, sg.maxComputeWorkgroupSubgroups,
@@ -344,6 +351,11 @@ def query(*, stage_caps=False) -> dict:
             raise RuntimeError("no Vulkan 1.3 GPU with the features and graphics queue the runtime needs")
         (name, subgroup_size, supported_stages, lo, hi, required_stages, max_workgroup_subgroups,
          sgc, per_vertex, max_push_constants_size, vendor, device, driver) = chosen
+        if per_vertex:
+            # The feature counts only with its extension listed (RADV sets it on gfx90c without one).
+            # Reuse the Vulkan 1.2 extension set already fetched above, and query Vulkan 1.3 devices only once chosen.
+            exts = device_extensions(vk, chosen_d) if chosen_extensions is None else chosen_extensions
+            per_vertex = FRAGMENT_SHADER_BARYCENTRIC_EXTENSION in exts
         compute_required = bool(required_stages & VK_SHADER_STAGE_COMPUTE_BIT)
         mesh_required = bool(required_stages & VK_SHADER_STAGE_MESH_BIT_EXT)
         compute_supported = bool(supported_stages & VK_SHADER_STAGE_COMPUTE_BIT)

@@ -163,6 +163,39 @@ class ModeRoundProbeTests(unittest.TestCase):
             finally:
                 os.chmod(out_json, 0o600)
 
+    def test_oracle_closed_on_success(self):
+        fake = FakeModeOracle()
+        mock_close = mock.MagicMock()
+        fake.close = mock_close
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(runner, "open_oracle", return_value=fake), \
+             mock.patch.object(hw_asm, "family", return_value="gfx10"), \
+             mock.patch.object(sys, "stdout", out), mock.patch.object(sys, "stderr", err):
+            rc = probe.main(["--waves", "32"])
+        self.assertEqual(rc, 0)
+        mock_close.assert_called_once()
+
+    def test_oracle_closed_on_non_gfx10_skip(self):
+        fake = mock.MagicMock()
+        fake.arch = "gfx900"
+        err = io.StringIO()
+        with mock.patch.object(runner, "open_oracle", return_value=fake), \
+             mock.patch.object(hw_asm, "family", return_value="gfx9"), \
+             mock.patch.object(sys, "stderr", err):
+            rc = probe.main(["--waves", "32"])
+        self.assertEqual(rc, 77)
+        fake.close.assert_called_once()
+
+    def test_oracle_closed_on_probe_exception(self):
+        fake = mock.MagicMock()
+        fake.arch = "gfx1030"
+        with mock.patch.object(runner, "open_oracle", return_value=fake), \
+             mock.patch.object(hw_asm, "family", return_value="gfx10"), \
+             mock.patch.object(probe, "probe_cases", side_effect=RuntimeError("probe failed")):
+            with self.assertRaises(RuntimeError):
+                probe.main(["--waves", "32"])
+        fake.close.assert_called_once()
+
 
 class FakeModeOracle:
     """Answers the probe's kernels from the tables in tools/mode_round_probe.py, like a GFX10 GPU that matches them,
@@ -171,6 +204,9 @@ class FakeModeOracle:
 
     def __init__(self, bad_op=None, diffs=0):
         self.bad_op, self.diffs = bad_op, diffs
+
+    def close(self):
+        pass
 
     def run(self, programs, words=4):
         out = []

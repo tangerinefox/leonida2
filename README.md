@@ -220,11 +220,13 @@ Stages: `check` always runs first; then `shaders`, `assets` and `runtime` run to
 depend on each other). `pipelines` starts once the translated shaders are ready and, when this run includes runtime,
 that stage has finished rebuilding `vk_pipeline_check`, so it can overlap the rest of assets; it creates every
 translated shader on your GPU driver, reports any it has to skip, and saves a pipeline cache to `pipeline_cache.bin`
-in `--out` (the runtime doesn't load that cache yet, so it doesn't speed up the first boot). The shader translation
-is the longest CPU step: it runs on `--jobs` processes (half the CPU threads by default). When shaders and assets
-share the machine, that budget is split between them and passed to `rpf9dump` as `--jobs`; a solo assets run still
-lets `rpf9dump` use every core. Progress lines include percent and a rough ETA for translation shards, asset steps,
-and overall stage completion.
+in `--out`, which also holds `gta6rt.exe` after the `runtime` stage. The runtime seeds its Vulkan pipeline cache
+from the file beside the executable when its header matches the device and pipeline cache UUID. It falls back to
+an empty cache if the file is missing, incompatible, or rejected by the driver. Shader translation is the longest
+CPU step. It runs on `--jobs` processes (half the CPU threads by default). When shaders and assets share the machine,
+that budget is split between them and passed to `rpf9dump` as `--jobs`. A solo assets run still lets `rpf9dump` use
+every core. Progress lines include percent and a rough ETA for translation shards, asset steps, and overall stage
+completion.
 
 On an interactive terminal, a LEONIDA setup screen lets you set jobs and whether stages overlap, then a key-switchable
 per-stage log view (`1`–`4` / `Tab`) keeps parallel output demuxed; full stage logs go under `work/logs/`. Use
@@ -268,6 +270,10 @@ Either way it copies `gta6rt.exe` and `gta6rt_tls_host.dll` into `--out` and wri
 starts `gta6rt.exe` with `wine`, or with the Wine named by `WINE` (for Proton, its `files/bin/wine`). The same option
 skips the build on Windows.
 
+For `tools/pe_inspect.py`'s import classes on Linux, set `WINEPREFIX` to the prefix the loader runs in (or use
+`~/.wine`); without one, system DLLs are reported as `system (unverified)`
+([docs/design.md](docs/design.md#day-one-when-the-exe-is-here)).
+
 On Linux, run `<out>/gta6rt.sh --dry-run` to inspect the packaged title's imports, then
 `<out>/gta6rt.sh --init` to check TLS callbacks and DLL initialization. Use `<out>/gta6rt.sh --run` for startup.
 These commands use the package in `game_path.txt`, the port's `overlay` for writes, and Vulkan by default.
@@ -304,8 +310,9 @@ The biggest open pieces:
 - **World start**: the story load finishes, but no world frame has been verified yet;
   [Where it stops](docs/linux_proton.md#where-it-stops) lists what stops it.
 - **Shader translator on hardware**: compute, mesh and geometry now translate (see the translator contract in
-  [docs/design.md](docs/design.md)); still open are the vertex-shader input layout (`v0` = `VertexIndex` is
-  unverified if the console runs VS as NGG) and wave64 cross-half code in VS/PS/GS on 32-wide subgroups.
+  [docs/design.md](docs/design.md)); still open is wave64 cross-half code in VS/PS/GS on 32-wide subgroups. The
+  vertex-shader input layout is measured: all 2,236 VS are legacy (non-NGG), with `v0` = `VertexIndex` (the
+  *Inputs and outputs* row of [docs/design.md](docs/design.md)).
 - **Xbox D3D12 → Vulkan**: mesh-shader draws, indirect draw state and stream output are still open; #313 tracks the
   remaining method surface. The Windows integration exercises the first-run UI. [Plan and status](docs/d3d12_vulkan.md)
 - **Model recovery**: investigate the 71 unrecovered fragment candidates in [`levels.rpf`](docs/models.md#full-archive-re-count-at-e293917).

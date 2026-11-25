@@ -387,7 +387,7 @@ class TestTranslateIntegrationBoundaryChecks(unittest.TestCase):
         export = [0x0F, 0x18, 0x00, 0xF8, 0x00, 0x01, 0x00, 0x01]
         endpgm = [0x00, 0x00, 0x81, 0xBF]
         # The word of the finding was [0x00,0x50,0x16,0xCC, 0x01,0x05,0x0E,0x0C]; the translator recovers that one
-        # v_dot4_i32_i8 form from the program's words now (restore_skipped_instructions), so it is no longer a gap.
+        # v_dot4_i32_i8 form from the program's words now (rdna2spirv.skipped_form), so it is no longer a gap.
         # This is the same instruction with another op_sel, which is not recovered and stays skipped.
         gap = [0x00, 0x58, 0x16, 0xCC, 0x01, 0x05, 0x0E, 0x0C]
 

@@ -27,6 +27,13 @@ import re
 import struct
 import subprocess
 import sys
+import tempfile
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+import replace_retry  # noqa: E402
+from file_mode import published_mode  # noqa: E402
 
 # Left out: anything that writes memory or images, LDS, and the rare instructions the harness has no setup for.
 # Loads are fine: with empty user data they read zeros from the start of the harness's heap, the same for both.
@@ -74,8 +81,8 @@ def select_candidates(index, disasm_dir, spirv_dir, count=150, loops="none", nam
     if count < 1:       # the check below runs after the first append, so 0 or less still picked one shader
         raise ValueError("count must be at least 1")
     if names_file:
-        with open(names_file, encoding="utf-8") as f:
-            return [name for name in f.read().split("\n") if name]
+        with open(names_file, encoding="utf-8-sig") as f:
+            return [name for line in f.read().splitlines() if (name := line.strip())]
 
     picked = []
     for name in supported_pixel_shaders(index):
@@ -120,12 +127,31 @@ def classify_result(translation_valid, dispatch_runs, structured_runs):
 
 
 def write_outcomes(out_dir, outcomes):
-    """Write (shader name, outcome) pairs to the harness's tab-separated report."""
+    """Write (shader name, outcome) pairs to the harness's tab-separated report atomically."""
     os.makedirs(out_dir, exist_ok=True)
-    path = os.path.join(out_dir, "outcomes.tsv")
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
-        f.write("".join(f"{name}\t{outcome}\n" for name, outcome in outcomes))
-    return path
+    dest = os.path.realpath(os.path.join(out_dir, "outcomes.tsv"))
+    dest_dir = os.path.dirname(dest) or out_dir
+    fd, tmp = tempfile.mkstemp(dir=dest_dir, prefix=".outcomes-", suffix=".tmp")
+    try:
+        try:
+            f = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
+        except BaseException:
+            os.close(fd)
+            raise
+        with f:
+            f.write("".join(f"{name}\t{outcome}\n" for name, outcome in outcomes))
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, published_mode(dest))
+        replace_retry.replace(tmp, dest)
+    except BaseException:
+        try:
+            os.chmod(tmp, 0o600)
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return dest
 
 
 def test_vertex_shader(out_dir, runner=None):
@@ -216,7 +242,7 @@ def render_targets(forms, name, harness, vs, out, runs, timeout, observed, decla
             failure = None
             try:
                 h = subprocess.run([harness, vs, spirv, raw, *args], capture_output=True, text=True,
-                                   timeout=timeout)
+                                   encoding="utf-8", errors="replace", timeout=timeout)
                 if all_attachments and h.returncode == 3:
                     failure = "timeout"
                 if h.returncode == 0 and os.path.isfile(raw):
@@ -261,7 +287,7 @@ def main(argv=None):
     import json
     index_path = os.path.join(old, "index.json")
     try:
-        with open(index_path, encoding="utf-8") as f:
+        with open(index_path, encoding="utf-8-sig") as f:
             index = json.load(f)
     except (OSError, ValueError, RecursionError) as e:
         ap.error(f"cannot read {index_path}: {getattr(e, 'strerror', None) or e}")
@@ -333,9 +359,10 @@ def main(argv=None):
     tool = os.path.join(a.repo, "tools", "rdna2spirv.py")
     for name in picked:
         src = os.path.join(disasm, name + ".s")
-        r1 = subprocess.run([sys.executable, "-I", tool, src, "--out", new], capture_output=True, text=True)
+        r1 = subprocess.run([sys.executable, "-I", tool, src, "--out", new],
+                            capture_output=True, text=True, encoding="utf-8", errors="replace")
         r2 = subprocess.run([sys.executable, "-I", tool, src, "--out", loopdir, "--dispatch-loop"],
-                            capture_output=True, text=True)
+                            capture_output=True, text=True, encoding="utf-8", errors="replace")
         if "1 pass spirv-val" not in r1.stdout or "1 pass spirv-val" not in r2.stdout:
             note(name, "a translation is invalid")
             continue

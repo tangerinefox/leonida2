@@ -25,6 +25,7 @@ SOURCE_SUFFIXES = (".py", ".ps1", ".cpp", ".cc", ".c", ".h", ".hpp", ".cmake", "
 # Flags of other programs the docs quote: gh (AGENTS.md), pip (docs/shader_validation.md), argparse itself, and
 # the spirv-opt passes docs/embedded_shaders.md tried on one module.
 FOREIGN = {"--search", "--state", "--index-url", "--help",
+           "--strip-components", "--override-channels",
            "--ssa-rewrite", "--eliminate-dead-code-aggressive", "--eliminate-dead-branches", "--merge-blocks",
            "--cfg-cleanup", "--merge-return", "--scalar-replacement"}
 # Pages that quote another project's tree (SCARAB, americas-recomp).

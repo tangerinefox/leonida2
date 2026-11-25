@@ -463,7 +463,7 @@ def scan_pe64_rtti(data: bytes) -> dict:
             continue
         lo = sec["virtual_address"]
         hi = min(lo + sec["virtual_size"], len(img))
-        for p in range((lo + 7) & ~7, hi - 8, 8):
+        for p in range((lo + 7) & ~7, hi - 7, 8):
             q = struct.unpack_from("<Q", img, p)[0]
             if q in col_vas:
                 vt = p + 8

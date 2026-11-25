@@ -31,12 +31,13 @@ inline bool title_window_fits(std::uint64_t cap, std::uint64_t used, std::uint64
 inline bool title_window_range(std::uint64_t va, std::uint64_t bytes, std::uint64_t lo, std::uint64_t hi,
                                std::uint64_t align, std::uint64_t most, std::uint64_t cap, std::uint64_t used,
                                TitleWindowRange& out) {
-    if (!align || hi <= va) return false;
-    const std::uint64_t want = std::clamp<std::uint64_t>(bytes ? bytes : 1, 1, most);
+    if (!align || (align & (align - 1)) != 0 || !most || va < lo || hi <= va) return false;
+    const std::uint64_t want = (std::min)(bytes ? bytes : std::uint64_t(1), most);
     const std::uint64_t start = (std::max)(va & ~(align - 1), lo);
-    std::uint64_t end = va > UINT64_MAX - want - align ? UINT64_MAX : (va + want + align - 1) & ~(align - 1);
+    const std::uint64_t raw_end = want > UINT64_MAX - va ? UINT64_MAX : va + want;
+    std::uint64_t end = raw_end > UINT64_MAX - (align - 1) ? UINT64_MAX : (raw_end + align - 1) & ~(align - 1);
     end = (std::min)(end, hi);
-    if (end <= start) return false;
+    if (end <= va || end <= start) return false;
     const TitleWindowRange range{start, end - start};
     if (!title_window_fits(cap, used, range.size)) return false;
     out = range;
@@ -49,13 +50,15 @@ inline bool title_window_range(std::uint64_t va, std::uint64_t bytes, std::uint6
 inline bool title_pool_extent(std::uint64_t pool_lo, std::uint64_t pool_hi, std::uint64_t va,
                               std::uint64_t readable_end, std::uint64_t align, std::uint64_t most,
                               TitleWindowRange& out) {
-    if (!align || pool_hi <= pool_lo || va < pool_lo || va >= pool_hi) return false;
+    if (!align || (align & (align - 1)) != 0 || pool_hi <= pool_lo || va < pool_lo || va >= pool_hi ||
+        readable_end <= va)
+        return false;
     const std::uint64_t start = (std::max)(va & ~(align - 1), pool_lo);
     std::uint64_t end = (std::min)(readable_end, pool_hi);
-    if (most) end = (std::min)(end, start > UINT64_MAX - most ? UINT64_MAX : start + most);
     end = end > UINT64_MAX - (align - 1) ? UINT64_MAX : (end + align - 1) & ~(align - 1);
+    if (most) end = (std::min)(end, start > UINT64_MAX - most ? UINT64_MAX : start + most);
     end = (std::min)(end, pool_hi);
-    if (end <= va) return false;
+    if (end <= va || end <= start) return false;
     out = {start, end - start};
     return true;
 }

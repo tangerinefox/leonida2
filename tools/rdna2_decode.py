@@ -352,57 +352,48 @@ def _format_ds_swizzle(offset16: int) -> str:
 
 
 def _mimg_addr_count(name: str, dim: int, a16: bool) -> int:
-    """Number of address VGPRs for an MIMG instruction."""
-    if name in ("image_bvh_intersect_ray", "image_bvh64_intersect_ray"):
-        return 11 if name == "image_bvh_intersect_ray" else 12
+    """Number of address VGPRs for an MIMG instruction (matches LLVM AMDGPU::getAddrSizeMIMGOp on GFX10)."""
+    if name == "image_bvh_intersect_ray":
+        return 8 if a16 else 11
+    if name == "image_bvh64_intersect_ray":
+        return 9 if a16 else 12
     if name == "image_get_resinfo":
         return 1
-    if name == "image_get_lod":
-        return _MIMG_DIM_COORDS.get(dim, 2)
-    base = _MIMG_DIM_COORDS.get(dim, 2)
-    if name.startswith("image_atomic_"):
-        return (base + 1) // 2 if a16 else base
-    # Separate 32-bit address components (offset, bias, z-compare, derivatives) from a16-packable coords/lod/clamp.
-    has_o = name.endswith("_o") or "_o_" in name
-    base_name = name[:-2] if name.endswith("_o") else name
-    has_cl = base_name.endswith("_cl")
-    if has_cl:
-        base_name = base_name[:-3]
-    fixed32 = 1 if has_o else 0
-    if "_b" in base_name and not base_name.startswith("image_bvh"):
-        fixed32 += 1
-    if "_c" in base_name and not base_name.startswith(("image_atomic", "image_get")):
-        fixed32 += 1
-    if "_d" in base_name and not base_name.startswith(("image_atomic", "image_get")):
-        fixed32 += 2 * _MIMG_GRAD_COORDS.get(dim, 2)
-    packable = base
-    if "_l" in base_name and "_lz" not in base_name and not base_name.startswith(
-            ("image_load", "image_store", "image_atomic", "image_get")):
-        packable += 1
-    if has_cl:
-        packable += 1
-    if base_name in ("image_load_mip", "image_store_mip"):
-        packable += 1
-    if a16:
-        # On GFX10, a16 packs coordinates (and lod/clamp after coords) two 16-bit values per VGPR; clamp/lod
-        # after 2D coords starts a new VGPR when coords are even (e.g., 2D + cl -> 1 + 1 = 2 VGPRs).
-        packed = (base + 1) // 2 + (packable - base)
-        return fixed32 + packed
-    return fixed32 + packable
+    coords = _MIMG_DIM_COORDS.get(dim, 2)
+    if name in ("image_get_lod", "image_msaa_load") or name.startswith("image_atomic_"):
+        return (coords + 1) // 2 if a16 else coords
+    if name.startswith(("image_load", "image_store")):
+        packable = coords + (1 if "_mip" in name else 0)
+        return (packable + 1) // 2 if a16 else packable
+    # image_sample_* and image_gather4*: parse underscore-delimited modifier tokens so `_cd`, `_by2`,
+    # `_g16`, `_cl_o_g16`, etc. never collide via substring checks.
+    parts = set(name.split("_")[2:])
+    extra = int("o" in parts) + int("b" in parts) + int("c" in parts)
+    has_grad = ("d" in parts) or ("cd" in parts)
+    is_g16 = "g16" in parts
+    has_lod_or_cl = ("l" in parts) or ("cl" in parts)
+    packable = coords + (1 if has_lod_or_cl else 0)
+    addr = extra + ((packable + 1) // 2 if a16 else packable)
+    if has_grad:
+        grad_coords = _MIMG_GRAD_COORDS.get(dim, 2)
+        # GFX10 supports independent A16 and G16: G16 packs each derivative axis to alignTo<2>(grad_coords).
+        addr += ((grad_coords + 1) & ~1) if is_g16 else (2 * grad_coords)
+    return addr
 
 
 def _mimg_data_count(name: str, dmask: int, d16: bool, tfe: bool) -> int:
     if name in ("image_bvh_intersect_ray", "image_bvh64_intersect_ray"):
         return 4
     if name.startswith("image_atomic_"):
-        # The GFX10 atomic dmask selects the total VDATA width, including
-        # both compare and swap values for cmpswap (masks 0x3 and 0xf).
-        if dmask in (1, 3, 15):
-            return dmask.bit_count()
-        n = 2 if "cmpswap" in name else 1
-        if name.endswith("_x2"):
-            n *= 2
-        return n
+        # GFX10 atomic dmask selects the total VDATA width (compare + swap for cmpswap/fcmpswap,
+        # which have no 1-VGPR form even when dmask == 0x1), plus 1 VGPR when tfe is set.
+        if "cmpswap" in name:
+            n = 4 if dmask == 15 else 2
+        elif dmask in (1, 3, 15):
+            n = dmask.bit_count()
+        else:
+            n = 2 if name.endswith("_x2") else 1
+        return n + (1 if tfe else 0)
     if name.startswith("image_gather4"):
         n = 4
     else:
@@ -614,6 +605,8 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
         if entry is None:
             return None, 4
         name, spec = entry
+        if opc == 0x06 and mcpu.startswith("gfx101"):
+            name = "v_mac_legacy_f32"
         mods = []
         if is_dpp16 or is_dpp8 or is_sdwa:
             if not need(8):
@@ -956,6 +949,8 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
         name, spec = entry
         if opc == 0x140 and mcpu.startswith("gfx101"):
             name = "v_mad_legacy_f32"
+        elif opc == 0x106 and mcpu.startswith("gfx101"):
+            name = "v_mac_legacy_f32"
         sdst = (w0 >> 8) & 0x7F
         abs_bits = 0 if is_vop3b else ((w0 >> 8) & 7)
         op_sel = 0 if is_vop3b else ((w0 >> 11) & 0xF)
@@ -1256,7 +1251,9 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
         else:
             vaddr_op = _vreg(vaddr0, n_addr)
         n_data = _mimg_data_count(name, dmask, bool(d16), bool(tfe))
-        rsrc_w = 4 if (r128 or name.startswith("image_bvh")) else 8
+        # On GFX10, LLVM uses SReg_256_XNULL (8 SGPRs) for all non-BVH MIMG instructions even with r128;
+        # only image_bvh*_intersect_ray take a 4-SGPR descriptor (SReg_128_XNULL).
+        rsrc_w = 4 if name.startswith("image_bvh") else 8
         args = []
         for fn, nr, _ in spec:
             if fn == "VDATA":

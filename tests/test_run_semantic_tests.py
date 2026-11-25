@@ -9,7 +9,10 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
+import _thread
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
@@ -281,6 +284,130 @@ class RunnerTest(unittest.TestCase):
             code, out = run(tmp, "-j", "2")
             self.assertEqual(code, 1)
             self.assertIn("no test*.py files", out)
+
+    def test_parallel_interrupt_stops_active_processes_and_cancels_queued_jobs(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as marker_dir:
+            mod_template = (
+                "import os, time, unittest\n"
+                "class T(unittest.TestCase):\n"
+                "    def test_run(self):\n"
+                "        with open(r'{marker}', 'w') as f: f.write('1')\n"
+                "        time.sleep(10)\n"
+            )
+            files = {
+                f"test_{i}.py": mod_template.format(marker=os.path.join(marker_dir, f"m_{i}.txt"))
+                for i in range(4)
+            }
+            suite(tmp, files)
+
+            def trigger():
+                start = time.monotonic()
+                while time.monotonic() - start < 8:
+                    if len(os.listdir(marker_dir)) >= 2:
+                        break
+                    time.sleep(0.05)
+                time.sleep(0.05)
+                _thread.interrupt_main()
+
+            threading.Thread(target=trigger, daemon=True).start()
+            out, err = io.StringIO(), io.StringIO()
+            t0 = time.monotonic()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = r.main([tmp, "-j", "2"])
+            elapsed = time.monotonic() - t0
+
+            self.assertEqual(code, 130)
+            self.assertIn("interrupted", err.getvalue())
+            self.assertNotIn("files failed", out.getvalue())
+            self.assertNotIn("4 files,", out.getvalue())
+            started = os.listdir(marker_dir)
+            self.assertEqual(len(started), 2, f"Expected 2 started modules, got {started}")
+            self.assertLess(elapsed, 5.0)
+
+    def test_serial_interrupt_returns_130_and_prints_interrupted(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as marker_dir:
+            marker = os.path.join(marker_dir, "serial_marker.txt")
+            content = (
+                "import os, time, unittest\n"
+                "class T(unittest.TestCase):\n"
+                f"    def test_run(self):\n"
+                f"        with open(r'{marker}', 'w') as f: f.write('1')\n"
+                "        time.sleep(10)\n"
+            )
+            suite(tmp, {"test_serial_hang.py": content})
+
+            def trigger():
+                start = time.monotonic()
+                while time.monotonic() - start < 8:
+                    if os.path.exists(marker):
+                        break
+                    time.sleep(0.05)
+                time.sleep(0.05)
+                _thread.interrupt_main()
+
+            threading.Thread(target=trigger, daemon=True).start()
+            out, err = io.StringIO(), io.StringIO()
+            t0 = time.monotonic()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = r.main([tmp, "-j", "1"])
+            elapsed = time.monotonic() - t0
+
+            self.assertEqual(code, 130)
+            self.assertIn("interrupted", err.getvalue())
+            self.assertLess(elapsed, 5.0)
+
+    def test_terminate_active_processes_kills_registered_processes(self):
+        cmd = [sys.executable, "-c", "import time; time.sleep(10)"]
+        p1 = subprocess.Popen(cmd)
+        p2 = subprocess.Popen(cmd)
+        r._register_process(p1)
+        r._register_process(p2)
+        try:
+            self.assertIsNone(p1.poll())
+            self.assertIsNone(p2.poll())
+            r._terminate_active_processes()
+            self.assertIsNotNone(p1.poll())
+            self.assertIsNotNone(p2.poll())
+        finally:
+            for p in (p1, p2):
+                try:
+                    p.kill()
+                except OSError:
+                    pass
+
+    @unittest.skipUnless(os.name == "posix", "POSIX process-group SIGINT test")
+    def test_posix_sigint_cancels_queued_modules_and_stops_runner(self):
+        import signal
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as marker_dir:
+            mod_template = (
+                "import os, time, unittest\n"
+                "class T(unittest.TestCase):\n"
+                "    def test_run(self):\n"
+                "        with open(r'{marker}', 'w') as f: f.write('1')\n"
+                "        time.sleep(8)\n"
+            )
+            files = {
+                f"test_{i}.py": mod_template.format(marker=os.path.join(marker_dir, f"m_{i}.txt"))
+                for i in range(5)
+            }
+            suite(tmp, files)
+
+            script = os.path.join(ROOT, "scripts", "run_semantic_tests.py")
+            proc = subprocess.Popen([sys.executable, "-I", script, tmp, "-j", "2"],
+                                    start_new_session=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    text=True)
+            start = time.monotonic()
+            while time.monotonic() - start < 5:
+                if len(os.listdir(marker_dir)) >= 2:
+                    break
+                time.sleep(0.05)
+            time.sleep(0.05)
+            os.killpg(proc.pid, signal.SIGINT)
+            stdout, stderr = proc.communicate(timeout=5)
+            self.assertIn(proc.returncode, (130, -signal.SIGINT, 128 + signal.SIGINT))
+            self.assertIn("interrupted", stderr)
+            self.assertNotIn("5 files,", stdout)
+            self.assertEqual(len(os.listdir(marker_dir)), 2)
 
 
 if __name__ == "__main__":

@@ -36,9 +36,55 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 MAX_TIMEOUT_SECONDS = 24 * 60 * 60
+
+# The child processes running right now: on SIGINT / Ctrl+C, the main thread terminates them so no orphans linger.
+_active_processes = set()
+_processes_lock = threading.Lock()
+
+
+def _register_process(proc):
+    with _processes_lock:
+        _active_processes.add(proc)
+
+
+def _unregister_process(proc):
+    with _processes_lock:
+        _active_processes.discard(proc)
+
+
+def _kill_process_tree(proc):
+    if proc is None:
+        return
+    if os.name == "nt":
+        try:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
+def _terminate_active_processes():
+    with _processes_lock:
+        procs = list(_active_processes)
+    for p in procs:
+        try:
+            p.terminate()
+        except OSError:
+            pass
+    for p in procs:
+        _kill_process_tree(p)
+        try:
+            p.wait(timeout=0.2)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
 
 # The child runs the module through unittest's own program and writes the result to a file, so the count of tests
 # comes from the result object and nothing the module writes can change it. The exit codes are unittest's own: 1
@@ -113,22 +159,35 @@ def run_module(directory, module, verbose, timeout=None):
     with tempfile.TemporaryDirectory() as scratch:
         count_path = os.path.join(scratch, "count.json")
         env = dict(os.environ, LEONIDA_TEST_COUNT=count_path)
+        proc = subprocess.Popen(cmd, cwd=directory, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, errors="replace")
+        _register_process(proc)
         try:
-            p = subprocess.run(cmd, cwd=directory, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               text=True, errors="replace", timeout=timeout)
-        except subprocess.TimeoutExpired as exc:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_process_tree(proc)
+            stdout, stderr = proc.communicate()
             # TimeoutExpired retains bytes even when text=True.
             parts = [chunk.decode(locale.getpreferredencoding(False), errors="replace") if isinstance(chunk, bytes)
-                     else chunk for chunk in (exc.stdout, exc.stderr) if chunk]
+                     else chunk for chunk in (stdout, stderr) if chunk]
             out = "".join(parts)
             return 1, 0, out + f"\nTIMED OUT after {timeout:g} s: {module}\n"
+        except BaseException:
+            _kill_process_tree(proc)
+            try:
+                proc.wait(timeout=0.5)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+            raise
+        finally:
+            _unregister_process(proc)
         count = read_count(count_path)
-    out = p.stdout + p.stderr
+    out = stdout + stderr
     # Discover imports every package initializer, but an empty one has no tests to run. It is included in the
     # module list so parallel runs see TestCase classes when there are any; without them, it is not a failure.
-    if p.returncode == 5 and count == 0 and module.endswith(".__init__") and "NO TESTS RAN" in p.stderr:
+    if proc.returncode == 5 and count == 0 and module.endswith(".__init__") and "NO TESTS RAN" in stderr:
         return 0, 0, out
-    return p.returncode, count, out
+    return proc.returncode, count, out
 
 
 def main(argv=None):
@@ -147,26 +206,76 @@ def main(argv=None):
         print(f"no {a.pattern} files in {directory}")
         return 1
     if a.jobs <= 1:
+        cmd = [sys.executable, "-m", "unittest", "discover", "-s", directory,
+               "-p", a.pattern, *(["-v"] if a.verbose else [])]
+        proc = subprocess.Popen(cmd)
+        _register_process(proc)
+        start_time = time.monotonic()
         try:
-            return subprocess.call([sys.executable, "-m", "unittest", "discover", "-s", directory,
-                                    "-p", a.pattern, *(["-v"] if a.verbose else [])], timeout=a.timeout)
+            while True:
+                try:
+                    return proc.wait(timeout=0.2)
+                except subprocess.TimeoutExpired:
+                    if a.timeout is not None and time.monotonic() - start_time >= a.timeout:
+                        raise
         except subprocess.TimeoutExpired:
-            # Inherited stdout/stderr have already emitted any partial test output.
+            _kill_process_tree(proc)
             print(f"TIMED OUT after {a.timeout:g} s: unittest discover in {directory}", file=sys.stderr)
             return 1
+        except KeyboardInterrupt:
+            _kill_process_tree(proc)
+            try:
+                proc.wait(timeout=0.5)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+            print("interrupted", file=sys.stderr)
+            return 130
+        except BaseException:
+            _kill_process_tree(proc)
+            raise
+        finally:
+            _unregister_process(proc)
     # Largest files first: they tend to run longest, and one started last would set the wall time alone.
     modules.sort(key=lambda m: -os.path.getsize(module_path(directory, m)))
     start, total, failed = time.monotonic(), 0, []
-    with concurrent.futures.ThreadPoolExecutor(a.jobs) as pool:
-        jobs = {pool.submit(run_module, directory, m, a.verbose, a.timeout): m for m in modules}
-        for job in concurrent.futures.as_completed(jobs):
-            code, ran, out = job.result()
-            total += ran
-            if code:
-                failed.append(jobs[job])
-                print(f"==== FAILED: {jobs[job]}\n{out}", flush=True)
-            elif a.verbose:
-                print(f"==== {jobs[job]}\n{out}", flush=True)
+    pool = concurrent.futures.ThreadPoolExecutor(a.jobs)
+    jobs = {}
+    try:
+        for m in modules:
+            jobs[pool.submit(run_module, directory, m, a.verbose, a.timeout)] = m
+        pending = set(jobs)
+        while pending:
+            done, _ = concurrent.futures.wait(pending, timeout=0.2, return_when=concurrent.futures.FIRST_COMPLETED)
+            for job in done:
+                pending.remove(job)
+                code, ran, out = job.result()
+                total += ran
+                if code:
+                    failed.append(jobs[job])
+                    print(f"==== FAILED: {jobs[job]}\n{out}", flush=True)
+                elif a.verbose:
+                    print(f"==== {jobs[job]}\n{out}", flush=True)
+    except KeyboardInterrupt:
+        for job in jobs:
+            job.cancel()
+        try:
+            pool.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            pool.shutdown(wait=False)
+        _terminate_active_processes()
+        print("interrupted", file=sys.stderr)
+        return 130
+    except BaseException:
+        for job in jobs:
+            job.cancel()
+        try:
+            pool.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            pool.shutdown(wait=False)
+        _terminate_active_processes()
+        raise
+    else:
+        pool.shutdown(wait=True)
     took = time.monotonic() - start
     summary = f"{len(modules)} files, {total} tests, {len(failed)} files failed in {took:.0f} s with {a.jobs} jobs"
     print(summary + (": " + ", ".join(sorted(failed)) if failed else ""))
@@ -183,4 +292,8 @@ if __name__ == "__main__":
         sys.stdout.reconfigure(errors="replace")
     except (AttributeError, ValueError, OSError):
         pass
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        sys.exit(130)

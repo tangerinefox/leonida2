@@ -38,6 +38,7 @@ import json
 import os
 import struct
 import sys
+import zlib
 from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -139,10 +140,11 @@ def files_of(path):
         return [path]
     with os.scandir(path) as entries:
         names = sorted(entry.path for entry in entries if entry.is_file())
-    fssm = [name for name in names if name.endswith(".fssm")]
-    taken = {os.path.splitext(os.path.basename(name))[0] for name in fssm}
+    fssm = [name for name in names if name.lower().endswith(".fssm")]
+    taken = {os.path.normcase(os.path.splitext(os.path.basename(name))[0]) for name in fssm}
     dxbc = [name for name in names
-            if name.endswith(".dxbc") and os.path.splitext(os.path.basename(name))[0] not in taken]
+            if name.lower().endswith(".dxbc")
+            and os.path.normcase(os.path.splitext(os.path.basename(name))[0]) not in taken]
     return sorted(fssm + dxbc)
 
 
@@ -158,7 +160,7 @@ def blob_rows(path, limit=None):
                 rows.append({"name": name, "payload": "fssm", "blob": data})
                 continue
             blobs = fssm_unpack.unpack_all(data)
-        except (OSError, ValueError, struct.error) as e:
+        except (OSError, ValueError, struct.error, zlib.error) as e:
             rows.append({"name": name, "payload": None, "error": str(e)})
             continue
         if not blobs:
@@ -226,7 +228,10 @@ def main(argv=None):
     except OSError as e:
         print(f"ERROR: cannot list {args.path}: {e.strerror or e}", file=sys.stderr)
         return 2
-    stages = fssm_header.stage_index(args.path)
+    try:
+        stages = fssm_header.stage_index(args.path)
+    except RecursionError:
+        stages = {}
     decoded = []
     for row in rows:
         stem = os.path.splitext(row["name"])[0]

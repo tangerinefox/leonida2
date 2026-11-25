@@ -263,8 +263,8 @@ def detect_wave64(insns):
 
 
 def audit(disasm_dir, fssm_dir=None, dxbc_dir=None, stages=("cs", "ms", "gs"), limit=None, *, report_path=None):
-    if limit is not None and limit < 0:
-        raise ValueError("limit must be non-negative")
+    if limit is not None and limit < 1:
+        raise ValueError("limit must be at least 1")
     parent = os.path.dirname(os.path.realpath(disasm_dir))
     fssm_dir = fssm_dir or os.path.join(parent, "fssm")
     dxbc_dir = dxbc_dir or parent
@@ -395,16 +395,25 @@ def print_report(rep):
                 print(f"    {v:6d}  {k}")
 
 
+def shader_count(text):
+    """--limit: at least 1; 0 used to mean an audit of nothing that still printed a zero report."""
+    try:
+        value = int(text, 0)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be at least 1") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Audit CS/MS/GS RSRC2/PSV0 headers and read-before-write registers.")
     ap.add_argument("disasm_dir", help="directory of disassembled .s files")
     ap.add_argument("--fssm", default=None, help="directory of .fssm files (default: <disasm_dir>/../fssm)")
     ap.add_argument("--dxbc", default=None, help="directory of .dxbc files (default: <disasm_dir>/..)")
     ap.add_argument("--json", dest="json_out", default=None, help="optional path to write full JSON report")
-    ap.add_argument("--limit", type=int, default=None, help="stop after N .s files")
+    ap.add_argument("--limit", type=shader_count, default=None, help="stop after N .s files (at least 1)")
     a = ap.parse_args(argv)
-    if a.limit is not None and a.limit < 0:
-        ap.exit(2, f"{ap.prog}: error: --limit must be non-negative\n")
     # A bad path is one ERROR line, not a traceback out of os.listdir: the audit of a whole corpus can
     # run for minutes, and an explicit --fssm/--dxbc that does not exist would otherwise be counted as
     # "(missing fssm)" and print a report that looks right.

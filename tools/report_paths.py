@@ -3,6 +3,9 @@ an input or another output.
 
     from report_paths import same_report_path        # after sys.path.insert(0, <this folder>), as -I needs
 
+When both resolved paths can be statted, their file identity takes priority over the name rules below.
+On Windows, the name fallback checks the parent directory before treating case variants as aliases.
+
 `same_report_path(first, second)` is true when the two paths resolve to one name (`realpath`, then `normcase`, and on a
 case-insensitive macOS volume also case-folded and with composed and decomposed accents treated alike) or when both
 exist and `os.path.samefile` says they are one file (a hard link, another spelling the name rules missed). Neither
@@ -84,10 +87,46 @@ def same_report_path(first, second):
     # Resolve each path once: the key and the volume probe both want the resolved name, and a guard runs once
     # per input file, so a second realpath per path is the whole cost of the check (see #6220's review).
     first, second = os.path.realpath(first), os.path.realpath(second)
-    if _resolved_key(first) == _resolved_key(second):
+    if first == second:
         return True
     try:
+        # Case-sensitive Windows directories can have distinct files with the same folded name.
         return os.path.samefile(first, second)
     except OSError:
-        pass
-    return _same_resolved_name(first, second)
+        if _resolved_key(first) == _resolved_key(second):
+            return sys.platform != "win32" or _same_windows_folded_path(first, second)
+        return _same_resolved_name(first, second)
+
+
+def _windows_directory_keeps_case(path):
+    """Check the directory that will contain a component, or its nearest existing ancestor."""
+    while True:
+        try:
+            with tempfile.TemporaryDirectory(prefix=".leonida-report-", dir=path) as probe:
+                # Look up the temporary entry itself so the test uses the parent directory's case rules.
+                try:
+                    os.stat(os.path.join(path, os.path.basename(probe).upper()))
+                except FileNotFoundError:
+                    return True
+                return False
+        except FileNotFoundError:
+            parent = os.path.dirname(path)
+            if parent == path:
+                return False
+            path = parent
+        except OSError:
+            return False  # Keep the conservative folded match if the directory cannot be probed.
+
+
+def _same_windows_folded_path(first, second):
+    """Check each case difference in two absolute paths that have the same Windows name key."""
+    first, second = os.fsdecode(first), os.fsdecode(second)
+    while first != second:
+        first, first_name = os.path.split(first)
+        second, second_name = os.path.split(second)
+        if not first_name:  # Drive and share names do not use per-directory case sensitivity.
+            break
+        if (first_name != second_name and os.path.normcase(first_name) == os.path.normcase(second_name)
+                and _windows_directory_keeps_case(first)):
+            return False
+    return True

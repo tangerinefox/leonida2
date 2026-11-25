@@ -10,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -309,7 +309,7 @@ class StageValidationAndSequencingTest(unittest.TestCase):
                         with patch("make_game.shaders") as mock_shaders:
                             ret = make_game.main()
                             self.assertEqual(ret, 0)
-                            mock_check.assert_called_once_with(os.path.abspath(self.game_dir), False)
+                            mock_check.assert_called_once_with(os.path.abspath(self.game_dir), False, jobs=ANY)
                             mock_preflight.assert_not_called()
                             mock_shaders.assert_not_called()
 

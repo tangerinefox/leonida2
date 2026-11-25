@@ -76,6 +76,19 @@ class DecodeTests(unittest.TestCase):
         ins = self.one(asm("41 54"))            # push r12
         self.assertEqual(ins.ops, (("r", 12, 8, False),))
 
+    def test_opcode_90_nop_pause_and_rex_xchg(self):
+        ins = self.one(asm("90"))
+        self.assertEqual((ins.mnem, ins.ops, ins.size, ins.unknown),
+                         ("nop", (), 1, False))
+
+        ins = self.one(asm("f3 90"))
+        self.assertEqual((ins.mnem, ins.ops, ins.size, ins.unknown),
+                         ("pause", (), 2, False))
+
+        ins = self.one(asm("41 90"))
+        self.assertEqual((ins.mnem, ins.ops, ins.size, ins.unknown),
+                         ("xchg", (("r", 8, 8, False), ("r", 0, 8, False)), 2, False))
+
     def test_modrm_mem(self):
         ins = self.one(asm("48 8b 44 24 08"))   # mov rax,[rsp+8]
         m = ins.ops[1][1]

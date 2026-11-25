@@ -1105,70 +1105,8 @@ def _drop_tree_block(tree, b):
 
 
 def _unwrap_known_pc_guards(tree, out_pcs, entry_pc=0):
-    """Unwrap `("guard", g, body)` nodes whenever abstract interpretation proves `%pc == g` on all incoming paths.
-
-    In `cfg_structure.structure`, every post-dominating join block `g` after a conditional diamond or loop is
-    still wrapped in `("guard", g, ...)`. Because `%pc` is a Function-scope variable in SPIR-V, LLVM/NVVM's
-    `SROA`/`Mem2Reg` promotes `%pc` at the same time as `%vgpr[0..255]` and `%sgpr[0..127]`, before `%pc == g`
-    can be constant-folded, forcing ~384 redundant Phi nodes at every spine guard merge block (and preventing
-    early block merging across convergent `OpControlBarrier`s).
-
-    Tracks the exact finite set `cur_pc` of values `%pc` can hold before each item in `tree`:
-      - `("block", b)` overwrites `%pc` with `out_pcs[b]`.
-      - `("guard", g, gbody)`: if `cur_pc == {g}`, `%pc == g` is tautologically true on every path reaching
-        this item, so the guard unwraps in place; otherwise `gbody` is processed starting from `{g}` and its
-        exit `%pc` set merges with the skip path `cur_pc - {g}`.
-      - `("loop", h, lbody)`: `lbody` is processed starting from `cur_pc | {h}`; exiting the loop proves
-        `%pc != h`, leaving `pc_after_lbody - {h}`.
-    """
-    root_out = []
-    stack = [[collections.deque(tree), root_out, {entry_pc}, None]]
-    while stack:
-        frame = stack[-1]
-        q, dst, cur_pc, tag = frame
-        if not q:
-            if len(stack) > 1 and tag[0] == "guard" and len(cur_pc) == 1:
-                nxt_g = next(iter(cur_pc))
-                skip_pc = tag[3]
-                parent_q = stack[-2][0]
-                if parent_q and parent_q[0][0] == "guard" and parent_q[0][1] == nxt_g and nxt_g not in skip_pc:
-                    for child in reversed(parent_q.popleft()[2]):
-                        q.appendleft(child)
-                    continue
-            stack.pop()
-            if not stack:
-                break
-            parent = stack[-1]
-            if tag[0] == "guard":
-                _, g, child_dst, skip_pc = tag
-                parent[1].append(("guard", g, child_dst))
-                parent[2] = skip_pc | cur_pc
-            else:
-                _, h, child_dst = tag
-                parent[1].append(("loop", h, child_dst))
-                parent[2] = cur_pc - {h}
-            continue
-        it = q.popleft()
-        kind = it[0]
-        if kind == "block":
-            b = it[1]
-            dst.append(it)
-            frame[2] = set(out_pcs[b])
-        elif kind == "guard":
-            g, gbody = it[1], it[2]
-            if cur_pc == {g}:
-                for child in reversed(gbody):
-                    q.appendleft(child)
-            else:
-                child_dst = []
-                skip_pc = set(cur_pc)
-                skip_pc.discard(g)
-                stack.append([collections.deque(gbody), child_dst, {g}, ("guard", g, child_dst, skip_pc)])
-        else:
-            h, lbody = it[1], it[2]
-            child_dst = []
-            stack.append([collections.deque(lbody), child_dst, set(cur_pc) | {h}, ("loop", h, child_dst)])
-    return root_out
+    """Unwrap `("guard", g, body)` nodes whenever abstract interpretation proves `%pc == g` on all incoming paths."""
+    return cfg_structure.unwrap_known_pc_guards(tree, out_pcs, entry_pc=entry_pc)
 
 
 def _region_has_cycle(region, succ):
@@ -1357,7 +1295,8 @@ def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_wr
             u = work.pop()
             if u == skip or u in region:
                 continue
-            if u == b or u == 0 or not succ[u] or not blk_info[u][0]:
+            if (u == b or u == 0 or not succ[u] or not blk_info[u][0]
+                    or (len(raw_edges[u]) == 1 and terms[u][0] == "br" and terms[u][1] != "s_branch")):
                 ok = False
                 break
             region.add(u)
@@ -1611,23 +1550,26 @@ def plan_structured_emulation(blocks, raw_edges, succ, folds, fold_chain, absorb
         eff_succ[b] = nxt
         eff_succ_compact.append([eff_idx[s] for s in nxt])
 
-    compact_tree = cfg_structure.structure(eff_succ_compact)
-    if compact_tree is None:
-        return None
-    tree = _map_tree_ids(compact_tree, eff_blocks)
-
     out_pcs = {}
     for b in eff_blocks:
         tail = chain_of[b][-1]
         s = set(eff_succ[b])
         if not s:
-            s.add(-1)
+            s.add(cfg_structure.END)
         elif tail not in folds and len(raw_edges[tail]) == 1:
             last = active_blocks[tail][-1] if active_blocks[tail] else None
             op = base_op(last["op"]) if last is not None else None
             if op in BRANCHES and op != "s_branch":
-                s.add(-1)
+                s.add(cfg_structure.END)
         out_pcs[b] = frozenset(s)
+    compact_out_pcs = {
+        eff_idx[b]: frozenset(eff_idx[p] if p != cfg_structure.END else cfg_structure.END for p in pcs)
+        for b, pcs in out_pcs.items()
+    }
+    compact_tree = cfg_structure.structure(eff_succ_compact, out_pcs=compact_out_pcs)
+    if compact_tree is None:
+        return None
+    tree = _map_tree_ids(compact_tree, eff_blocks)
     tree = _unwrap_known_pc_guards(tree, out_pcs, eff_blocks[0])
 
     # Precompute per-superblock instruction summaries (for dirty transfer, sync-free check, s_barrier, s_endpgm).
