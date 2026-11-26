@@ -2495,13 +2495,13 @@ public:
         struct Stats {
             std::mutex mu;
             uint64_t calls[3][3] = {};  // method x (null, aggregate, a device)
-            uint64_t found[3] = {}, pressed[3] = {};
+            uint64_t found[3] = {}, pressed[3] = {}, a_pressed[3] = {};
             std::map<std::string, std::pair<uint64_t, uint64_t>> by_device;  // name -> (readings, with buttons)
             uint64_t since = 0;
         };
         static Stats st;
         std::string name;
-        bool buttons = false;
+        bool buttons = false, a_button = false;
         if (SUCCEEDED(hr) && got) {
             IGameInputDevice* d = nullptr;
             got->GetDevice(&d);
@@ -2510,7 +2510,10 @@ public:
                 d->Release();
             }
             GameInputGamepadState g{};
-            if (got->GetGamepadState(&g)) buttons = g.buttons != 0;
+            if (got->GetGamepadState(&g)) {
+                buttons = g.buttons != 0;
+                a_button = (g.buttons & GameInputGamepadA) != 0;
+            }
         }
         const int arg = !asked ? 0 : as_device(asked)->info.deviceFamily == GameInputFamilyAggregate ? 1 : 2;
         std::lock_guard lock(st.mu);
@@ -2518,6 +2521,7 @@ public:
         if (SUCCEEDED(hr) && got) {
             ++st.found[method];
             st.pressed[method] += buttons;
+            st.a_pressed[method] += a_button;
             auto& e = st.by_device[name];
             ++e.first;
             e.second += buttons;
@@ -2529,10 +2533,10 @@ public:
         std::string line;
         for (int m = 0; m < 3; ++m) {
             char t[200];
-            std::snprintf(t, sizeof(t), " %s %llu/%llu/%llu found %llu pressed %llu;", methods[m],
+            std::snprintf(t, sizeof(t), " %s %llu/%llu/%llu found %llu pressed %llu A %llu;", methods[m],
                           (unsigned long long)st.calls[m][0], (unsigned long long)st.calls[m][1],
                           (unsigned long long)st.calls[m][2], (unsigned long long)st.found[m],
-                          (unsigned long long)st.pressed[m]);
+                          (unsigned long long)st.pressed[m], (unsigned long long)st.a_pressed[m]);
             line += t;
         }
         for (const auto& [n, c] : st.by_device) {
@@ -2545,6 +2549,7 @@ public:
         std::memset(st.calls, 0, sizeof(st.calls));
         std::memset(st.found, 0, sizeof(st.found));
         std::memset(st.pressed, 0, sizeof(st.pressed));
+        std::memset(st.a_pressed, 0, sizeof(st.a_pressed));
         st.by_device.clear();
         st.since = now;
     }

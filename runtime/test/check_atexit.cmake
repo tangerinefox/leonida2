@@ -26,6 +26,12 @@ set(code_c_exit 12)
 # exit(7) is running a slow handler when a second thread calls _exit(7): the exit lock holds it back.
 set(expect_concurrent_exit "${ctors};slow handler started;slow handler done;${handlers}")
 set(code_concurrent_exit 7)
+# The main thread's thread_local object ends before the atexit handlers and static destructors ([basic.start.term]):
+# the UCRT calls the EXE's thread-local destructor callback first in exit() and _cexit().
+set(expect_thread_local_exit "${ctors};ctor thread_local;dtor thread_local;${handlers}")
+set(code_thread_local_exit 13)
+set(expect_thread_local_cexit "${ctors};ctor thread_local;dtor thread_local;${handlers};after _cexit")
+set(code_thread_local_cexit 14)
 
 # The program's own lines, in order, without the prefix; everything gta6rt prints is dropped.
 function(guest_lines output result)
@@ -42,7 +48,7 @@ function(guest_lines output result)
 endfunction()
 
 set(failures "")
-foreach(mode return exit _exit quick_exit ExitProcess cexit c_exit concurrent_exit)
+foreach(mode return exit _exit quick_exit ExitProcess cexit c_exit concurrent_exit thread_local_exit thread_local_cexit)
   execute_process(COMMAND ${RUNNER} "${GUEST}" ${mode}
     WORKING_DIRECTORY "${guest_dir}" TIMEOUT 60
     RESULT_VARIABLE native_code OUTPUT_VARIABLE native_out ERROR_VARIABLE native_err)
@@ -68,4 +74,4 @@ endforeach()
 if(failures)
   message(FATAL_ERROR "atexit/termination differences:${failures}")
 endif()
-message(STATUS "tiny_atexit: 8 termination paths match the Windows sequence")
+message(STATUS "tiny_atexit: 10 termination paths match the Windows sequence")

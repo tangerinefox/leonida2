@@ -1165,6 +1165,59 @@ int check_rebound_tables(Context& c, ID3D12RootSignature* narrow, bool mirror, b
     return 0;
 }
 
+// Two slot-133 shadows over the same title page share one tracker and its sums (LEONIDA_SHADOW_KEEP, src/
+// shadow_keep.h). A is copied with the title's byte at 1; the byte becomes 2 and B is made over the page, so B's first
+// copy holds 2; the byte goes back to 1 and a submission refreshes both. Both copies must hold 1, with the flag on or
+// off: B's first copy brings its pieces to the sums, or the sums still read 1 and B keeps 2 (found by lixonik).
+int check_shadow_keep_refill(Context& c) {
+    constexpr UINT64 kPage = 4096, kAt = 16;  // the byte: page 1 of A, page 0 of B
+    auto* pages = static_cast<std::uint8_t*>(
+        VirtualAlloc(nullptr, kPages, MEM_TOP_DOWN | MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    EXPECT(pages);
+    pages[kPage + kAt] = 1;
+    const D3D12_RESOURCE_DESC desc = buffer_desc(2 * kPage);
+    Ref<ID3D12Resource> a, b, readback;
+    EXPECT(SUCCEEDED(rt::d3d12::create_buffer_at_host_address(c.inner, pages, desc, 0xFFFFFFFFu,
+                                                              IID_PPV_ARGS(&a.p))));
+    EXPECT(rt::d3d12::title_shadow_buffer(a.p));
+    pages[kPage + kAt] = 2;
+    EXPECT(SUCCEEDED(rt::d3d12::create_buffer_at_host_address(c.inner, pages + kPage, desc, 0xFFFFFFFFu,
+                                                              IID_PPV_ARGS(&b.p))));
+    EXPECT(rt::d3d12::title_shadow_buffer(b.p));
+    pages[kPage + kAt] = 1;
+
+    const D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK};
+    const auto readback_desc = buffer_desc(2 * kBytes);
+    EXPECT(SUCCEEDED(c.device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &readback_desc,
+                                                       D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                       IID_PPV_ARGS(&readback.p))));
+    Ref<ID3D12CommandAllocator> allocator;
+    Ref<ID3D12GraphicsCommandList> list;
+    EXPECT(SUCCEEDED(c.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
+    EXPECT(SUCCEEDED(c.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
+                                                 IID_PPV_ARGS(&list.p))));
+    list->CopyBufferRegion(readback.p, 0, a.p, kPage, kBytes);
+    list->CopyBufferRegion(readback.p, kBytes, b.p, 0, kBytes);
+    EXPECT(list->Close() == S_OK);
+    ID3D12CommandList* lists[] = {list.p};
+    c.queue->ExecuteCommandLists(1, lists);  // the refresh, then the copies
+    EXPECT(rt::d3d12::last_execute_result(c.queue) == leonida::ReplayResult::success);
+    EXPECT(SUCCEEDED(c.queue->Signal(c.fence, ++c.fence_value)));
+    EXPECT(SUCCEEDED(c.fence->SetEventOnCompletion(c.fence_value, nullptr)));
+    void* mapped = nullptr;
+    EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
+    const std::uint8_t got_a = static_cast<const std::uint8_t*>(mapped)[kAt];
+    const std::uint8_t got_b = static_cast<const std::uint8_t*>(mapped)[kBytes + kAt];
+    readback->Unmap(0, nullptr);
+    std::printf("shadow keep refill: A holds %u, B holds %u (the title's byte is 1)\n", got_a, got_b);
+    EXPECT(got_a == 1);
+    EXPECT(got_b == 1);
+    a.reset();
+    b.reset();
+    VirtualFree(pages, 0, MEM_RELEASE);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1176,6 +1229,7 @@ int main(int argc, char** argv) {
     const bool window_cap = argc == 2 && std::strcmp(argv[1], "--window-cap") == 0;
     const bool window_write_back = argc == 2 && std::strcmp(argv[1], "--window-writeback") == 0;
     const bool placed_write_back = argc == 2 && std::strcmp(argv[1], "--placed-writeback") == 0;
+    const bool keep_refill = argc == 2 && std::strcmp(argv[1], "--shadow-keep-refill") == 0;
     if (window_cap) {
         const char* cap = std::getenv("LEONIDA_TITLE_WINDOWS_MB");
         if (!cap || std::strcmp(cap, "0")) {
@@ -1297,6 +1351,14 @@ int main(int argc, char** argv) {
                 return 1;
             }
             std::printf("title-placed buffer write back: the GPU's writes reached the title's pages\n");
+            return 0;
+        }
+        if (keep_refill) {
+            if (check_shadow_keep_refill(c)) return 1;
+            if (d.validation_errors()) {
+                std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
+                return 1;
+            }
             return 0;
         }
         if (window_write_back) {

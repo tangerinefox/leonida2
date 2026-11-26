@@ -1399,7 +1399,7 @@ class BarrierInLoopsTests(unittest.TestCase):
         """
         prog = self._ring_shift_loop_cs(wave64=True, threads=128, iters=5)
         spv, gen = _translate_cs("cs_bar_loop_w64_emulate", prog, threads=128, lds_bytes=512, emulate=True)
-        self.assertEqual(gen.control_flow, "emulated wave64 rounds")
+        self.assertEqual(gen.control_flow, "emulated wave64 structured")  # the loop is in the tail scheduler
         for rev in (False, True):
             with self.subTest(reverse_subgroups=rev):
                 mem = run_compute_workgroup(spv, 128, 32, push_constants=VSHARP, reverse_subgroups=rev)
@@ -1472,7 +1472,7 @@ class BarrierInLoopsTests(unittest.TestCase):
         spv_em, gen_em = _translate_cs(
             "cs_div_bar_em", self._wave_divergent_barrier_loop_cs(True), threads=128, lds_bytes=512, emulate=True
         )
-        self.assertEqual(gen_em.control_flow, "emulated wave64 rounds")
+        self.assertEqual(gen_em.control_flow, "emulated wave64 structured")  # the loop is in the tail scheduler
         mem_em = run_compute_workgroup(spv_em, 128, 32, push_constants=VSHARP)
         self.assertEqual([mem_em[4 * t] for t in range(128)], [2] * 64 + [4] * 64)
 

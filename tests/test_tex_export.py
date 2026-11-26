@@ -219,7 +219,7 @@ def test_export_picks_the_top_mip_placement_and_writes_dds(eq, tmp_path, fmt, na
 def test_fmt_reuses_the_indexer_table_without_12_byte_rgb32():
     from tex_headers import FMT_INFO
     assert T.FMT == {f: v for f, v in FMT_INFO.items() if f not in (6, 7, 8)}
-    assert len(T.FMT) == 56
+    assert len(T.FMT) == 57
 
 
 @pytest.mark.parametrize("fmt", sorted(T.FMT))
@@ -478,14 +478,30 @@ def test_packed_r10g10b10a2_writes_a_png(eq, tmp_path, monkeypatch, capsys):
     assert read_png(stem.with_suffix(".png")) == (2, 1, bytes((255, 0, 0, 255, 0, 0, 255, 85)))
 
 
+def test_shared_exponent_r9g9b9e5_writes_a_png(eq, tmp_path, monkeypatch, capsys):
+    # The indexer's table lists DXGI 67, so the export reaches dds_png instead of stopping at "unsupported format".
+    # Texels (R, G, B mantissa, exponent): (256, 128, 0, 16) -> 1.0, 0.5, 0; (511, 64, 1, 15) -> 511/512, 1/8, 1/512.
+    eq(4)
+    packed = struct.pack("<II", 256 | (128 << 9) | (16 << 27), 511 | (64 << 9) | (1 << 18) | (15 << 27))
+    carve = str(tmp_path / "carve")
+    write_blob(carve, "x.rpf", 0x1000, packed + bytes(4096 - len(packed)))
+    t = texture(67, "R9G9B9E5_SHAREDEXP", 2, 1, mips=1)
+    out, code, text = png_main(tmp_path, monkeypatch, capsys, [t], carve, "--png")
+    assert code is None
+    assert text.splitlines() == ["1 textures: {'ok:first': 1} -> " + str(out), "png: {'written': 1}"]
+    stem = out / "x.rpf" / f"{0xABC:012x}_3_2x1_R9G9B9E5_SHAREDEXP"
+    assert stem.with_suffix(".dds").read_bytes()[148:] == packed
+    assert read_png(stem.with_suffix(".png")) == (2, 1, bytes((255, 128, 0, 255, 255, 32, 0, 255)))
+
+
 def test_undecodable_format_keeps_the_dds_and_counts_unsupported(eq, tmp_path, monkeypatch, capsys):
-    # R10G10B10A2_UNORM_SRGB: dds_png has no decoder for its DXGI code
-    carve, expected = build_case(eq, tmp_path, 25, top_first=True)
-    t = texture(25, "R10G10B10A2_UNORM_SRGB", 64, 64, mips=2)
+    # R8G8B8A8_UINT: dds_png has no decoder for its DXGI code
+    carve, expected = build_case(eq, tmp_path, 30, top_first=True)
+    t = texture(30, "R8G8B8A8_UINT", 64, 64, mips=2)
     out, code, text = png_main(tmp_path, monkeypatch, capsys, [t], carve, "--png")
     assert code is None  # main() returns None, so the process exits 0
-    assert tree(out) == ["export_log.json", f"x.rpf{os.sep}{0xABC:012x}_3_64x64_R10G10B10A2_UNORM_SRGB.dds"]
-    assert (out / "x.rpf" / f"{0xABC:012x}_3_64x64_R10G10B10A2_UNORM_SRGB.dds").read_bytes()[148:] == expected
+    assert tree(out) == ["export_log.json", f"x.rpf{os.sep}{0xABC:012x}_3_64x64_R8G8B8A8_UINT.dds"]
+    assert (out / "x.rpf" / f"{0xABC:012x}_3_64x64_R8G8B8A8_UINT.dds").read_bytes()[148:] == expected
     assert json.loads((out / "export_log.json").read_text(encoding="utf-8"))[0]["export"]["png"] == "unsupported"
     assert text.splitlines()[1:] == ["png: {'unsupported': 1}"]
 
@@ -495,7 +511,7 @@ def test_mixed_run_counts_each_kind(eq, tmp_path, monkeypatch, capsys):
     with open(os.path.join(carve, "x.rpf", f"{0x1000:012x}.bin"), "rb") as f:
         write_blob(carve, "x.rpf", 0x2000, f.read())  # same 4 bpe size, so the equation is already in place
     textures = [texture(28, "R8G8B8A8_UNORM", 64, 64, mips=2),
-                texture(25, "R10G10B10A2_UNORM_SRGB", 64, 64, mips=2, gpu=0x2000),
+                texture(30, "R8G8B8A8_UINT", 64, 64, mips=2, gpu=0x2000),
                 texture(9999, "X", 4, 4, 1, gpu=0x3000)]
     out, code, text = png_main(tmp_path, monkeypatch, capsys, textures, carve, "--png")
     assert text.splitlines()[1] == "png: {'written': 1, 'unsupported': 1}"

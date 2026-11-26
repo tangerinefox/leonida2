@@ -55,8 +55,10 @@ scripted pad, driven by the script alone:
   shim, or through `IGameInputDispatcher::Dispatch` once the title made a dispatcher) and found by `FindDeviceFromId`.
   It is already connected, so a callback registered without enumeration hears nothing.
 - **The readings:** `GetCurrentReading`, `GetNextReading` and `GetPreviousReading`, with gamepad, UI navigation,
-  controller axis and controller button state. A reading is taken when the title asks for one and the script's state
-  has changed since the last, so no thread polls; the history keeps the last 64 readings.
+  controller axis and controller button state. A reading is taken when the title asks for one, so no thread polls,
+  but it first adds one reading for every change the script made since the last, stamped with the script's own time:
+  a press that starts and ends between two reads of the title is still in the history, where `GetNextReading` finds
+  it, and the readings are the same however often the title reads. The history keeps the last 64 readings.
 - **The timeline:** the same as with SDL3 (`runtime/shims/gameinput_script.h` holds the parser, the timeline and the
   log lines for both): seconds from the first `GameInputCreate`, each press held 300 ms (or its own `:hold`, see
   `LEONIDA_INPUT_SCRIPT` below), then released.
@@ -71,8 +73,11 @@ The start of the run logs one line with the counts, and each press logs the same
 [rt] gameinput: press a@40.0 (Scripted pad (Leonida))
 ```
 
-A press is logged when the title reads it, so a press the title never reads is not logged. `LEONIDA_INPUT_LOG=0`
-turns the `press` lines off. Without `LEONIDA_INPUT_SCRIPT`, the shim serves no devices and answers `E_NOTIMPL` for
+A press is logged at the next reading the title asks for, with the script's time of the press, so a press is logged
+once the title reads its pad again. `LEONIDA_INPUT_LOG=0` turns the `press` lines off. `LEONIDA_INPUT_TRACE=1`
+(diagnostic, this shim only) logs what the title asks for: the first 128 `GetCurrentReading`, `GetNextReading` and
+`GetPreviousReading` calls, then every one that returns a pressed button and every 1000th, the device callbacks and
+`RegisterDeviceCallback` calls, and the first few calls of each reading method. Without `LEONIDA_INPUT_SCRIPT`, the shim serves no devices and answers `E_NOTIMPL` for
 every slot past `Release`, as before.
 
 `LEONIDA_INPUT_FILE=<path>` drives a run whose display takes no keyboard input (a headless session): every line

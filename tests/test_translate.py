@@ -13,8 +13,8 @@ from pathlib import Path
 import pytest
 
 import rdna2spirv
-from conftest import (EMPTY_DXBC, KNOWN_VAL_ISSUES, ROOT, SAMPLE_DXBC, Shader, make_dxbc, mesh_psv0_chunk,
-                      requires_tools, signature_chunk)
+from conftest import (EMPTY_DXBC, KNOWN_VAL_ISSUES, ROOT, SAMPLE_DXBC, TEXT_ONLY_MARK, Shader, make_dxbc,
+                      mesh_psv0_chunk, requires_tools, signature_chunk)
 
 pytestmark = requires_tools
 
@@ -62,6 +62,24 @@ def test_gpu_samples_translate_and_validate(path, make_shader):
     with open(path, encoding="utf-8") as f:
         shader = make_shader(f.read(), name, dxbc=SAMPLE_DXBC.get(stem, EMPTY_DXBC))
     shader.validate(shader.translate(), KNOWN_VAL_ISSUES.get(stem))
+
+
+def test_text_only_mark_is_spelled_as_in_the_gpu_runner():
+    """conftest.Shader and scripts/run_gpu_tests.py have to agree on the comment line that marks a sample llvm-mc
+    cannot assemble: with two spellings, a marked sample is handed to llvm-mc here and fails."""
+    runner = Path(ROOT, "scripts", "run_gpu_tests.py").read_text(encoding="utf-8")
+    assert f'\nTEXT_ONLY_MARK = "{TEXT_ONLY_MARK}"\n' in runner
+
+
+def test_only_a_marked_sample_skips_llvm_mc(make_shader):
+    """A sample with the text-only line becomes its own listing, comment lines dropped, whatever llvm-mc makes of
+    its instructions; the same lines without it still go to llvm-mc and fail there."""
+    body = "v_mov_b32 v1, 1.0\n  v_no_such_instruction v0, v1\n\ns_endpgm\n"
+    shader = make_shader(f"; a sample llvm-mc cannot assemble\n{TEXT_ONLY_MARK}\n{body}", "cs_text_only")
+    assert shader.path.read_text(encoding="utf-8").splitlines()[1:] == [
+        "\tv_mov_b32 v1, 1.0", "\tv_no_such_instruction v0, v1", "\ts_endpgm"]
+    with pytest.raises(AssertionError, match="v_no_such_instruction"):
+        make_shader(body, "cs_not_marked")
 
 
 @pytest.mark.parametrize("case", sorted(SUPPORTED))

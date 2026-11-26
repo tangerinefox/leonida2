@@ -326,23 +326,30 @@ struct BlobRead {
 
 size_t align8(size_t n) { return (n + 7) & ~size_t{7}; }
 
-size_t packed_size(const std::vector<BlobRead>& blobs) {
-    size_t n = align8(blobs.size() * sizeof(XGameSaveBlob));
-    for (const BlobRead& b : blobs) n += align8(b.data.size()) + align8(b.name.size() + 1);
+// The layout the blobs are packed in: 8-byte aligned data and names when the buffer has room for that, packed back
+// to back otherwise. A title sizes the buffer as the sum of sizeof(XGameSaveBlob), the data and the name with its NUL
+// for each blob, so the minimum is the unaligned size.
+size_t packed_size(const std::vector<BlobRead>& blobs, bool aligned) {
+    const auto a = [aligned](size_t n) { return aligned ? align8(n) : n; };
+    size_t n = a(blobs.size() * sizeof(XGameSaveBlob));
+    for (const BlobRead& b : blobs) n += a(b.data.size()) + a(b.name.size() + 1);
     return n;
 }
+size_t packed_size(const std::vector<BlobRead>& blobs) { return packed_size(blobs, false); }
 
-void pack(const std::vector<BlobRead>& blobs, void* buffer) {
+void pack(const std::vector<BlobRead>& blobs, void* buffer, size_t buffer_size) {
+    const bool aligned = buffer_size >= packed_size(blobs, true);
+    const auto a = [aligned](size_t n) { return aligned ? align8(n) : n; };
     auto* base = static_cast<uint8_t*>(buffer);
     auto* entries = static_cast<XGameSaveBlob*>(buffer);
-    size_t at = align8(blobs.size() * sizeof(XGameSaveBlob));
+    size_t at = a(blobs.size() * sizeof(XGameSaveBlob));
     for (size_t i = 0; i < blobs.size(); ++i) {
         uint8_t* data = base + at;
         if (!blobs[i].data.empty()) std::memcpy(data, blobs[i].data.data(), blobs[i].data.size());
-        at += align8(blobs[i].data.size());
+        at += a(blobs[i].data.size());
         char* name = reinterpret_cast<char*>(base + at);
         std::memcpy(name, blobs[i].name.c_str(), blobs[i].name.size() + 1);
-        at += align8(blobs[i].name.size() + 1);
+        at += a(blobs[i].name.size() + 1);
         entries[i].info.name = name;
         entries[i].info.size = static_cast<uint32_t>(blobs[i].data.size());
         entries[i].data = data;
@@ -642,7 +649,7 @@ HRESULT CALLBACK job_provider(XAsyncOp op, const XAsyncProviderData* data) {
         }
         if (job->identity == &kReadIdentity) {
             if (data->bufferSize < packed_size(job->blobs)) return E_GS_PROVIDED_BUFFER_TOO_SMALL;
-            pack(job->blobs, data->buffer);
+            pack(job->blobs, data->buffer, data->bufferSize);
             t_read_count = static_cast<uint32_t>(job->blobs.size());
             return S_OK;
         }
@@ -840,7 +847,7 @@ HRESULT STDMETHODCALLTYPE save_read(void*, XGameSaveContainerHandle c, const cha
     const HRESULT hr = read_blobs(c, names, names ? *count : 0, blobs);
     if (FAILED(hr)) return hr;
     if (size < packed_size(blobs)) return E_GS_PROVIDED_BUFFER_TOO_SMALL;
-    pack(blobs, out);
+    pack(blobs, out, size);
     *count = static_cast<uint32_t>(blobs.size());
     return S_OK;
 }

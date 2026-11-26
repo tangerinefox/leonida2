@@ -228,6 +228,20 @@ int main() {
               std::strcmp(out[1].info.name, "profile/main") == 0 &&
               std::memcmp(out[1].data, profile.data(), profile.size()) == 0,
           "ReadBlobData returns both blobs, byte for byte, pointing into the buffer");
+    // A title sizes the buffer as sizeof(XGameSaveBlob) + data + name and its NUL per blob, with no padding: such a
+    // buffer is enough, the blobs packed back to back.
+    const char* one[] = {"story"};
+    count = 1;
+    std::vector<uint8_t> exact(sizeof(Blob) + story.size() + std::strlen("story") + 1);
+    auto* tight = reinterpret_cast<Blob*>(exact.data());
+    check(at<Read>(save, 20)(save, container, one, &count, exact.size(), tight) == S_OK && count == 1 &&
+              std::strcmp(tight[0].info.name, "story") == 0 && tight[0].info.size == story.size() &&
+              std::memcmp(tight[0].data, story.data(), story.size()) == 0 &&
+              tight[0].info.name + std::strlen("story") + 1 <= reinterpret_cast<const char*>(exact.data() + exact.size()),
+          "ReadBlobData into a buffer of the unpadded size returns the blob");
+    count = 1;
+    check(at<Read>(save, 20)(save, container, one, &count, exact.size() - 1, tight) == E_GS_PROVIDED_BUFFER_TOO_SMALL,
+          "one byte less than the unpadded size is too small");
     const char* absent[] = {"nope"};
     count = 1;
     check(at<Read>(save, 20)(save, container, absent, &count, buffer.size() * 8, out) == E_GS_BLOB_NOT_FOUND,

@@ -1433,8 +1433,8 @@ class StructuredEmulationTests(unittest.TestCase):
                 want = isa_v4_before_sbar(l) + isa_v4_before_sbar(l ^ 64)
                 self.assertEqual(mem_new[1024 + l * 4], want, f"lane {l} rev={rev}")
 
-    def test_multiwave_divergent_sbarrier_falls_back_to_rounds(self):
-        # Wave 0 hits s_barrier in one arm while Wave 1 hits s_barrier in another -> MUST keep global rounds.
+    def test_multiwave_divergent_sbarrier_stays_in_tail_rounds(self):
+        # Wave 0 hits s_barrier in one arm while Wave 1 hits s_barrier in another -> both arms MUST keep the rounds.
         insns = [
             ("s_mov_b64 exec, -1", 4),
             ("v_lshlrev_b32_e32 v2, 2, v0", 4),
@@ -1452,11 +1452,49 @@ class StructuredEmulationTests(unittest.TestCase):
             ("s_endpgm", 4),
         ]
         spv, gen = _translate_encoded("cs_div_sbar_w64", insns, (128, 1, 1), emulate=True, rsrc2=0x20088)
-        self.assertEqual(gen.control_flow, "emulated wave64 rounds")
-        self.assertIsNone(gen.emulate_plan)
-        mem, _ = run_emulated_workgroup(spv, (128, 1, 1), push_constants=VSHARP + [0] * 28)
-        for lane in range(64):
-            self.assertEqual(mem[lane * 4], lane + 64, f"lane {lane}")
+        self.assertEqual(gen.control_flow, "emulated wave64 structured")
+        plan = gen.emulate_plan
+        self.assertEqual(plan["inline_blocks"], {0})
+        self.assertEqual(plan["tail_blocks"], {1, 2})  # both s_barrier arms
+        for rev in (False, True):
+            mem, _ = run_emulated_workgroup(spv, (128, 1, 1), push_constants=VSHARP + [0] * 28, reverse_order=rev)
+            for lane in range(64):
+                self.assertEqual(mem[lane * 4], lane + 64, f"lane {lane}, reverse={rev}")
+
+    def test_multiwave_guarded_sbarrier_epilogue_keeps_body_structured(self):
+        # The shape of an NGG mesh epilogue: a body with a wave vote, then a guarded s_barrier both waves skip or
+        # reach (s_cbranch_vccnz), then a top-level s_barrier. Only the part from the guard on stays in rounds.
+        def insns(vcc):
+            return [
+                ("s_mov_b64 exec, -1", 4),
+                ("v_lshlrev_b32_e32 v2, 2, v0", 4),
+                ("v_add_nc_u32_e32 v5, 7, v0", 4),
+                ("v_readfirstlane_b32 s5, v0", 4),
+                ("v_add_nc_u32_e32 v5, s5, v5", 4),
+                ("ds_write_b32 v2, v5", 8),
+                (f"s_mov_b64 vcc, {vcc}", 4),
+                ("s_cbranch_vccnz 1", 4),
+                ("s_barrier", 4),
+                ("s_barrier", 4),
+                ("v_xor_b32_e32 v3, 64, v0", 4),
+                ("v_lshlrev_b32_e32 v3, 2, v3", 4),
+                ("ds_read_b32 v4, v3", 8),
+                ("buffer_store_dword v4, v2, s[0:3], 0 offen", 8),
+                ("s_endpgm", 4),
+            ]
+        for vcc in ("0", "-1"):
+            spv, gen = _translate_encoded("cs_sbar_epilogue_w64", insns(vcc), (128, 1, 1), emulate=True,
+                                          rsrc2=0x20088)
+            self.assertEqual(gen.control_flow, "emulated wave64 structured")
+            plan = gen.emulate_plan
+            self.assertEqual(plan["inline_blocks"], {0})
+            self.assertEqual(plan["tail_blocks"], {1, 2})
+            for rev in (False, True):
+                mem, _ = run_emulated_workgroup(spv, (128, 1, 1), push_constants=VSHARP + [0] * 28,
+                                                reverse_order=rev)
+                for lane in range(128):
+                    other = lane ^ 64
+                    self.assertEqual(mem[lane * 4], other + 7 + (other & 64), f"lane {lane}, vcc={vcc}, rev={rev}")
 
     def test_monotone_dirty_transfer_no_phantom_clear_after_x_round(self):
         # Regression: an x_round (v_readlane_b32) clears g.x_dirty in codegen before a subsequent

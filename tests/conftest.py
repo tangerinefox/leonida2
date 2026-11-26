@@ -156,6 +156,10 @@ KNOWN_VAL_ISSUES = {}
 # 0x8088 = 4 user SGPRs, TGID_X, 512 B of LDS; group 64x1x1 (the header the cs_* samples in runtime/test/shaders use).
 DEFAULT_CS_HEADER = (0x8088, (64, 1, 1))
 
+# The comment line a sample carries when llvm-mc cannot assemble it (cs_dpp_cmp.asm: a VOPC compare in DPP form).
+# scripts/run_gpu_tests.py has the same line; tests/test_translate.py checks that the two agree.
+TEXT_ONLY_MARK = "; run_gpu_tests: text only, llvm-mc has no gfx1013 encoding for an instruction here"
+
 
 class Shader:
     def __init__(self, workdir, name, asm, cs_header=DEFAULT_CS_HEADER, dxbc=EMPTY_DXBC):
@@ -167,6 +171,15 @@ class Shader:
             rsrc2, (lx, ly, lz) = cs_header
             (workdir / "fssm").mkdir(exist_ok=True)
             (workdir / "fssm" / f"{name}.fssm").write_bytes(bytes(0x138) + struct.pack("<4I", rsrc2, lx, ly, lz))
+        self.path = disasm / f"{name}.s"
+        self.workdir = workdir
+        if any(ln.strip() == TEXT_ONLY_MARK for ln in asm.splitlines()):
+            # llvm-mc has no gfx1013 encoding for an instruction of this sample, so its text is the listing, as in
+            # assemble_to_s of scripts/run_gpu_tests.py: the translator reads straight-line code from the text alone.
+            lines = [f"; {name}  code 0x0..0x0 (synthetic), gfx1013, 0 invalid words"]
+            lines += ["\t" + ln.strip() for ln in asm.splitlines() if ln.strip() and not ln.lstrip().startswith(";")]
+            self.path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+            return
         cmd = LLVM_MC + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013"]
         for ln in asm.splitlines():
             s = ln.strip()
@@ -181,9 +194,7 @@ class Shader:
         cmd.append("-show-encoding")
         r = subprocess.run(cmd, input=asm, capture_output=True, text=True)
         assert r.returncode == 0, r.stderr
-        self.path = disasm / f"{name}.s"
         self.path.write_text(f"; {name}  synthetic\n{r.stdout}")
-        self.workdir = workdir
 
     def translate(self):
         return rdna2spirv.translate(str(self.path))

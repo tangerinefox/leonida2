@@ -75,7 +75,7 @@ inline void note_released(std::uintptr_t begin, std::uintptr_t end) {
         std::lock_guard lock(q->mutex);
         bool room = q->ranges.size() < 65536;
         if (!room) {
-            // Full: first the ranges that overlap or touch become one (remaps report page runs, often neighbours), and
+            // Full: first the ranges that overlap or touch become one (unmaps report page runs, often neighbours), and
             // only when that leaves it more than half full does it all become one covering range.
             std::sort(q->ranges.begin(), q->ranges.end());
             std::size_t kept = 0;

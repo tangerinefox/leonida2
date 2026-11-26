@@ -98,10 +98,10 @@ Pad read_at(IGameInput* input, IGameInputDevice* device, double seconds) {
 }
 
 int scripted_pad(CreateFn create) {
-    // Five presses (two overlapping A presses, Menu, B held 0.8 s, a right-stick throw) and seven rejected entries
-    // (four of them holds that are zero, negative, missing or too long).
+    // Six presses (two overlapping A presses, Menu, B held 0.8 s, a right-stick throw, a Y press the title never reads
+    // while it is down) and seven rejected entries (four of them holds that are zero, negative, missing or too long).
     SetEnvironmentVariableA("LEONIDA_INPUT_SCRIPT",
-                            "a@1, START@2.5 ,a@1.2,b@3:0.8 ,rsup@4,bogus@1,a@-1,,x@3:0,x@3:-1,x@3:,x@3:601");
+                            "a@1, START@2.5 ,a@1.2,b@3:0.8 ,rsup@4,y@10,bogus@1,a@-1,,x@3:0,x@3:-1,x@3:,x@3:601");
     rt::gameinput_no_sdl::set_clock(fake_clock);
     at(0);
 
@@ -211,23 +211,40 @@ int scripted_pad(CreateFn create) {
     check(up.buttons == 0 && up.right_y == 1.0f && up.ui == GameInputUiNavigationScrollUp,
           "script: rsup throws the right stick up at 4.1 s");
     check(read_at(input, device, 4.5).right_y == 0, "script: the stick is back at rest at 4.5 s");
+    // The title reads at 4.5 s and next at 60 s: y@10 starts and ends in between, and is still in the history.
     check(read_at(input, device, 60).buttons == 0, "script: nothing is held after the script ends");
 
-    // The history: the reading before the current one is the stick throw, and the one after that throw is the rest.
+    // The history, newest first: the rest after Y (10.3 s), the Y press (10.0 s), the rest after the stick throw
+    // (4.3 s), the stick throw. Each reading carries the script's time of the change, not the time of the read.
     IGameInputReading* now = nullptr;
-    IGameInputReading* before = nullptr;
-    IGameInputReading* after = nullptr;
     check(input->GetCurrentReading(GameInputKindUnknown, nullptr, &now) == S_OK && now, "script: a current reading");
     if (now) {
+        check(now->GetTimestamp() == 7'000'000 + 10'300'000, "script: the current reading is Y's release at 10.3 s");
+        IGameInputReading* y = nullptr;
+        IGameInputReading* rest = nullptr;
+        IGameInputReading* stick = nullptr;
+        IGameInputReading* after = nullptr;
         GameInputGamepadState s{};
-        check(input->GetPreviousReading(now, GameInputKindGamepad, device, &before) == S_OK && before &&
-                  before->GetGamepadState(&s) && s.rightThumbstickY == 1.0f,
-              "script: GetPreviousReading steps back to the stick throw");
-        if (before) {
-            check(input->GetNextReading(before, GameInputKindGamepad, nullptr, &after) == S_OK && after == now,
-                  "script: GetNextReading steps forward to the current reading");
-            before->Release();
+        check(input->GetPreviousReading(now, GameInputKindGamepad, device, &y) == S_OK && y &&
+                  y->GetGamepadState(&s) && s.buttons == GameInputGamepadY &&
+                  y->GetTimestamp() == 7'000'000 + 10'000'000,
+              "script: a press between two reads of the title is in the history, at its own time");
+        if (y) {
+            check(input->GetPreviousReading(y, GameInputKindGamepad, device, &rest) == S_OK && rest &&
+                      rest->GetGamepadState(&s) && s.buttons == 0 && s.rightThumbstickY == 0 &&
+                      rest->GetTimestamp() == 7'000'000 + 4'300'000,
+                  "script: before Y, the stick's return at 4.3 s");
+            check(input->GetNextReading(y, GameInputKindGamepad, nullptr, &after) == S_OK && after == now,
+                  "script: GetNextReading steps forward from Y to the current reading");
+            y->Release();
         }
+        if (rest) {
+            check(input->GetPreviousReading(rest, GameInputKindGamepad, device, &stick) == S_OK && stick &&
+                      stick->GetGamepadState(&s) && s.rightThumbstickY == 1.0f,
+                  "script: GetPreviousReading steps back to the stick throw");
+            rest->Release();
+        }
+        if (stick) stick->Release();
         if (after) after->Release();
         IGameInputReading* none = nullptr;
         check(input->GetNextReading(now, GameInputKindUnknown, nullptr, &none) == GAMEINPUT_E_READING_NOT_FOUND &&

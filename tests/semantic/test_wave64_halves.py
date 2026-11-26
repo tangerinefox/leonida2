@@ -1348,5 +1348,25 @@ class PixelShaders(unittest.TestCase):
                     self.assertEqual(slots64, slots32)
 
 
+class VcmpxDppExec(unittest.TestCase):
+    """SHADER-VOPCX-DPP review: a v_cmpx in DPP form writes EXEC like any v_cmpx, and the cross-lane branch of the
+    analysis must not drop that write. The repro from the review: after the compare, v5 = s4 is not one value in every
+    lane, so v_readlane_b32 of it is not a uniform read."""
+
+    BODY = ["v_mov_b32_e32 v5, 0", "s_mov_b64 s[10:11], exec", None, "v_mov_b32_e32 v5, s4", "s_mov_b64 exec, s[10:11]",
+            "v_readlane_b32 s5, v5, 0", "v_mov_b32_e32 v6, s5"]
+
+    def meta(self, compare):
+        body = [compare if line is None else line for line in self.BODY]
+        return meta_of("ps_vcmpx_dpp_exec", ps(body))[0]
+
+    def test_dpp_form_is_classified_as_the_e32_form(self):
+        e32 = self.meta("v_cmpx_gt_f32_e32 v1, v2")
+        dpp = self.meta("v_cmpx_gt_f32_dpp v1, -v1 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf bound_ctrl:1 fi:1")
+        self.assertEqual(e32, ("C", ["cross-lane"], []))
+        self.assertEqual(dpp, e32)
+        self.assertNotIn("readlane-uniform", dpp[2])
+
+
 if __name__ == "__main__":
     unittest.main()

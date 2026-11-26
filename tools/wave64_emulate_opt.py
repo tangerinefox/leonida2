@@ -1741,13 +1741,6 @@ def plan_structured_emulation(blocks, raw_edges, succ, folds, fold_chain, absorb
         if any(sb_has_endpgm[u] for u in it_blocks):
             saw_endpgm = True
 
-    # Multi-wave soundness guard: any `s_barrier` inside a non-top-level guard/loop must stay in global x_scheduler
-    # so waves on different paths can meet at different s_barrier sites (cs_barrier_divergent).
-    for it in flat_top:
-        if it[0] != "block":
-            if any(sb_has_sbarrier[u] for u in _blocks_in_tree(it)):
-                return None
-
     def check_sync_free(it):
         sub_blocks = _blocks_in_tree(it)
         has_loop = _tree_has_loop([it])
@@ -1793,7 +1786,10 @@ def plan_structured_emulation(blocks, raw_edges, succ, folds, fold_chain, absorb
             cur_dirty = sb_gen_dirty[b] if sb_clears_dirty[b] else (cur_dirty | sb_gen_dirty[b])
             steps.append(("inline_block", b))
             continue
-        if has_end:
+        # An `s_barrier` under a guard or in a loop: waves on different paths meet at different sites
+        # (cs_barrier_divergent), which only the round scheduler models. Every wave enters the tail in the same
+        # round, and what ran before it has no `s_barrier` that is not reached by the whole workgroup.
+        if has_end or (it[0] != "block" and any(sb_has_sbarrier[u] for u in it_blocks)):
             # Early s_endpgm inside a wave-divergent guard/loop (or non-final block): hand remaining tail to x_scheduler.
             rem = set()
             for rem_it in flat_top[idx_it:]:

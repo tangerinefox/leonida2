@@ -13,6 +13,7 @@
 #include "host_wine.h"
 #include "../shims/d3d12_com.h"
 #include "../src/title_page_watch.h"
+#include "../src/title_geometry_watch.h"
 #include "../src/gfx10_descriptors.h"
 #include "../src/deferred_image_binding.h"
 #include <dxgi1_4.h>
@@ -919,6 +920,167 @@ int check_aliased_write(ID3D12Device* device) {
                 who, unmarked, marked == -1 ? "arrives" : "STILL STALE");
     EXPECT(unmarked == 0x11000);
     EXPECT(marked == -1);
+    return 0;
+}
+
+// The same page, guarded at both addresses instead of copied at every submission. With the other address known (what
+// xmem answers through leonida::geometry_writes::aliases), the shadow at A arms the geometry watch's cells of the
+// aliased 64 KiB at A and at B: both read-only between submissions, and a submission that follows no write copies
+// nothing of it. The control: a write through a third view nobody reported doesn't fault, so it stays stale until a
+// write through B (which faults) marks the block; then both arrive. Each view commits its pages itself: Wine shows a
+// page of a SEC_RESERVE view as committed only in the view that committed it.
+std::uintptr_t g_alias_a, g_alias_b;
+void aliases_of_test_views(std::uintptr_t va, std::vector<std::uintptr_t>& others) {
+    if (va >= g_alias_a && va < g_alias_a + 4 * 0x10000) others.push_back(va - g_alias_a + g_alias_b);
+    if (va >= g_alias_b && va < g_alias_b + 4 * 0x10000) others.push_back(va - g_alias_b + g_alias_a);
+}
+
+int check_aliased_guard(ID3D12Device* device) {
+    const char* who = "vulkan slot-133 aliased page, guarded";
+    constexpr SIZE_T size = 4 * 0x10000;
+    constexpr UINT64 committed = size / 2, block = 0x10000, at = 0x11000;
+    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_RESERVE, 0, DWORD(size),
+                                        nullptr);
+    EXPECT(section != nullptr);
+    std::uint8_t* views[3]{};
+    for (auto& view : views) {
+        view = static_cast<std::uint8_t*>(MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, size));
+        EXPECT(view != nullptr && VirtualAlloc(view, committed, MEM_COMMIT, PAGE_READWRITE) == view);
+    }
+    std::uint8_t *a = views[0], *b = views[1], *c = views[2];
+    g_alias_a = reinterpret_cast<std::uintptr_t>(a);
+    g_alias_b = reinterpret_cast<std::uintptr_t>(b);
+    leonida::geometry_writes::aliases.store(&aliases_of_test_views, std::memory_order_release);
+    leonida::title_page_aliases::set(g_alias_a + block, true);
+    leonida::title_page_aliases::set(g_alias_b + block, true);
+    long long unreported = -1, faulted = -1;
+    DWORD at_a = 0, at_b = 0, b_written = 0;
+    {
+        Ref<ID3D12Resource> buffer;
+        buffer.p = place_shadow(device, a, size);
+        EXPECT(buffer.p != nullptr);
+        GpuReader reader;
+        if (reader.init(device, size)) return 1;
+        std::vector<std::uint8_t> want(size, 0), got;
+        for (UINT64 i = 0; i < committed; ++i) want[i] = a[i] = pattern_byte(i, 23);
+        EXPECT(reader.read(buffer.p, got) == 0);
+        EXPECT(first_difference(got, want) == -1);
+        at_a = protection_of(a + at);
+        at_b = protection_of(b + at);
+        EXPECT((at_a & 0xff) == PAGE_READONLY);
+        EXPECT((at_b & 0xff) == PAGE_READONLY);
+        // Nothing written: the block is not copied, so a write the cells can't see is not either.
+        for (UINT64 i = at; i < at + 64; ++i) want[i] = c[i] = 0x5a;
+        EXPECT(reader.read(buffer.p, got) == 0);
+        unreported = first_difference(got, want);
+        // Through B: faults, and the block is copied again (the write through C with it).
+        for (UINT64 i = at + 0x800; i < at + 0x1000; ++i) want[i] = b[i] = pattern_byte(i, 151);
+        b_written = protection_of(b + at);
+        EXPECT(reader.read(buffer.p, got) == 0);
+        faulted = first_difference(got, want);
+        EXPECT((protection_of(b + at) & 0xff) == PAGE_READONLY);
+        // Through A, the shadow's own address.
+        for (UINT64 i = at; i < at + 16; ++i) want[i] = a[i] = 0xc3;
+        EXPECT(reader.read(buffer.p, got) == 0);
+        EXPECT(first_difference(got, want) == -1);
+    }
+    // Released: both addresses are writable again.
+    EXPECT((protection_of(a + at) & 0xff) == PAGE_READWRITE);
+    EXPECT((protection_of(b + at) & 0xff) == PAGE_READWRITE);
+    leonida::title_page_aliases::set(g_alias_a + block, false);
+    leonida::title_page_aliases::set(g_alias_b + block, false);
+    leonida::geometry_writes::aliases.store(nullptr, std::memory_order_release);
+    for (auto* view : views) UnmapViewOfFile(view);
+    CloseHandle(section);
+    std::printf("%s: protection between submissions 0x%lx at A, 0x%lx at B (0x%lx after the write through B); an "
+                "unreported view's write: first stale byte at %lld (expected 69632); after a write through B: %s\n",
+                who, at_a, at_b, b_written, unreported, faulted == -1 ? "arrives" : "STILL STALE");
+    EXPECT(unreported == static_cast<long long>(at));
+    EXPECT((b_written & 0xff) == PAGE_READWRITE);
+    EXPECT(faulted == -1);
+    return 0;
+}
+
+// An alias that appears after the cells were armed. The page is mapped at A and B and guarded at both; then xmem maps
+// it at C too and, as note_mapping does once the peers are updated, moves the mapping of the cells at every address.
+// The next submission asks for the other addresses again and guards C as well, so a write through C faults and is
+// copied at the submission after it.
+std::uintptr_t g_alias_c;
+void aliases_of_late_views(std::uintptr_t va, std::vector<std::uintptr_t>& others) {
+    const std::uintptr_t views[3] = {g_alias_a, g_alias_b, g_alias_c};
+    for (const std::uintptr_t from : views) {
+        if (!from || va < from || va >= from + 4 * 0x10000) continue;
+        for (const std::uintptr_t to : views)
+            if (to && to != from) others.push_back(va - from + to);
+    }
+}
+
+int check_aliased_guard_late_peer(ID3D12Device* device) {
+    const char* who = "vulkan slot-133 aliased page, guarded, alias added later";
+    constexpr SIZE_T size = 4 * 0x10000;
+    constexpr UINT64 committed = size / 2, block = 0x10000, at = 0x11000;
+    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_RESERVE, 0, DWORD(size),
+                                        nullptr);
+    EXPECT(section != nullptr);
+    std::uint8_t* views[3]{};
+    for (auto& view : views) {
+        view = static_cast<std::uint8_t*>(MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, size));
+        EXPECT(view != nullptr && VirtualAlloc(view, committed, MEM_COMMIT, PAGE_READWRITE) == view);
+    }
+    std::uint8_t *a = views[0], *b = views[1], *c = views[2];
+    g_alias_a = reinterpret_cast<std::uintptr_t>(a);
+    g_alias_b = reinterpret_cast<std::uintptr_t>(b);
+    g_alias_c = 0;  // not mapped there yet, as far as xmem knows
+    leonida::geometry_writes::aliases.store(&aliases_of_late_views, std::memory_order_release);
+    leonida::title_page_aliases::set(g_alias_a + block, true);
+    leonida::title_page_aliases::set(g_alias_b + block, true);
+    DWORD c_before = 0, c_armed = 0, c_written = 0;
+    long long late = -1;
+    {
+        Ref<ID3D12Resource> buffer;
+        buffer.p = place_shadow(device, a, size);
+        EXPECT(buffer.p != nullptr);
+        GpuReader reader;
+        if (reader.init(device, size)) return 1;
+        std::vector<std::uint8_t> want(size, 0), got;
+        for (UINT64 i = 0; i < committed; ++i) want[i] = a[i] = pattern_byte(i, 41);
+        EXPECT(reader.read(buffer.p, got) == 0);
+        EXPECT(first_difference(got, want) == -1);
+        EXPECT((protection_of(a + at) & 0xff) == PAGE_READONLY);
+        EXPECT((protection_of(b + at) & 0xff) == PAGE_READONLY);
+        c_before = protection_of(c + at);
+        // Mapped at C now: the peers first, then the cells' mapping at every address (xmem's note_mapping).
+        g_alias_c = reinterpret_cast<std::uintptr_t>(c);
+        leonida::title_page_aliases::set(g_alias_c + block, true);
+        namespace watch = leonida::geometry_writes;
+        for (const std::uintptr_t view : {g_alias_a, g_alias_b, g_alias_c})
+            watch::notify(view + block, view + 2 * block, watch::Event::mapping);
+        EXPECT(reader.read(buffer.p, got) == 0);
+        EXPECT(first_difference(got, want) == -1);
+        c_armed = protection_of(c + at);
+        // Through C: faults, and the block is copied at the next submission.
+        for (UINT64 i = at + 0x400; i < at + 0xc00; ++i) want[i] = c[i] = pattern_byte(i, 97);
+        c_written = protection_of(c + at);
+        EXPECT(reader.read(buffer.p, got) == 0);
+        late = first_difference(got, want);
+    }
+    EXPECT((protection_of(a + at) & 0xff) == PAGE_READWRITE);
+    EXPECT((protection_of(b + at) & 0xff) == PAGE_READWRITE);
+    EXPECT((protection_of(c + at) & 0xff) == PAGE_READWRITE);
+    leonida::title_page_aliases::set(g_alias_a + block, false);
+    leonida::title_page_aliases::set(g_alias_b + block, false);
+    leonida::title_page_aliases::set(g_alias_c + block, false);
+    leonida::geometry_writes::aliases.store(nullptr, std::memory_order_release);
+    g_alias_c = 0;
+    for (auto* view : views) UnmapViewOfFile(view);
+    CloseHandle(section);
+    std::printf("%s: protection at C 0x%lx before it was reported, 0x%lx after (0x%lx after the write through C); "
+                "the write through C: %s\n",
+                who, c_before, c_armed, c_written, late == -1 ? "arrives" : "STILL STALE");
+    EXPECT((c_before & 0xff) == PAGE_READWRITE);
+    EXPECT((c_armed & 0xff) == PAGE_READONLY);
+    EXPECT((c_written & 0xff) == PAGE_READWRITE);
+    EXPECT(late == -1);
     return 0;
 }
 
@@ -2095,6 +2257,8 @@ int check_written_pages_all(ID3D12Device* device) {
     failures += check_concurrent_writes(device, false);
     if (leonida::title_write_watch::enabled()) failures += check_concurrent_writes(device, true);
     failures += check_aliased_write(device);
+    failures += check_aliased_guard(device);
+    failures += check_aliased_guard_late_peer(device);
     failures += check_kernel_write(device);
     failures += check_shared_pages(device);
     return failures;

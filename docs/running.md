@@ -22,10 +22,21 @@ Paths are placeholders: `<checkout>` is the repository, `<build>` the folder wit
 - **The GPU timeout.** World frames take seconds each. The OS's GPU timeout must be longer, or the driver resets the
   GPU: amdgpu's `lockup_timeout` on Linux, `TdrDelay` on Windows (sections below).
 - **Large ray-tracing programs.** 724 library compute programs have 2 MiB of SPIR-V or more (676 of them ray-tracing
-  resolve) and take 89-167 s each in the driver ([reported by others](https://github.com/ubiquitarianism/leonida/issues/1608#issuecomment-7184700506);
-  the count of 724 also measured by us). `LEONIDA_RT_AS=off` drops acceleration-structure builds and
-  `LEONIDA_SKIP_COMPUTE=<name>,<name>,...` with those programs' names (picked by module size from
-  `<work>/shaders/spirv/library/index.json`) never builds or dispatches them. The picture then lacks what they draw.
+  resolve). With wave64 emulation they took 89-167 s each in the driver ([reported by others](https://github.com/ubiquitarianism/leonida/issues/1608#issuecomment-7184700506);
+  the count of 724 also measured by us). With a native wave64 pack compile time is no reason to leave them out: on an
+  RX 7900 XTX (RADV, Mesa 26.3.1, Wine) all 721 such programs of that pack built, 360 of them in 170 s on 32 threads,
+  2.5-32 s each, the largest (13 MiB) in 28.5 s alone, at a peak of 14 GiB of RAM (measured by us). The pipeline
+  pre-compile builds them with the rest. Dispatched at play (measured by us, one run per condition: RX 7900 XTX 24 GB,
+  `LEONIDA_RT_AS=off`, no skip list, all 721 in the journal), they all came from the journal (2,700 compute
+  pipelines from it against 1,900 with the skip list set; none built in the game) and the load reached the world.
+  One run (a local build of `main` with four then-open pull requests) stopped submitting after 404 s with the GPU idle
+  and no GPU fault; the other (`main` `bd6ba97ab`) lost the device about 214 s in, after a read page fault, with
+  every queue idle in the dispatch markers. The same idle-queue device loss also happens with the skip list set, so
+  it is not shown to come from these programs, and running them got no further than the skip list's best runs
+  (about 11 minutes, ending on a title breakpoint). Whether their output is correct is not measured. Our longest
+  runs used `LEONIDA_SKIP_COMPUTE=<name>,<name>,...` with those programs' names (picked by module size from
+  `<work>/shaders/spirv/library/index.json`), which drops their dispatches at play, and `LEONIDA_RT_AS=off`, which
+  drops acceleration-structure builds. The picture then lacks what they draw.
 
 ## Linux, Wine, AMD RX 7900 XTX (RADV)
 
@@ -39,6 +50,8 @@ reasons behind each step: [linux_proton.md](linux_proton.md#amd-on-linux-what-go
 - **Pipeline pre-compile:** `wine <build>/gta6rt.exe --precompile-pipelines --threads 16` with the run's
   `LEONIDA_SHADERS`, `LEONIDA_PIPELINE_CACHE_DIR` and `LEONIDA_DEVICE_FAULT`, before the first run. It built 3,693
   compute pipelines. Not `make_game.py --stages pipelines`: its cache never matches the runtime's driver keys.
+  The pre-compile builds the programs `LEONIDA_SKIP_COMPUTE` names too (`--skip-listed` leaves them out) and ends
+  with one line that counts what it built, what was journaled already and what it left out.
 - **Driver and OS:** `amdgpu.lockup_timeout=30000,60000,10000,10000` on the kernel command line (the default is
   2000 ms; reboot needed).
 - **Environment:**
@@ -52,11 +65,11 @@ reasons behind each step: [linux_proton.md](linux_proton.md#amd-on-linux-what-go
   | `LEONIDA_STARTUP_CACHE_CHECKPOINTS=1` | session cache snapshots during the boot |
   | `LEONIDA_ASYNC_PIPELINES=0` | draws wait for their pipeline instead of being skipped |
   | `LEONIDA_SERIAL_BIG_COMPILES=0`, `LEONIDA_COMPUTE_WARMUP_MAX_BYTES=8388608` | warm-up limits, as in the NVIDIA report below |
-  | `LEONIDA_RT_AS=off`, `LEONIDA_SKIP_COMPUTE=<list>` | the large ray-tracing programs ([above](#settings-every-platform-needs)) |
+  | `LEONIDA_RT_AS=off`, `LEONIDA_SKIP_COMPUTE=<list>` | the large ray-tracing programs, left out at play as in our longest runs ([above](#settings-every-platform-needs)) |
   | `LEONIDA_TITLE_WATCHDOG=0`, `LEONIDA_TITLE_WATCHDOG_KICK=<trap RVA>,<kick RVA>` | the title's hang watchdog ([above](#settings-every-platform-needs)) |
   | `LEONIDA_DEVICE_TYPE=6`, `LEONIDA_MAP_READBACK=1`, `LEONIDA_FRAME_PACING=1`, `LEONIDA_PRESENT_NO_TEAR=1` | taken over from the NVIDIA report below; their effect on AMD was not measured one by one |
   | `LEONIDA_ARENA_MB=4095`, `LEONIDA_TITLE_WINDOWS_MB=4096`, `LEONIDA_GEOMETRY_MB=6144` | room for the title's buffers in the world |
-  | `LEONIDA_CONSOLE_RELEASE_FILTER=1`, `LEONIDA_SHADOW_ALIAS_MS=5000`, `LEONIDA_CONSOLE_FIX_US=0` | carried from earlier boot runs; their effect here was not measured one by one |
+  | `LEONIDA_SHADOW_ALIAS_MS=5000`, `LEONIDA_CONSOLE_FIX_US=0` | carried from earlier boot runs; their effect here was not measured one by one |
   | `LEONIDA_DEVICE_FAULT=1` | a device-loss report if the GPU hangs |
   | `LEONIDA_KEYBOARD_PAD=always` | the keyboard as the pad |
 
@@ -96,7 +109,10 @@ Reported by others: [#1608, comment 7184700506](https://github.com/ubiquitariani
   `LEONIDA_DEVICE_TYPE=6`, `LEONIDA_TITLE_WATCHDOG=0`, `LEONIDA_MAP_READBACK=1`, `LEONIDA_HOST_IMAGE_COPY=0`,
   `LEONIDA_ARENA_MB=4095`, `LEONIDA_TITLE_WINDOWS_MB=4096`, `LEONIDA_SERIAL_BIG_COMPILES=0`, `LEONIDA_FRAME_PACING=1`,
   `LEONIDA_PRESENT_NO_TEAR=1`. The report gives the reason for the skip list only: without it the world start waits
-  hours on the ray-tracing programs; with asynchronous pipelines instead the screen stayed black.
+  hours on the ray-tracing programs; with asynchronous pipelines instead the screen stayed black. Those compile times
+  are the report's pack; a native wave64 pack builds them in seconds each ([above](#settings-every-platform-needs)).
+  Where they still take minutes, `gta6rt --precompile-pipelines --big-threads N` bounds how many build at once (each
+  held about 3.5 GB of host memory on an RTX 4070 Ti) and `--skip-listed` leaves the listed ones out.
 - **Command:** TBD.
 - **What to expect:** the opening night street from about 650 s, at 0.1-0.2 frames/s, no device loss through 934 s.
   The black stretch before it is graphics pipelines of 1-2.6 MB SPIR-V compiling one at a time, 5-10 s each.

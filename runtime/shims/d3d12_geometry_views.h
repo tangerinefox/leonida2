@@ -1,6 +1,7 @@
 #pragma once
 
 #include "d3d12_title_buffer_windows.h"
+#include "../src/memory_breakdown.h"
 #include "../src/title_geometry_watch.h"
 #include <atomic>
 #include <chrono>
@@ -318,6 +319,7 @@ public:
         VkDeviceSize va{};
         bool at_cap = false;
         const bool over_bytes = bytes_ >= limit || bytes > limit - bytes_;
+        leonida::memory_breakdown::Owner owner(leonida::memory_breakdown::Consumer::geometry);
         if (over_bytes || !pool_.allocate(device, bytes, va, mapped, true, limit, &at_cap)) {
             if (at_cap || over_bytes) {
                 refused_[key] = gen;
@@ -411,10 +413,10 @@ public:
     // deferring its backing storage reclamation until GPU submissions through `retire_ticket` have completed
     // (kAfterExecutes: through the submissions of every replay in progress now, see execute_end).
     // With `final_copy` (a refresh's copy), a ready view whose title range is readable now is copied from it once more
-    // before it leaves the refresh: a range the title remapped holds new bytes, and a list recorded before the remap
-    // that took the view's address (a root view) and runs in a submission the view waits for reads those, as it would
-    // have read them in the console's memory, and as the refresh this retirement replaces would have copied them.
-    // Freed or unmapped memory is not readable, so such a view keeps what it held.
+    // before it leaves the refresh: a released range that is still readable (a heap block freed in memory that stays
+    // committed) may hold new bytes, and a list recorded before the release that runs in a submission the view waits
+    // for reads those, as it would have read them in the console's memory. Decommitted or unmapped memory is not
+    // readable, so such a view keeps what it held.
     template<class OnRetire = NoopRetire, class Copy = NoCopy>
     std::size_t retire_range(Address begin, Address end, std::uint64_t retire_ticket = 0,
                              OnRetire&& on_retire = {}, Copy&& final_copy = {}) {

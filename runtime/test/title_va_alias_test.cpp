@@ -85,29 +85,44 @@ int main() {
     a.remove(title, arena);
     a.remove(title + 0x40000, 0x7000000);
     EXPECT(a.size() == 0);
-    // Replacing part of an alias removes the entire old interval. Other heaps read independently.
-    std::uint64_t cursor = 0;
-    leonida::DescriptorRanges past;
-    EXPECT(a.changed_ranges(cursor, past));
-    auto second = cursor;
+    // Every listener is told each change as it happens (the console heaps' slot records): an add, the whole old
+    // interval when part of it is replaced, a removal, a copy forgotten and title memory added. None is dropped, however
+    // many come (the 4,096-entry ring this replaced fell back to a full sweep), and a removed listener hears nothing.
+    struct Heard {
+        leonida::TitleVaAliases::Change change;
+        std::uint64_t title_va, bytes, shader_va;
+    };
+    std::vector<Heard> first, second;
+    const auto hear = [](void* to, leonida::TitleVaAliases::Change change, std::uint64_t va, std::uint64_t bytes,
+                         std::uint64_t shader_va) {
+        static_cast<std::vector<Heard>*>(to)->push_back({change, va, bytes, shader_va});
+    };
+    using Change = leonida::TitleVaAliases::Change;
+    a.add_listener(&first, hear);
+    a.add_listener(&second, hear);
     EXPECT(a.add(title, size, arena));
-    EXPECT(a.add(title+16, 32, arena+4096));
-    for (auto* reader : {&cursor, &second}) {
-        leonida::DescriptorRanges delta;
-        EXPECT(a.changed_ranges(*reader, delta));
-        delta.merge();
-        EXPECT(delta.overlaps(title+size-1, 1) && delta.overlaps(title-16, 17));
-        EXPECT(!delta.overlaps(title+size, 1) && !delta.overlaps(title-16, 16));
+    EXPECT(a.add(title + 16, 32, arena + 4096));
+    for (const auto* heard : {&first, &second}) {
+        EXPECT(heard->size() == 3);
+        EXPECT((*heard)[0].change == Change::added && (*heard)[0].title_va == title && (*heard)[0].bytes == size);
+        EXPECT((*heard)[1].change == Change::removed && (*heard)[1].title_va == title && (*heard)[1].bytes == size &&
+               (*heard)[1].shader_va == arena);
+        EXPECT((*heard)[2].change == Change::added && (*heard)[2].title_va == title + 16 &&
+               (*heard)[2].bytes == 32 && (*heard)[2].shader_va == arena + 4096);
     }
-    leonida::DescriptorRangeChanges backing;
-    for (unsigned i = 0; i < 4097; ++i) backing.record(UINT64_MAX-3, 4);
-    cursor = 0;
-    EXPECT(!backing.read(cursor, past));
-    backing.record(UINT64_MAX-3, 4);
-    leonida::DescriptorRanges last;
-    EXPECT(backing.read(cursor,last));
-    last.merge();
-    EXPECT(last.overlaps(UINT64_MAX,1) && !last.overlaps(0,1));
+    a.remove_listener(&second);
+    a.remove(title + 16, arena + 4096);
+    a.forget_copy(title + 0x1000, 0x100, 0x5000000);
+    a.add_title_memory(0x30000000000ull, 0x2000);
+    EXPECT(second.size() == 3 && first.size() == 6);
+    EXPECT(first[3].change == Change::removed && first[3].title_va == title + 16 && first[3].shader_va == arena + 4096);
+    EXPECT(first[4].change == Change::removed && first[4].title_va == title + 0x1000 && first[4].bytes == 0x100 &&
+           first[4].shader_va == 0x5000000);
+    EXPECT(first[5].change == Change::memory_added && first[5].title_va == 0x30000000000ull && first[5].bytes == 0x2000);
+    a.remove_title_memory(0x30000000000ull);
+    for (unsigned i = 0; i < 5000; ++i) a.forget_copy(title, 4, arena);
+    EXPECT(first.size() == 5006);
+    a.remove_listener(&first);
     // shader_side: whether an address is one the layer wrote for the title (inside some range's copy), so a scan that
     // sees an already rewritten V# again leaves it alone rather than taking it for an unmapped address.
     EXPECT(!a.shader_side(arena));

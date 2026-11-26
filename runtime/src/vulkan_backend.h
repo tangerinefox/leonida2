@@ -1807,6 +1807,7 @@ public:
             XdxrTriangles g;
             g.vertices = t.vertex_va ? base + t.vertex_va : 0;
             g.vertex_stride = t.vertex_stride;
+            g.vertex_count = t.vertex_count;
             g.xy_only = t.vertex_format == VK_FORMAT_R32G32_SFLOAT;
             g.indices = t.index_type && t.index_va ? base + t.index_va : 0;
             g.index_type = t.index_type;

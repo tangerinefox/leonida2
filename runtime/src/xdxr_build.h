@@ -104,6 +104,9 @@ struct XdxrTriangles {
     std::uint32_t triangle_count = 0;
     std::uint64_t transform = 0;      // device address of a 3x4 row-major float matrix, 0 = none
     std::uint32_t flags = 0;          // D3D12_RAYTRACING_GEOMETRY_FLAGS (bit 0 opaque)
+    // VertexCount: a triangle with a vertex index at or past it is inactive and reads no vertex (0: every triangle);
+    // the default bounds nothing, for callers with no desc.
+    std::uint32_t vertex_count = 0xffffffffu;
 };
 
 // How a top-level build reaches the BLAS addresses its instance descs hold (xdxr_build.comp blas_address). They are
@@ -172,11 +175,12 @@ public:
             t.arg0 = geo.vertex_stride;
             t.arg1 = geo.xy_only ? 1u : 0u;
             t.arg2 = geo.index_type;
+            t.vertex_count = geo.vertex_count;
             t.geometry = std::uint32_t(g) << 8 | (geo.flags & 0xffu);
             dispatch(cb, t, t.count);
             first += geo.triangle_count;
         }
-        if (update_from) refit_finish(cb, layout, p); else finish(cb, layout, p);
+        if (update_from) update_finish(cb, layout, p); else finish(cb, layout, p);
         return true;
     }
 
@@ -204,7 +208,7 @@ public:
             }
             dispatch(cb, t, t.count);
         }
-        if (update_from) refit_finish(cb, layout, p); else finish(cb, layout, p);
+        if (update_from) update_finish(cb, layout, p); else finish(cb, layout, p);
         return true;
     }
 
@@ -246,16 +250,19 @@ private:
         mode_init = 0, mode_triangles = 1, mode_instances = 2, mode_morton = 3, mode_karras = 4, mode_nodes = 5,
         mode_header = 6, mode_radix_count = 7, mode_radix_scan = 8, mode_radix_scatter = 9, mode_small_sort = 10,
         mode_copy_as = 12, mode_postbuild = 13, mode_kept = 14, mode_kept_scan = 15,
-        mode_kept_index = 16, mode_propagate = 17, mode_clear = 18
+        mode_kept_index = 16, mode_propagate = 17, mode_clear = 18, mode_check = 19
     };
     struct Addr { std::uint32_t lo = 0, hi = 0; };
     struct Push {  // xdxr_build.comp `Push`, std430 push-constant layout
         Addr dst, scratch, src0, src1, src2, bias;
         std::uint32_t mode = 0, count = 0, first = 0, arg0 = 0, arg1 = 0, arg2 = 0, geometry = 0, elements = 0,
-                      sort_size = 0, elements_off = 0, nodes_off = 0, parents_off = 0, total_size = 0, flags = 0;
+                      sort_size = 0, elements_off = 0, nodes_off = 0, parents_off = 0, total_size = 0, flags = 0,
+                      vertex_count = 0;
     };
-    enum : std::uint32_t { flag_tlas = 1, flag_box16 = 2, flag_pair = 4, flag_translate = 8 };  // xdxr_build.comp FLAG_*
-    static_assert(sizeof(Push) == 104, "push constants must match xdxr_build.comp");
+    enum : std::uint32_t {  // xdxr_build.comp FLAG_*
+        flag_tlas = 1, flag_box16 = 2, flag_pair = 4, flag_translate = 8, flag_if_refit = 16, flag_if_build = 32
+    };
+    static_assert(sizeof(Push) == 108, "push constants must match xdxr_build.comp");
 
     static Addr split(std::uint64_t a) { return {std::uint32_t(a), std::uint32_t(a >> 32)}; }
 
@@ -284,19 +291,43 @@ private:
 
     // An update: the source's tree is copied unless it is the destination, as many bytes as its header says (a
     // compacted source is shorter than the layout). Its parent table stays as it is, so there is no MODE_INIT.
+    //
+    // Then MODE_CHECK: the source may not be a structure of this layout at all (a title passing one it never built,
+    // which D3D12 leaves undefined), and its pointers would send the refit anywhere. The full build's MODE_INIT runs
+    // only when the check fails (flag_if_build), and refit_finish / finish are both recorded with the flag that picks
+    // one of them (update_finish).
     void refit_begin(VkCommandBuffer cb, const XdxrLayout& l, const Push& p, std::uint64_t source) {
         vk_.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
         const std::uint64_t dst = std::uint64_t(p.dst.hi) << 32 | p.dst.lo;
-        if (source == dst) return;
-        Push c = p;
-        c.mode = mode_copy_as;
-        c.count = l.size / 4;
-        c.src0 = split(source);
-        dispatch(cb, c, c.count);
+        if (source != dst) {
+            Push c = p;
+            c.mode = mode_copy_as;
+            c.count = l.size / 4;
+            c.src0 = split(source);
+            dispatch(cb, c, c.count);
+        }
+        Push k = p;
+        k.mode = mode_check;
+        k.count = 1;
+        dispatch(cb, k, 1);
+        Push init = p;
+        init.flags |= flag_if_build;
+        init.mode = mode_init;
+        init.count = l.parent_entries > 16 ? l.parent_entries : 16;
+        dispatch(cb, init, init.count);
+    }
+
+    void update_finish(VkCommandBuffer cb, const XdxrLayout& l, const Push& p) {
+        Push r = p;
+        r.flags |= flag_if_refit;
+        refit_finish(cb, l, r, true);
+        Push b = p;
+        b.flags |= flag_if_build;
+        finish(cb, l, b);
     }
 
     // Boxes bottom-up through the existing nodes, then the header (its bounds change; nothing else does).
-    void refit_finish(VkCommandBuffer cb, const XdxrLayout& l, const Push& p) {
+    void refit_finish(VkCommandBuffer cb, const XdxrLayout& l, const Push& p, bool barrier_after = false) {
         Push c = p;
         c.mode = mode_clear;
         c.count = l.nodes;
@@ -306,7 +337,7 @@ private:
         h.mode = mode_header;
         h.count = 1;
         h.arg2 = 1;                                     // an update: the bounds only
-        dispatch(cb, h, 1, false);
+        dispatch(cb, h, 1, barrier_after);
     }
 
     // `update`: the elements' pointers are their own (an update never pairs), not the ones MODE_NODES recorded.

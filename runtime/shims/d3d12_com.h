@@ -390,10 +390,6 @@ std::uint64_t device_arena_size(ID3D12Device* device);
 // Copies `bytes` of the device's GPU address arena at console VA `va` (what shaders read there: a heap's GPU copy,
 // the null slots after it) into `out`. False without an arena or when the range is not inside it. For tests.
 bool read_arena(ID3D12Device* device, std::uint64_t va, void* out, std::size_t bytes);
-// The slots whose host-RAM mirror differs from the GPU copy of the console descriptor heap at `console_va`
-// (src/console_heap_copy.h), compared now: 0 when they agree, -1 when there is no such heap or it has no mirror.
-// For tests.
-long long console_heap_mirror_mismatches(ID3D12Device* device, std::uint64_t console_va);
 
 // The blocks of device memory that textures share (src/image_memory.h): how many, their bytes, and the textures in
 // them. For tests.

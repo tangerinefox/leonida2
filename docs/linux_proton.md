@@ -198,6 +198,8 @@ they were found.
    with the environment of the game run (`LEONIDA_SHADERS`, `LEONIDA_PIPELINE_CACHE_DIR`, `LEONIDA_DEVICE_FAULT`;
    `--precompile-pipelines` in [d3d12_vulkan.md](d3d12_vulkan.md)). It built 3,693 compute pipelines; the next boot took
    1,900 of them from the journal in 0.1 s of driver time, and the menus ran at 30 frames/s instead of under one.
+   That run left out the programs `LEONIDA_SKIP_COMPUTE` named, which kept them out of the journal; the pre-compile
+   now builds them too unless it is given `--skip-listed`.
    The `pipeline_cache.bin` that `make_game.py`'s pipelines stage writes with `vk_pipeline_check` gave no hits: 0 of
    5,526 journal pipeline keys were in its 29,861 objects (9 shader binaries were identical, so the machine code
    matched and the keys did not). Each of three differences is enough for a miss on RADV:
@@ -212,10 +214,17 @@ they were found.
      hashes the whole set layout and the stage flags. Graphics would miss anyway: the checker pairs each stage with a
      stub and fixed state, and RADV hashes the full graphics state.
 4. **Leave out the ray-tracing programs.** 724 library compute programs have 2 MiB of SPIR-V or more (676 of them
-   ray-tracing resolve) and take 89-167 s each in the driver. `LEONIDA_RT_AS=off` drops acceleration-structure builds
-   and copies, and `LEONIDA_SKIP_COMPUTE=<name>,<name>,...` with those programs' `lib_cs_NNNNN` names (picked by
-   module size from `library/index.json`) never builds or dispatches them. The picture then lacks whatever those
-   passes draw.
+   ray-tracing resolve). The 89-167 s each in the driver were measured with wave64-emulated packs; with the native
+   pack of step 2 they build in seconds, so compile time is not the reason any more. Measured afterwards on the same
+   machine (RX 7900 XTX, RADV, Mesa 26.3.1, Wine): all 721 such programs of that pack built, 360 of them in 170 s on 32
+   threads, 2.5-32 s each, the largest (13 MiB) in 28.5 s alone, at a peak of 14 GiB of RAM. Two world runs with all
+   of them in the journal and no skip list (one run per build) took them all from the journal and got no further
+   than runs with the skip list: one stopped submitting after 404 s with the GPU idle, the other lost the device
+   about 214 s in with every queue idle, a loss that also happens with the skip list set
+   ([running.md](running.md#settings-every-platform-needs)). Whether their output is correct is not measured, so the
+   longest runs still leave them out. `LEONIDA_RT_AS=off` drops acceleration-structure builds and copies, and
+   `LEONIDA_SKIP_COMPUTE=<name>,<name>,...` with those programs' `lib_cs_NNNNN` names (picked by module size from
+   `library/index.json`) drops their dispatches at play. The picture then lacks whatever those passes draw.
 5. **Keep the title's hang watchdog kicked.** The title exits on purpose (a write to address 0) when its main loop has
    not reported for 30 s, which a world load under the runtime exceeds. `LEONIDA_TITLE_WATCHDOG=0` defuses it only
    together with `LEONIDA_TITLE_WATCHDOG_KICK=<trap RVA>,<kick RVA>` (hex; `runtime/src/main.cpp`); the two values are

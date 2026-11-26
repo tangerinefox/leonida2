@@ -9,6 +9,10 @@
 //   cexit         _cexit() runs every handler and returns; main then returns 11
 //   c_exit        _c_exit() runs none and returns; main then returns 12, and exit runs them all
 //   concurrent_exit  a second thread calls _exit(7) while exit(7) runs a handler: it waits for them all
+//   thread_local_exit   a thread_local object of the main thread, then exit(13): it ends first, then the handlers
+//   thread_local_cexit  the same object, then _cexit(): the same order, and main then returns 14
+// The thread_local destructor reaches the CRT through _register_thread_local_exe_atexit_callback, which the EXE's
+// startup calls only when the image has one (this program has one in every mode, constructed only in the last two).
 // One handler registers another while the handlers run: it must still run, next.
 #include <windows.h>
 #include <process.h>  // _cexit, _c_exit
@@ -73,6 +77,15 @@ int main(int argc, char** argv) {
         std::atexit(handler_slow);
         CloseHandle(CreateThread(nullptr, 0, quick_exit_thread, nullptr, 0, nullptr));
         std::exit(7);
+    }
+    if (!std::strncmp(mode, "thread_local_", 13)) {
+        thread_local Tracer main_thread_local("thread_local");  // constructed here, on the main thread only
+        if (!std::strcmp(mode, "thread_local_exit")) std::exit(13);
+        if (!std::strcmp(mode, "thread_local_cexit")) {
+            _cexit();
+            say("after _cexit");
+            return 14;
+        }
     }
     if (!std::strcmp(mode, "exit")) std::exit(7);
     if (!std::strcmp(mode, "_exit")) _exit(8);
