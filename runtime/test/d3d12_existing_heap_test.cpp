@@ -1359,6 +1359,141 @@ int check_pending_stream_views(ID3D12Device* device) {
     return 0;
 }
 
+namespace {
+std::atomic<DWORD> g_view_av_thread{0};
+std::atomic<unsigned> g_view_avs{0};
+
+LONG CALLBACK count_view_av(PEXCEPTION_POINTERS info) {
+    if (info && info->ExceptionRecord && info->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
+        GetCurrentThreadId() == g_view_av_thread.load(std::memory_order_relaxed)) {
+        g_view_avs.fetch_add(1, std::memory_order_relaxed);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+}  // namespace
+
+// Map changes reported to title_memory_map between submissions must both retire a cached readable answer before a
+// synchronous slot-70 view hashes decommitted pages, and wake a pending slot-70 view without waiting for a submission.
+int check_placed_view_map_changes(ID3D12Device* device) {
+    const char* who = "slot-70 view map changes";
+    if (!rt::d3d12::bindless_set_layout(device)) return 0;
+    GpuReader gpu;
+    EXPECT(!gpu.init(device, 4096));
+    auto env_is = [](const char* name, const char* want) {
+        char buf[16]{};
+        const DWORD n = GetEnvironmentVariableA(name, buf, sizeof(buf));
+        return n > 0 && n < sizeof(buf) && std::strcmp(buf, want) == 0;
+    };
+    auto index = [&](const leonida::gfx10::ImageWords& descriptor) {
+        std::uint32_t key[8];
+        std::memcpy(key, descriptor.data(), sizeof(key));
+        return rt::d3d12::bindless_hash_lookup(device, key);
+    };
+
+    // 1. Committed >256 KiB texture -> decommit interior 64 KiB + map::changed -> synchronous view takes zero AVs.
+    {
+        constexpr SIZE_T bytes = 512 * 1024;
+        auto* pages = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        EXPECT(pages);
+        std::memset(pages, 0x5a, bytes);
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = 512;
+        desc.Height = 1024;
+        desc.DepthOrArraySize = desc.MipLevels = 1;
+        desc.SampleDesc.Count = 1;
+        desc.Format = DXGI_FORMAT_R8_UNORM;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+        srv.Format = desc.Format;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Texture2D.MipLevels = 1;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        leonida::gfx10::ImageWords slot{};
+        auto write_view = [&](UINT mapping) {
+            srv.Shader4ComponentMapping = mapping;
+            std::array<UINT, 14> resource{};
+            std::array<UINT, 16> words{};
+            std::memcpy(resource.data(), &desc, sizeof(desc));
+            std::memcpy(words.data(), &srv, sizeof(srv));
+            return rt::d3d12::write_placed_texture_view(device, false, resource.data(), words.data(),
+                                                        reinterpret_cast<UINT64>(pages),
+                                                        {reinterpret_cast<SIZE_T>(slot.data())});
+        };
+        EXPECT(write_view(D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING));
+        EXPECT(index(slot) != 0);
+
+        EXPECT(VirtualFree(pages + 65536, 65536, MEM_DECOMMIT) != FALSE);
+        leonida::title_memory_map::changed(pages + 65536, 65536);
+
+        g_view_avs.store(0, std::memory_order_relaxed);
+        g_view_av_thread.store(GetCurrentThreadId(), std::memory_order_relaxed);
+        PVOID veh = AddVectoredExceptionHandler(1, &count_view_av);
+        EXPECT(veh != nullptr);
+        const bool wrote_after_unmap = write_view(D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(0, 0, 0, 0));
+        RemoveVectoredExceptionHandler(veh);
+        g_view_av_thread.store(0, std::memory_order_relaxed);
+        EXPECT(wrote_after_unmap);
+        EXPECT(g_view_avs.load(std::memory_order_relaxed) == 0);
+
+        EXPECT(VirtualAlloc(pages + 65536, 65536, MEM_COMMIT, PAGE_READWRITE) == pages + 65536);
+        leonida::title_memory_map::changed(pages + 65536, 65536);
+        Ref<ID3D12Resource> placement;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, desc, 6, IID_PPV_ARGS(&placement.p)), S_OK);
+        placement.p->Release();
+        placement.p = nullptr;
+        VirtualFree(pages, 0, MEM_RELEASE);
+    }
+
+    // 2. Reserved texture -> commit + map::changed (no texel write note, no submission) -> synchronous view publishes.
+    {
+        constexpr SIZE_T bytes = 65536;
+        void* pages = VirtualAlloc(nullptr, bytes, MEM_RESERVE, PAGE_NOACCESS);
+        EXPECT(pages);
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = 32;
+        desc.Height = 8;
+        desc.DepthOrArraySize = desc.MipLevels = 1;
+        desc.SampleDesc.Count = 1;
+        desc.Format = DXGI_FORMAT_R8_UNORM;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+        srv.Format = desc.Format;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Texture2D.MipLevels = 1;
+        leonida::gfx10::ImageWords first{}, second{};
+        auto write_view = [&](UINT mapping, leonida::gfx10::ImageWords& out) {
+            srv.Shader4ComponentMapping = mapping;
+            std::array<UINT, 14> resource{};
+            std::array<UINT, 16> words{};
+            std::memcpy(resource.data(), &desc, sizeof(desc));
+            std::memcpy(words.data(), &srv, sizeof(srv));
+            return rt::d3d12::write_placed_texture_view(device, false, resource.data(), words.data(),
+                                                        reinterpret_cast<UINT64>(pages),
+                                                        {reinterpret_cast<SIZE_T>(out.data())});
+        };
+        EXPECT(write_view(D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, first));
+        if (!env_is("LEONIDA_TITLE_IMAGE_DEFER", "0")) EXPECT(!index(first));
+
+        EXPECT(VirtualAlloc(pages, bytes, MEM_COMMIT, PAGE_READWRITE) == pages);
+        std::memset(pages, 0x33, bytes);
+        leonida::title_memory_map::changed(pages, bytes);
+
+        EXPECT(write_view(D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(0, 0, 0, 0), second));
+        if (!env_is("LEONIDA_TITLE_FILL_ASYNC", "1")) EXPECT(index(first) && index(second));
+
+        Ref<ID3D12Resource> placement;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, desc, 6, IID_PPV_ARGS(&placement.p)), S_OK);
+        placement.p->Release();
+        placement.p = nullptr;
+        VirtualFree(pages, 0, MEM_RELEASE);
+    }
+    return 0;
+}
+
 // A persistent Map can become readable without notifying xmem or calling Map a second time.
 int check_mapped_plane(ID3D12Device* device) {
     const char* who = "persistent slot-133 plane";
@@ -2089,6 +2224,7 @@ int main(int argc, char** argv) {
         if (vk.host_pointer_alignment) failures += check_title_placed_all(ours.p);
         if (vk.host_image_copy) {
             failures += check_pending_stream_views(ours.p);
+            failures += check_placed_view_map_changes(ours.p);
             failures += check_shared_bc_placements(ours.p);
             failures += check_mapped_plane(ours.p);
             failures += check_mapped_bc_array(ours.p);
@@ -2099,6 +2235,7 @@ int main(int argc, char** argv) {
             no_host_copy.host_image_copy = false;
             Ref<ID3D12Device> staged;
             if (FAILED(rt::d3d12::create_vulkan_device(no_host_copy, IID_PPV_ARGS(&staged.p)))) return 1;
+            failures += check_placed_view_map_changes(staged.p);
             failures += check_mapped_plane(staged.p);
             failures += check_mapped_bc_array(staged.p);
         }

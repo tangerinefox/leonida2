@@ -1718,10 +1718,12 @@ int main(int argc, char** argv) {
     check(create(&input) == S_OK && input, "GameInputCreate returns an instance");
     if (argc == 2 && std::strcmp(argv[1], "--input-script") == 0) {
         if (!input) return 1;
-        // Only the X after byte 63 is due now. Its later entry must not cancel it.
+        // Only the X after byte 63 and the Y held 0.6 s are due now. X's later entry must not cancel it; the
+        // malformed holds at the end hold nothing.
         set_env("LEONIDA_INPUT_SCRIPT",
                 "start@3600,start@3600,start@3600,start@3600,start@3600,start@3600, X@0 \t,x@3600,"
-                "unknown@0,a@,a@x,,a@-0.1,a@nan,a@inf,a@1e999,a@0tail, ,");
+                "unknown@0,a@,a@x,,a@-0.1,a@nan,a@inf,a@1e999,a@0tail, ,y@0:0.6,"
+                "a@0:0,a@0:-1,a@0:,a@0:x,a@0:inf,a@0:601,a@0:1tail");
         set_env("LEONIDA_KEYBOARD_PAD", "1");
         rt::gameinput::set_keyboard_source(fake_key_down, fake_focus);
         rt::gameinput::set_cursor_source(fake_cursor);
@@ -1730,27 +1732,32 @@ int main(int argc, char** argv) {
         rt::gameinput::reload_config();
         rt::gameinput::poll();
         const auto buttons = pad_state(input, nullptr).buttons;
-        const auto expected = GameInputGamepadX | GameInputGamepadB;
-        check((buttons & expected) == expected, "long script: the spaced X after byte 63 and the physical B are held");
+        const auto expected = GameInputGamepadX | GameInputGamepadB | GameInputGamepadY;
+        check((buttons & expected) == expected,
+              "long script: the spaced X after byte 63, the held Y and the physical B are held");
         check((buttons & ~expected) == 0, "malformed script entries hold no extra buttons");
         g_focus = false;
         set_env("LEONIDA_INPUT_SCRIPT", "y@0");
         rt::gameinput::reload_config();
         rt::gameinput::poll();
-        check(pad_state(input, nullptr).buttons == GameInputGamepadX,
-              "scripted X survives focus loss; reload does not replace it with Y");
+        check(pad_state(input, nullptr).buttons == (GameInputGamepadX | GameInputGamepadY),
+              "scripted X and Y survive focus loss; reload does not replace the script with y@0");
         Sleep(350);
         g_focus = true;
         rt::gameinput::poll();
-        // A scripted press lasts its 300 ms and then until the title has read the pads six times since it began
-        // (update_keyboard_pad: kReads, at most kMaxHold seconds), so a title that polls slowly still sees it. Each
-        // pad_state() is one GetCurrentReading, and this is the third since the X began.
-        check(pad_state(input, nullptr).buttons == (GameInputGamepadX | GameInputGamepadB),
-              "long script: past its 300 ms the press is still held while the title has read the pads fewer than six times");
+        // A scripted press lasts its hold (300 ms, or button@seconds:hold) and then until the title has read the pads
+        // six times since it began (update_keyboard_pad: kReads), so a title that polls slowly still sees it. Each
+        // pad_state() is one GetCurrentReading, and this is the third since X and Y began.
+        check(pad_state(input, nullptr).buttons == (GameInputGamepadX | GameInputGamepadB | GameInputGamepadY),
+              "long script: past its 300 ms X is still held while the title has read the pads fewer than six times");
         for (int i = 0; i < 6; ++i) pad_state(input, nullptr);
         rt::gameinput::poll();
+        check(pad_state(input, nullptr).buttons == (GameInputGamepadB | GameInputGamepadY),
+              "long script: X ends once the title has read it, y@0:0.6 is still held for its time, the key stays held");
+        Sleep(400);
+        rt::gameinput::poll();
         check(pad_state(input, nullptr).buttons == GameInputGamepadB,
-              "long script: the timed press ends once the title has read it, while the physical key stays held");
+              "long script: Y is released after its 0.6 s hold, the title having read it six times");
         input->Release();
         std::printf("%d checks, %d failures\n", g_checks, g_failures);
         return g_failures ? 1 : 0;

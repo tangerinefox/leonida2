@@ -150,6 +150,10 @@ Each item was a stop on at least one of the machines. Tests named in the pull re
 
 ## Where it stops
 
+- **Writes into title memory.** A window is a read-side copy, so a UAV or raw write used to stop at the copy: the
+  missing return copy is the `WRITE_INVALID` device loss of #1537. The layer now copies the reached ranges back to
+  the title's pages at the next refresh, before the forward copy, and the title's own newer words win. Not yet
+  measured on a GPU with the world phase in front of it.
 - **Streamed memory that reaches its destination late or not at all.** The title calls queue slot 31
   (`CopyPageMappingsBatchX`) about 300 times per boot. With #968 this branch maps each batch's pool pages at the
   destination and at the paired CPU view the layer reads (`docs/d3d12_vulkan.md`, section 4.9), so most streamed
@@ -165,6 +169,63 @@ Each item was a stop on at least one of the machines. Tests named in the pull re
 - **Initialisation takes ~180 s under Proton** against ~70 s natively. Not investigated.
 - **Under Wine** a thread that takes an access violation while holding the process heap lock can still deadlock
   with xmem's fault handler; the test for it is skipped there.
+
+## AMD on Linux: what got the world drawn
+
+On 2026-11-26 a Linux machine with an RX 7900 XTX (and a Ryzen 9 7950X3D's RDNA2 iGPU), Mesa 26.3.1 (RADV) and Wine
+drew the first world frames: the opening night street and a sunset street with palms, cars and a character, over
+eight minutes in the world without a GPU hang, at about one frame per six seconds. The runtime was `main` `a73a57e13`
+with #1914, #1957, #1972, #2044, #2097, #2124, #2129, #2144, #2162, #2195 and #2240 merged; they went into `main`
+together with this section. Each step below removed a stop that ended every earlier run; they are in the order
+they were found.
+
+1. **Raise amdgpu's GPU timeout.** `modinfo amdgpu -p` shows `lockup_timeout` with a default of 2000 ms: the kernel
+   resets any ring whose job runs over 2 s. World frames take seconds, so a run ended about 30 s into the world with
+   `ring gfx_0.0.0 timeout` in `journalctl -k`, no page fault, and a black last frame. Raise it as root and reboot:
+   `amdgpu.lockup_timeout=30000,60000,10000,10000` on the kernel command line (graphics, compute, SDMA, video, in
+   ms), or `options amdgpu lockup_timeout=30000,60000,10000,10000` in a file under `/etc/modprobe.d/` followed by an
+   initramfs rebuild. A real hang then freezes that ring, and a desktop on the same GPU, for up to that long, so don't
+   make it unlimited. Windows reporters raise `TdrDelay` for the same reason.
+2. **Native wave64 shaders.** On a GPU that runs wave64 natively (AMD RDNA), translate with
+   `make_game.py --stages shaders --wave64-emulate off`. Before `max_subgroup_decider` (`make_game.py`), the auto
+   mode took the smallest `maxSubgroupSize` over every Vulkan device, so an installed llvmpipe (8) turned emulation on for all
+   23,841 wave64 shaders. Emulated single-wave compute programs were then translated in the round-loop form, which
+   hung the GPU on several library programs and drove RADV's compiler past 12 GiB (53 GB uncapped) on the largest; the
+   translator no longer does that for single-wave programs ([design.md](design.md), row "Wave64 emulation:
+   single-wave barrier fallback").
+   The auto mode now leaves CPU devices out when a GPU is listed and names the device that decided.
+3. **Fill the pipeline journal with the runtime itself.** `gta6rt --precompile-pipelines --threads 16`, under Wine,
+   with the environment of the game run (`LEONIDA_SHADERS`, `LEONIDA_PIPELINE_CACHE_DIR`, `LEONIDA_DEVICE_FAULT`;
+   `--precompile-pipelines` in [d3d12_vulkan.md](d3d12_vulkan.md)). It built 3,693 compute pipelines; the next boot took
+   1,900 of them from the journal in 0.1 s of driver time, and the menus ran at 30 frames/s instead of under one.
+   The `pipeline_cache.bin` that `make_game.py`'s pipelines stage writes with `vk_pipeline_check` gave no hits: 0 of
+   5,526 journal pipeline keys were in its 29,861 objects (9 shader binaries were identical, so the machine code
+   matched and the keys did not). Each of three differences is enough for a miss on RADV:
+   - **The set of shaders:** the runtime's warm-up builds the library's compute programs (`library/index.json`,
+     2,683 modules); the stage builds the main index and `bvh/`, and only 25 library modules are byte-identical to a
+     main-index one.
+   - **Robustness:** on RADV the runtime enables `robustBufferAccess`, `robustBufferAccess2` and `nullDescriptor`;
+     `vk_pipeline_check` turns `robustBufferAccess` off and leaves robustness2 off. RADV puts the robustness state into
+     every shader stage key, so every pipeline, compute and graphics, misses.
+   - **Layout and subgroup request:** for compute with set-0 bindings (2,244 of the 2,683) the checker builds set 0
+     from default bindless features and requests the subgroup size without the runtime's full-subgroups flag; RADV
+     hashes the whole set layout and the stage flags. Graphics would miss anyway: the checker pairs each stage with a
+     stub and fixed state, and RADV hashes the full graphics state.
+4. **Leave out the ray-tracing programs.** 724 library compute programs have 2 MiB of SPIR-V or more (676 of them
+   ray-tracing resolve) and take 89-167 s each in the driver. `LEONIDA_RT_AS=off` drops acceleration-structure builds
+   and copies, and `LEONIDA_SKIP_COMPUTE=<name>,<name>,...` with those programs' `lib_cs_NNNNN` names (picked by
+   module size from `library/index.json`) never builds or dispatches them. The picture then lacks whatever those
+   passes draw.
+5. **Keep the title's hang watchdog kicked.** The title exits on purpose (a write to address 0) when its main loop has
+   not reported for 30 s, which a world load under the runtime exceeds. `LEONIDA_TITLE_WATCHDOG=0` defuses it only
+   together with `LEONIDA_TITLE_WATCHDOG_KICK=<trap RVA>,<kick RVA>` (hex; `runtime/src/main.cpp`); the two values are
+   measured locally and never committed. With `=0` alone the loader logs that the watchdog stays armed.
+
+The rest of that run's environment came from a Linux/Proton report on an RTX 3090: `LEONIDA_ASYNC_PIPELINES=0`,
+`LEONIDA_DEVICE_TYPE=6`, `LEONIDA_MAP_READBACK=1`, `LEONIDA_TITLE_WINDOWS_MB=4096`, `LEONIDA_FRAME_PACING=1` and
+`LEONIDA_PRESENT_NO_TEAR=1`. Still wrong after it: frames alternate between white-out, a correct picture and black;
+some geometry is drawn in the wrong place; VRAM reached 18.3 of 22.3 GB; the run ended on a breakpoint in the title
+after 12 minutes.
 
 ## Reporting a result
 

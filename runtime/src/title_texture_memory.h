@@ -1,14 +1,17 @@
 #pragma once
 #include <windows.h>
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 
+#include "title_page_watch.h"
+
 namespace leonida {
 
 // Keep negative probes until the title changes the map or a writer reports this footprint. With cache_success,
-// positive ones too: a caller that is told of every map change over the footprint (retry) and reads it under a guard
-// (a page gone since faults into a defer) need not walk the pages before every read.
+// positive ones too: a caller that is told of every map change over the footprint (retry or sync_map) and reads it
+// under a guard (a page gone since faults into a defer) need not walk the pages before every read.
 class TextureReadability {
 public:
     template<class Probe>
@@ -16,16 +19,37 @@ public:
         if (cache_failure && pending_ && !retry_ && generation_ == generation) return false;
         if (cache_success && probed_ && !pending_ && !retry_ && generation_ == generation) return true;
         generation_ = generation;  // snapshot before the probe so a concurrent map change is noticed
+        map_generation_ = title_memory_map::generation();
         retry_ = false;
         probed_ = true;
         pending_ = !probe();
         return !pending_;
+    }
+    // Between refresh passes, check whether the map journal recorded a change over [cpu, cpu + size) since both
+    // this texture's last probe and the last pass's sweep.
+    void sync_map(std::uint64_t pass_generation, std::uintptr_t cpu, std::uint64_t size) {
+        if (!probed_ || retry_) return;
+        const std::uint64_t since = (std::max)(map_generation_, pass_generation);
+        if (title_memory_map::generation() == since) return;
+        const std::uintptr_t end = size > (std::numeric_limits<std::uintptr_t>::max)() - cpu
+                                       ? (std::numeric_limits<std::uintptr_t>::max)()
+                                       : cpu + static_cast<std::uintptr_t>(size);
+        std::uint64_t now = 0;
+        bool overlapped = false;
+        if (!title_memory_map::changes_since(
+                since, now, cpu, end, [&](std::uintptr_t, std::uintptr_t) { overlapped = true; }) ||
+            overlapped) {
+            retry_ = true;
+        } else {
+            map_generation_ = now;
+        }
     }
     void defer() { pending_ = true; }  // mapping disappeared between the probe and the read
     void retry() { retry_ = true; }
     bool pending() const { return pending_; }
 private:
     std::uint64_t generation_ = 0;
+    std::uint64_t map_generation_ = 0;
     bool pending_ = false, retry_ = false, probed_ = false;
 };
 

@@ -4644,6 +4644,85 @@ int check_list_values_more() {
     WaitForSingleObject(job, INFINITE);
     CloseHandle(job);
 
+    // 11. Work-aware timeout in Pump (src/list_value_wait_budget.h):
+    //   a) a matching in-flight producer pauses a held memory gate past the idle timeout until the producer lands;
+    //   b) a busy releaser executing an action gate pauses a concurrent memory gate past the idle timeout;
+    //   c) a demoted gate (4 ms budget) scales its pause caps with its short budget so unrelated active work does not
+    //      hold it for the full timeout's cap;
+    //   d) a matching producer stuck behind an unsignalled fence still hits a finite pause cap instead of hanging.
+    const auto write_on_a = [&](int index, std::uint64_t value, std::uint64_t& signal_value) -> bool {
+        if (FAILED(hr_of(raw(direct, 139, word(allocator), 0)))) return false;
+        raw(direct, 14, 1, 1, 1);  // Dispatch
+        raw(direct, 72, word(&g_cells2[index]), value, 0, 0);  // write64
+        if (FAILED(hr_of(raw(direct, 9)))) return false;
+        g_queue_call_count = 0;
+        if (submit(qa, direct) != 0) return false;
+        signal_value = logged_signal(qa_mock, a_written);
+        return signal_value != 0;
+    };
+    xs::set_list_value_wait_timeout_ms(40);
+    xs::reset_list_value_stats();
+    // 11a. Wait on qb before qa submits its matching write (so relay() misses it and Pump holds a gate).
+    EXPECT(hold_on(qb, 27, 1));
+    std::uint64_t producer_sig = 0;
+    EXPECT(write_on_a(27, 1, producer_sig));
+    EXPECT(!xs::list_values_idle(150));  // >3x the 40 ms idle timeout: pauses while producer is in flight
+    stats = xs::list_value_stats();
+    EXPECT(stats.gates_timed_out == 0 && stats.gates_met == 0 && cell2(27) == 0);
+    fence_signal(a_written, producer_sig);
+    EXPECT(xs::list_values_idle(3000) && cell2(27) == 1);
+    stats = xs::list_value_stats();
+    EXPECT(stats.gates_met == 1 && stats.gates_timed_out == 0);
+
+    // 11b. Releaser inside a 150 ms action gate pauses a concurrent memory gate past the 40 ms idle timeout.
+    xs::set_copy_page_mappings_hook([](std::uint32_t, const rt::xmem::PageBatch*, std::uintptr_t, std::uint32_t,
+                                       std::uint32_t) -> bool {
+        Sleep(150);
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_cells2[28]), 1);
+        return true;
+    });
+    g_queue_call_count = 0;
+    EXPECT(hr_of(raw(qc, 31, 1, word(remap), 0x7000000000, 16, 0)) == S_OK);
+    const std::uint64_t action_sig = logged_signal(qc_mock, c_written);
+    EXPECT(action_sig != 0);
+    const std::uint64_t met_before_rel = xs::list_value_stats().gates_met;
+    const std::uint64_t to_before_rel = xs::list_value_stats().gates_timed_out;
+    EXPECT(hold_on(qb, 28, 1));
+    fence_signal(c_written, action_sig);
+    EXPECT(xs::list_values_idle(3000) && cell2(28) == 1);
+    xs::set_copy_page_mappings_hook(nullptr);
+    stats = xs::list_value_stats();
+    EXPECT(stats.gates_met == met_before_rel + 1 && stats.gates_timed_out == to_before_rel);
+
+    // 11c. Demoted gate (3 timeouts -> 4 ms budget) with unrelated in-flight work on qa times out in a few ms, not
+    // the 12 s active-work cap of the 40 ms full timeout.
+    for (int i = 0; i < 3; ++i) EXPECT(hold_on(qb, 29, 1) && xs::list_values_idle(3000));
+    std::uint64_t unrelated_sig = 0;
+    EXPECT(write_on_a(30, 1, unrelated_sig));
+    const std::uint64_t short_before_dem = xs::list_value_stats().gates_short;
+    const std::uint64_t to_before_dem = xs::list_value_stats().gates_timed_out;
+    started = Clock::now();
+    EXPECT(hold_on(qb, 29, 1));
+    for (int i = 0; i < 1000 && xs::list_value_stats().gates_timed_out == to_before_dem; ++i) Sleep(1);
+    const auto demoted_active_ms = ms_since(started);
+    EXPECT(xs::list_value_stats().gates_timed_out == to_before_dem + 1 &&
+           xs::list_value_stats().gates_short == short_before_dem + 1 && demoted_active_ms < 500);
+    fence_signal(a_written, unrelated_sig);
+    EXPECT(xs::list_values_idle(3000));
+
+    // 11d. Stuck matching producer (fence never signals) still hits the finite max pause cap instead of hanging.
+    const std::uint64_t to_before_stuck = xs::list_value_stats().gates_timed_out;
+    started = Clock::now();
+    EXPECT(hold_on(qb, 29, 1));
+    std::uint64_t stuck_sig = 0;
+    EXPECT(write_on_a(29, 1, stuck_sig));
+    for (int i = 0; i < 1000 && xs::list_value_stats().gates_timed_out == to_before_stuck; ++i) Sleep(1);
+    const auto stuck_producer_ms = ms_since(started);
+    EXPECT(xs::list_value_stats().gates_timed_out == to_before_stuck + 1 && stuck_producer_ms < 500);
+    fence_signal(a_written, stuck_sig);
+    EXPECT(xs::list_values_idle(3000));
+    xs::set_list_value_wait_timeout_ms(5000);
+
     // 8. stop() ends both threads. Afterwards nothing new is landed or opened (the process is ending: a gate
     // signalled from another thread could open one whose remap was skipped, or go below one still to come), and
     // CopyPageMappingsBatchX remaps at the call rather than wait for a queue whose gates stay shut.

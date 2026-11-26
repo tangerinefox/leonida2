@@ -2289,6 +2289,12 @@ HRESULT queue_copy_page_mappings(ChildProxy* self, UINT count, const xmem::PageB
     if (!map && rt::xmem::copy_page_mappings_fn) map = &copy_page_mappings_default;
     if (!map || !count) return S_OK;
     if (!batches || flags) return E_INVALIDARG;
+    // Which implementation remaps, once: a boot's read-fault reports belong to that route's tests.
+    static std::atomic<bool> route_logged{false};
+    if (!route_logged.exchange(true, std::memory_order_relaxed))
+        std::fprintf(stderr, "[rt] d3d12_xs: CopyPageMappingsBatchX remaps through %s\n",
+                     map == &copy_page_mappings_default ? "xmem's range callback (copy_page_mappings_fn)"
+                                                        : "the installed batch hook (set_copy_page_mappings_hook)");
     auto* queue = reinterpret_cast<ID3D12CommandQueue*>(self->real);
     using clock = std::chrono::steady_clock;
     const auto t0 = clock::now();
@@ -2840,6 +2846,32 @@ struct UploadArena {
 
 constexpr std::size_t kUploadChunkMin = 8 << 20;  // one chunk serves a title's whole frame of uploads
 
+// LEONIDA_UPLOAD_LOG=1 (diagnostic): each upload chunk (its CPU base, device address and size), and the first 96 and
+// then every 8192nd AllocateUploadMemory result as an offset into its chunk, so the addresses the title builds
+// descriptors from can be matched with the memory it was handed.
+inline bool upload_log() {
+    static const bool on = [] {
+        const char* v = std::getenv("LEONIDA_UPLOAD_LOG");
+        return v && *v == '1';
+    }();
+    return on;
+}
+inline void log_upload_result(const UploadChunk* chunk, std::uint64_t result, std::uint64_t size,
+                              std::uint64_t alignment) {
+    if (!upload_log() || !chunk) return;
+    static std::atomic<std::uint64_t> calls{0};
+    const std::uint64_t n = ++calls;
+    if (n > 96 && (n % 8192)) return;
+    const std::uint64_t base = reinterpret_cast<std::uint64_t>(chunk->cpu_base);
+    std::fprintf(stderr,
+                 "[rt] upload-log: #%llu result 0x%llx = chunk 0x%llx + offset 0x%llx (size %llu, alignment %llu; "
+                 "chunk device address 0x%llx)\n",
+                 static_cast<unsigned long long>(n), static_cast<unsigned long long>(result),
+                 static_cast<unsigned long long>(base), static_cast<unsigned long long>(result - base),
+                 static_cast<unsigned long long>(size), static_cast<unsigned long long>(alignment),
+                 static_cast<unsigned long long>(chunk->gpu_base));
+}
+
 UploadChunk* upload_chunk_new(DeviceProxy* device, std::size_t size) {
     auto* chunk = new (std::nothrow) UploadChunk{};
     if (!chunk) return nullptr;
@@ -2865,6 +2897,24 @@ UploadChunk* upload_chunk_new(DeviceProxy* device, std::size_t size) {
         chunk->resource = resource;
         chunk->cpu_base = static_cast<std::uint8_t*>(cpu);
         chunk->gpu_base = resource->GetGPUVirtualAddress();
+        // LEONIDA_UPLOAD_ALIAS=1 (experiment): the title takes the pointer AllocateUploadMemory hands it for a GPU
+        // address too (the console's memory is unified) and writes it into the descriptors it builds itself. Entered in
+        // the title VA table, the chunk's CPU range answers with the chunk's console VA (its device address minus
+        // heap_base), so a V# the title wrote with such a pointer is rewritten to the chunk instead of left empty. A
+        // chunk below the arena has a negative console VA, usable in a V# only with LEONIDA_IMPORT_BELOW_ARENA=1.
+        static const bool alias = [] {
+            const char* v = std::getenv("LEONIDA_UPLOAD_ALIAS");
+            return v && *v == '1';
+        }();
+        if (alias) {
+            const bool added = leonida::title_va_aliases().add(reinterpret_cast<std::uint64_t>(chunk->cpu_base),
+                                                               chunk->size, chunk->gpu_base);
+            std::fprintf(stderr, "[rt] d3d12_xs: upload chunk 0x%llx (%llu bytes) entered as an alias of console VA "
+                                 "0x%llx: %s\n",
+                         static_cast<unsigned long long>(reinterpret_cast<std::uint64_t>(chunk->cpu_base)),
+                         static_cast<unsigned long long>(chunk->size), static_cast<unsigned long long>(chunk->gpu_base),
+                         added ? "ok" : "refused");
+        }
         return chunk;
     }
     if (resource) resource->Release();
@@ -2912,7 +2962,9 @@ std::uint64_t upload_alloc(DeviceProxy* device, std::uint64_t size, std::uint64_
         const std::size_t aligned = (chunk->used + (alignment - 1)) & ~(static_cast<std::size_t>(alignment) - 1);
         if (aligned >= chunk->used && aligned <= chunk->size && need <= chunk->size - aligned) {
             chunk->used = aligned + need;
-            return reinterpret_cast<std::uint64_t>(chunk->cpu_base + aligned);
+            const std::uint64_t result = reinterpret_cast<std::uint64_t>(chunk->cpu_base + aligned);
+            log_upload_result(chunk, result, size, alignment);
+            return result;
         }
     }
     const std::size_t chunk_size = need + alignment > kUploadChunkMin ? need + alignment : kUploadChunkMin;
@@ -2926,7 +2978,14 @@ std::uint64_t upload_alloc(DeviceProxy* device, std::uint64_t size, std::uint64_
     arena->chunks = chunk;
     const std::size_t aligned = (alignment - 1) & ~(static_cast<std::size_t>(alignment) - 1);  // 0-based
     chunk->used = aligned + need;
-    return reinterpret_cast<std::uint64_t>(chunk->cpu_base + aligned);
+    if (upload_log())
+        std::fprintf(stderr, "[rt] upload-log: new chunk at 0x%llx, device address 0x%llx, %llu bytes (%s)\n",
+                     static_cast<unsigned long long>(reinterpret_cast<std::uint64_t>(chunk->cpu_base)),
+                     static_cast<unsigned long long>(chunk->gpu_base), static_cast<unsigned long long>(chunk->size),
+                     chunk->resource ? "mapped upload buffer" : "VirtualAlloc fallback");
+    const std::uint64_t result = reinterpret_cast<std::uint64_t>(chunk->cpu_base + aligned);
+    log_upload_result(chunk, result, size, alignment);
+    return result;
 }
 
 // An address inside an upload chunk becomes the chunk's device address plus the offset; anything else — a
@@ -2949,6 +3008,9 @@ void destroy_upload_state(void* upload_state) {
     for (UploadChunk* chunk = arena->chunks; chunk;) {
         UploadChunk* next = chunk->next;
         if (chunk->resource) {
+            const char* alias = std::getenv("LEONIDA_UPLOAD_ALIAS");
+            if (alias && *alias == '1')
+                leonida::title_va_aliases().remove(reinterpret_cast<std::uint64_t>(chunk->cpu_base), chunk->gpu_base);
             chunk->resource->Unmap(0, nullptr);
             chunk->resource->Release();
         } else {

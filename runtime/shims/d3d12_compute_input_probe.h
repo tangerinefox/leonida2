@@ -195,7 +195,7 @@ bool gpu_words_now(State& state, std::uint64_t at, std::array<std::uint32_t, 8>&
             for (const auto& heap : state.console_heaps) {
                 const auto delta = at - heap->shader_va;
                 if (heap->copy && delta <= heap->bytes && sizeof(out) <= heap->bytes - delta) {
-                    std::memcpy(out.data(), heap->copy + delta, sizeof(out));
+                    std::memcpy(out.data(), heap->copy.gpu() + delta, sizeof(out));
                     return true;
                 }
             }
@@ -249,7 +249,7 @@ void recheck(State& state) {
         if (!lock.owns_lock()) std::fputs("[rt] compute-input: after loss, console heaps locked\n", stderr);
         else
             for (const auto& heap : state.console_heaps)
-                if (heap->copy) scan("console", heap->shader_va, heap->copy, heap->bytes);
+                if (heap->copy) scan("console", heap->shader_va, heap->copy.gpu(), heap->bytes);
     }
     {
         std::unique_lock lock(state.visible_heap_mutex, std::try_to_lock);
@@ -294,7 +294,7 @@ Backing descriptor(State& state, std::uint64_t seq, std::size_t list, std::size_
         for (const auto& heap : state.console_heaps) {
             const auto delta = at - heap->shader_va;
             if (heap->copy && delta <= heap->bytes && sizeof(gpu) <= heap->bytes - delta) {
-                std::memcpy(gpu.data(), heap->copy + delta, sizeof(gpu));
+                std::memcpy(gpu.data(), heap->copy.view() + delta, sizeof(gpu));
                 have_gpu = true;
                 break;
             }

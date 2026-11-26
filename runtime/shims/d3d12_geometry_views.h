@@ -9,13 +9,14 @@
 #include <mutex>
 #include <set>
 #include <shared_mutex>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 namespace rt::d3d12 {
 
-// One persistent device-local copy for each geometry extent. The console heap retains its original indices.
+// One persistent copy for each geometry extent, in device-local memory (or system memory: LEONIDA_GEOMETRY_HOST). The console heap retains its original indices.
 // Every CPU mapping of a source tile is watched; a physical remap changes which aliases must be watched.
 // Views whose title range is released are retired immediately and their backing storage is reclaimed once
 // in-flight GPU submissions up to their retire ticket have completed; previously cap-refused ranges retry
@@ -30,6 +31,7 @@ class GeometryViews {
     struct NoopRetire {
         void operator()(Address, std::size_t, VkDeviceSize) const noexcept {}
     };
+    struct NoCopy {};
     struct View {
         Address source{};
         std::size_t size{};
@@ -121,7 +123,7 @@ class GeometryViews {
     std::atomic<std::uint64_t> free_generation_{0};
     std::uint64_t serial_{}, bytes_{}, cap_refusals_{}, allocation_failures_{}, ready_{}, uploads_{}, uploaded_{};
     std::uint64_t submissions_{}, dirty_refreshes_{}, refilled_{}, tile_fills_{};
-    std::uint64_t evicted_{}, reaped_{}, retries_succeeded_{};
+    std::uint64_t evicted_{}, reaped_{}, retries_succeeded_{}, final_copies_{};
     std::unordered_map<Address, std::size_t> tile_reads_;  // refresh(): offset in tile_scratch_, SIZE_MAX unreadable
     // refresh() scratch: per view, whether it waits on a tile (pinned), is filled whole, was touched, was counted;
     // and the tiles found written, in address order.
@@ -213,6 +215,7 @@ class GeometryViews {
 
 public:
     explicit GeometryViews(std::uint64_t cap_override = 0) : cap_override_(cap_override) {
+        pool_.set_system_memory(system_memory_setting());
         leonida::geometry_writes::subscribe(releases_);
     }
     ~GeometryViews() { leonida::geometry_writes::unsubscribe(releases_); }
@@ -230,6 +233,16 @@ public:
     }
 
     std::uint64_t effective_cap() const { return cap_override_ ? cap_override_ : cap(); }
+
+    // LEONIDA_GEOMETRY_HOST: where the copies live. Unset or 0: device-local memory (the BAR) while the driver gives it;
+    // 1: system memory, write-back (cached) where the device offers it; 2: system memory, write-combined. The GPU then
+    // reads the copies over the bus (VRAM saved, each read of a vertex or index slower).
+    static int system_memory_setting() {
+        const char* v = std::getenv("LEONIDA_GEOMETRY_HOST");
+        if (!v || !*v || *v == '0') return TitleBufferWindows::kDeviceLocal;
+        return *v == '2' ? TitleBufferWindows::kSystemUncached : TitleBufferWindows::kSystemCached;
+    }
+    int system_memory() const { return pool_.system_memory(); }
 
     bool has_released() const { return leonida::geometry_writes::has_released(releases_); }
     bool has_retired() const { return retired_count_.load(std::memory_order_acquire) != 0; }
@@ -257,6 +270,10 @@ public:
     std::uint64_t evicted() const {
         std::lock_guard lock(mutex_);
         return evicted_;
+    }
+    std::uint64_t final_copies() const {
+        std::lock_guard lock(mutex_);
+        return final_copies_;
     }
     std::uint64_t reaped() const {
         std::lock_guard lock(mutex_);
@@ -393,9 +410,14 @@ public:
     // Retires every live view overlapping [begin, end), unlinking it from lookup/refresh/watch immediately and
     // deferring its backing storage reclamation until GPU submissions through `retire_ticket` have completed
     // (kAfterExecutes: through the submissions of every replay in progress now, see execute_end).
-    template<class OnRetire = NoopRetire>
+    // With `final_copy` (a refresh's copy), a ready view whose title range is readable now is copied from it once more
+    // before it leaves the refresh: a range the title remapped holds new bytes, and a list recorded before the remap
+    // that took the view's address (a root view) and runs in a submission the view waits for reads those, as it would
+    // have read them in the console's memory, and as the refresh this retirement replaces would have copied them.
+    // Freed or unmapped memory is not readable, so such a view keeps what it held.
+    template<class OnRetire = NoopRetire, class Copy = NoCopy>
     std::size_t retire_range(Address begin, Address end, std::uint64_t retire_ticket = 0,
-                             OnRetire&& on_retire = {}) {
+                             OnRetire&& on_retire = {}, Copy&& final_copy = {}) {
         if (end <= begin) return 0;
         struct CallbackItem {
             Address source;
@@ -425,6 +447,13 @@ public:
             const std::size_t first_retired = retired_.size();
             for (const auto id : ids) {
                 View& v = views_[id];
+                if constexpr (!std::is_same_v<std::decay_t<Copy>, NoCopy>) {
+                    if (v.ready && final_copy(v.dst, reinterpret_cast<const std::uint8_t*>(v.source), v.size) ==
+                                       GeometryCopy::copied) {
+                        ++final_copies_;
+                        uploaded_ += v.size;
+                    }
+                }
                 detach_tiles_locked(id, v.source, v.size);
                 if (v.ready) {
                     --ready_;
@@ -495,21 +524,21 @@ public:
         return freed;
     }
 
-    // Drains released title ranges recorded by xmem (retiring matching views at `retire_ticket`) and reaps retired
-    // views whose GPU work completed by `completed_ticket`.
-    template<class Device, class OnRetire = NoopRetire>
+    // Drains released title ranges recorded by xmem (retiring matching views at `retire_ticket`, with `final_copy` as
+    // retire_range takes it) and reaps retired views whose GPU work completed by `completed_ticket`.
+    template<class Device, class OnRetire = NoopRetire, class Copy = NoCopy>
     void drain_released(Device& device, std::uint64_t retire_ticket, std::uint64_t completed_ticket,
-                        OnRetire&& on_retire = {}) {
+                        OnRetire&& on_retire = {}, Copy&& final_copy = {}) {
         std::vector<std::pair<Address, Address>> ranges;
         leonida::geometry_writes::take_released(releases_, ranges);
         for (const auto& [begin, end] : ranges) {
-            retire_range(begin, end, retire_ticket, on_retire);
+            retire_range(begin, end, retire_ticket, on_retire, final_copy);
             leonida::title_gpu_views::Range pair{};
             if (end > begin && leonida::title_gpu_views::view_at(begin, 1, pair) &&
                 begin >= pair.gpu && begin - pair.gpu < pair.size) {
                 const Address offset = begin - pair.gpu;
                 const Address span = (std::min)(end - begin, pair.size - offset);
-                retire_range(pair.cpu + offset, pair.cpu + offset + span, retire_ticket, on_retire);
+                retire_range(pair.cpu + offset, pair.cpu + offset + span, retire_ticket, on_retire, final_copy);
             }
         }
         reap(device, completed_ticket);
@@ -666,14 +695,17 @@ public:
         if (!effective_cap()) return;
         std::lock_guard lock(mutex_);
         std::fprintf(stderr, "[rt] geometry buffers: seen %zu, backed %zu (%llu bytes), populated %llu, cap %llu MiB, "
-                             "cap refused %llu, retried ok %llu, evicted %llu (reaped %llu, retired %zu), "
-                             "allocation failures %llu, uploads %llu (%llu bytes), watched tiles %zu, reserved %llu bytes\n",
+                             "cap refused %llu, retried ok %llu, evicted %llu (reaped %llu, retired %zu, copied at "
+                             "retirement %llu), allocation failures %llu, uploads %llu (%llu bytes), watched tiles %zu, "
+                             "reserved %llu bytes (%s)\n",
                      keys_.size() + refused_.size(), live_views_, (unsigned long long)bytes_, (unsigned long long)ready_,
                      (unsigned long long)(effective_cap() >> 20), (unsigned long long)cap_refusals_,
                      (unsigned long long)retries_succeeded_, (unsigned long long)evicted_,
-                     (unsigned long long)reaped_, retired_.size(), (unsigned long long)allocation_failures_,
+                     (unsigned long long)reaped_, retired_.size(), (unsigned long long)final_copies_,
+                     (unsigned long long)allocation_failures_,
                      (unsigned long long)uploads_, (unsigned long long)uploaded_, tiles_.size(),
-                     static_cast<unsigned long long>(pool_.reserved()));
+                     static_cast<unsigned long long>(pool_.reserved()),
+                     pool_.system_memory() ? "system memory" : "device-local");
         std::fprintf(stderr, "[rt] geometry refresh: %llu/%llu submissions uploaded dirty views, %llu bytes (%llu views by "
                              "their written tiles only); %.3f s checking and refreshing sources, %llu bytes cleared\n",
                      static_cast<unsigned long long>(dirty_refreshes_), static_cast<unsigned long long>(submissions_),

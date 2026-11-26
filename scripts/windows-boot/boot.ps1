@@ -50,7 +50,8 @@
 
 .PARAMETER InputScript
     LEONIDA_INPUT_SCRIPT: timed pad presses, seconds since the pad's first poll (button@seconds, comma-separated;
-    buttons a b x y start back lb rb up down left right). Sets LEONIDA_KEYBOARD_PAD=always. Builds older than
+    buttons a b x y start back lb rb up down left right). Each press is held 300 ms; button@seconds:hold holds it
+    longer, e.g. b@1100:3 for a title that reads its pad only every few seconds. Sets LEONIDA_KEYBOARD_PAD=always. Builds older than
     main @ 8146ef690 ignore a script longer than 63 characters. Default 'a@45,a@60,a@75,a@90'.
 
 .PARAMETER NoInput

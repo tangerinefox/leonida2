@@ -98,8 +98,10 @@ Pad read_at(IGameInput* input, IGameInputDevice* device, double seconds) {
 }
 
 int scripted_pad(CreateFn create) {
-    // Four presses (two overlapping A presses, Menu, a right-stick throw) and three rejected entries.
-    SetEnvironmentVariableA("LEONIDA_INPUT_SCRIPT", "a@1, START@2.5 ,a@1.2,rsup@4,bogus@1,a@-1,");
+    // Five presses (two overlapping A presses, Menu, B held 0.8 s, a right-stick throw) and seven rejected entries
+    // (four of them holds that are zero, negative, missing or too long).
+    SetEnvironmentVariableA("LEONIDA_INPUT_SCRIPT",
+                            "a@1, START@2.5 ,a@1.2,b@3:0.8 ,rsup@4,bogus@1,a@-1,,x@3:0,x@3:-1,x@3:,x@3:601");
     rt::gameinput_no_sdl::set_clock(fake_clock);
     at(0);
 
@@ -201,6 +203,10 @@ int scripted_pad(CreateFn create) {
     check(menu.buttons == GameInputGamepadMenu && menu.ui == GameInputUiNavigationMenu,
           "script: START (any case) holds Menu at 2.6 s");
     check(read_at(input, device, 2.85).buttons == 0, "script: Menu is released at 2.85 s");
+    check(read_at(input, device, 3.05).buttons == GameInputGamepadB, "script: b@3:0.8 holds B at 3.05 s");
+    check(read_at(input, device, 3.7).buttons == GameInputGamepadB,
+          "script: B is still held at 3.7 s, past the 0.3 s default");
+    check(read_at(input, device, 3.85).buttons == 0, "script: B is released after its 0.8 s hold");
     const Pad up = read_at(input, device, 4.1);
     check(up.buttons == 0 && up.right_y == 1.0f && up.ui == GameInputUiNavigationScrollUp,
           "script: rsup throws the right stick up at 4.1 s");

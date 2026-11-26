@@ -58,7 +58,8 @@ scripted pad, driven by the script alone:
   controller axis and controller button state. A reading is taken when the title asks for one and the script's state
   has changed since the last, so no thread polls; the history keeps the last 64 readings.
 - **The timeline:** the same as with SDL3 (`runtime/shims/gameinput_script.h` holds the parser, the timeline and the
-  log lines for both): seconds from the first `GameInputCreate`, each press held 300 ms, then released.
+  log lines for both): seconds from the first `GameInputCreate`, each press held 300 ms (or its own `:hold`, see
+  `LEONIDA_INPUT_SCRIPT` below), then released.
 - **Not served:** reading callbacks, aggregate devices, rumble and every other device. Those slots answer `E_NOTIMPL`
   and log the slot once. Controllers and the [keyboard pad](#keyboard-pad) still need SDL3.
 
@@ -73,6 +74,10 @@ The start of the run logs one line with the counts, and each press logs the same
 A press is logged when the title reads it, so a press the title never reads is not logged. `LEONIDA_INPUT_LOG=0`
 turns the `press` lines off. Without `LEONIDA_INPUT_SCRIPT`, the shim serves no devices and answers `E_NOTIMPL` for
 every slot past `Release`, as before.
+
+`LEONIDA_INPUT_FILE=<path>` drives a run whose display takes no keyboard input (a headless session): every line
+appended to that file names one button of the script's table (`a`, `down`, ...) and becomes a press at once, held
+like a scripted one. The file is read again at most every 250 ms. It is for local runs only.
 
 `scripts/build_runtime.ps1` (what `make_game.py` runs) builds the shim only on its CMake path, when Visual Studio's
 C++ CMake tools are installed. Its direct-`cl.exe` fallback compiles a fixed file list without the shim and warns
@@ -335,7 +340,7 @@ line is logged when it takes effect); tracking goes on underneath, so clearing i
 | `LEONIDA_PROMPTS_SWITCH_MS` | `300` | shortest time between two changes of the active input family, 0..2000 ms |
 | `LEONIDA_GAMEINPUT_THREAD` | `1` | `0` stops the background poll thread; only `rt::gameinput::poll()` then reads the pads (tests) |
 | `LEONIDA_KEYBOARD_PAD` | `off` | `1` adds the [keyboard pad](#keyboard-pad), read while this process has focus; `always` reads keys whatever has focus |
-| `LEONIDA_INPUT_SCRIPT` | unset | Comma-separated `button@seconds` entries, e.g. `a@2,a@4,start@6`. With SDL3 they drive the keyboard pad, which has to be enabled; without SDL3 they drive [one scripted pad](#scripted-input-without-sdl3), the only device. The first pad update (without SDL3, the first `GameInputCreate`) reads the script once at startup and starts the clock. `reload_config()` does not reread it. Each press lasts 300 ms. Buttons are `a b x y start back lb rb up down left right`. Spaces around entries are allowed. Empty entries, unknown buttons and invalid times (including negative or non-finite values) are counted and ignored. |
+| `LEONIDA_INPUT_SCRIPT` | unset | Comma-separated `button@seconds` entries, e.g. `a@2,a@4,start@6`. With SDL3 they drive the keyboard pad, which has to be enabled; without SDL3 they drive [one scripted pad](#scripted-input-without-sdl3), the only device. The first pad update (without SDL3, the first `GameInputCreate`) reads the script once at startup and starts the clock. `reload_config()` does not reread it. Each press lasts 300 ms, or `hold` seconds when the entry is `button@seconds:hold` (more than 0, at most 600). With SDL3 a press then stays down until the title has read the pads six times since it began, but never past 5 s from its start (or its hold, if longer). A title reads its pad once a frame, so at a few seconds a frame a 300 ms press can fall between two reads and never arrive: on the retail title's "Couldn't autosave" prompt, three 300 ms `b` presses did nothing, while 120 presses 0.5 s apart got through; one `b@1100:3` replaces them. Buttons are `a b x y start back lb rb up down left right`. Spaces around entries are allowed. Empty entries, unknown buttons, invalid times (including negative or non-finite values) and invalid holds (0 or less, more than 600, not a number) are counted and ignored. |
 | `LEONIDA_MOUSE_SENSITIVITY` | `1` | scales how far the mouse moves the keyboard pad's right stick, 0.1..10 |
 
 SDL's own hints (`SDL_JOYSTICK_*`, see SDL's `SDL_hints.h`) also apply, for example `SDL_JOYSTICK_HIDAPI_PS5=0` to

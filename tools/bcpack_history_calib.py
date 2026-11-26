@@ -1858,6 +1858,8 @@ class Bc7Calibrator:
             if xy is None:
                 continue
             qpts = get_quads(xy[0], xy[1])
+            if qpts is None:  # the sibling block is undetermined itself
+                continue
             spread = max(max(p[c] for p in qpts) - min(p[c] for p in qpts) for c in range(4))
             weight = 4.0 if spread <= 6.0 else (2.0 if spread <= 18.0 else 0.5)
             sm = None if ns == 1 else (p2[part] if ns == 2 else p3[part])

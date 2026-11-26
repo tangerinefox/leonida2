@@ -13,6 +13,7 @@ method, scope and caveats. No game data is included.
 | [boot_leads.md](boot_leads.md) | Open leads that may move the retail boot further (TLS at module index 0, feature level at device creation, command-list replay, descriptor words, shader corpus count, frame pacing), each with where it lands, how to implement it and how to test it. Hypotheses, not measurements. |
 | [rpf.md](rpf.md) | RPF9 archive layout, the carve tools and the unreadable encrypted TOC. |
 | [linux.md](linux.md) | Linux in one page: what runs natively and what runs under Wine or Proton, the Ubuntu packages, `Build.sh`, the runtime cross-build, and why there is no native Linux `gta6rt`. |
+| [running.md](running.md) | Running the game per platform and GPU (Linux/Wine with AMD, Linux/Proton and Windows with NVIDIA, Windows with AMD, Intel, macOS): build, shaders, pipeline pre-compile, driver settings, environment, what to expect; each value measured by us, reported by others (linked) or TBD. |
 | [testing.md](testing.md) | Running the GPU tests on your own GPU: setup per OS, wave64 emulation, running without a GPU on Mesa llvmpipe, and known problems. |
 | [gpu_test_results.md](gpu_test_results.md) | Published GPU test results by hardware, driver and commit, with pass, skip and failure counts. |
 | [modding.md](modding.md) | The mod format: `mods/<folder>/mod.json`, checked and loaded in name order by `gta6rt`; a swap takes effect once the game's archetype lookup is hooked (needs the executable, RT-5). A mod names game models and holds no game data. |

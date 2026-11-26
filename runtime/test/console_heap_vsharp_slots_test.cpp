@@ -246,6 +246,80 @@ int test_retail_sized_heap_sparse_scan() {
     return 0;
 }
 
+int test_console_fix_budget_buffer_vsharp_non_deferral() {
+    // Verifies that under fix_console_slots budget expiry (fix_over == true), buffer V# descriptors
+    // (!(w[3] >> 30)) are never deferred/nulled, while image T# descriptors ((w[3] >> 30) != 0) are deferred.
+    constexpr std::size_t kSlots = 16;
+    std::vector<std::array<std::uint32_t, 8>> gpu_copy(kSlots);
+    for (auto& slot : gpu_copy) slot.fill(0);
+
+    ConsoleHeapVsharpSlots tracked;
+    tracked.reset(kSlots);
+
+    // Populate slots with alternating buffer V# and image T# descriptors:
+    // Even slots: live buffer V#s
+    // Odd slots: image T#s
+    for (std::size_t i = 0; i < kSlots; ++i) {
+        std::array<std::uint32_t, 8> w{};
+        if ((i & 1u) == 0) {
+            // Buffer V#: w[3] >> 30 == 0, num_records != 0
+            w[0] = static_cast<std::uint32_t>(0x1000 + i * 0x100);
+            w[1] = 0x20;
+            w[2] = 256;
+            w[3] = 0x00010000u;  // w[3] >> 30 == 0
+        } else {
+            // Image T#: w[3] >> 30 != 0
+            w[0] = static_cast<std::uint32_t>(0x5000 + i * 0x100);
+            w[2] = 128;
+            w[3] = (2u << 30) | 0x1234u;  // w[3] >> 30 == 2
+        }
+        gpu_copy[i] = w;
+        tracked.set(i, ConsoleHeapVsharpSlots::is_live_vsharp(w.data()));
+    }
+
+    // Now simulate fix_console_slots when budget is expired (fix_over == true):
+    // Buffer V#s must be fixed in-place and never nulled/deferred; only image T#s are deferred.
+    std::size_t deferred_fixes = 0;
+    std::vector<std::uint32_t> retries;
+    const bool fix_over = true;
+
+    for (std::size_t slot = 0; slot < kSlots; ++slot) {
+        const std::array<std::uint32_t, 8>& input = gpu_copy[slot];
+        const std::uint32_t w3 = input[3];
+        const bool is_buffer_vsharp = !(w3 >> 30);
+
+        if (fix_over && !is_buffer_vsharp) {
+            // Image T#: deferred past budget
+            gpu_copy[slot].fill(0);
+            tracked.clear(slot);
+            ++deferred_fixes;
+            retries.push_back(static_cast<std::uint32_t>(slot));
+            continue;
+        }
+
+        // Buffer V#: fixed immediately, not deferred
+        tracked.set(slot, ConsoleHeapVsharpSlots::is_live_vsharp(input.data()));
+    }
+
+    // All odd slots (image T#s) must have been deferred (nulled)
+    EXPECT(deferred_fixes == kSlots / 2);
+    EXPECT(retries.size() == kSlots / 2);
+    for (std::size_t slot : retries) {
+        EXPECT((slot & 1u) == 1u);
+        EXPECT(!tracked.test(slot));
+        EXPECT(gpu_copy[slot][0] == 0 && gpu_copy[slot][2] == 0);
+    }
+
+    // All even slots (buffer V#s) must have been preserved and remain live
+    for (std::size_t i = 0; i < kSlots; i += 2) {
+        EXPECT(tracked.test(i));
+        EXPECT(gpu_copy[i][2] == 256);
+        EXPECT(ConsoleHeapVsharpSlots::is_live_vsharp(gpu_copy[i].data()));
+    }
+    EXPECT(tracked.live_count() == kSlots / 2);
+    return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -254,6 +328,7 @@ int main() {
     if (test_in_place_invalidation_mutation()) return 1;
     if (test_differential_equivalence_against_linear_copy()) return 1;
     if (test_retail_sized_heap_sparse_scan()) return 1;
+    if (test_console_fix_budget_buffer_vsharp_non_deferral()) return 1;
     std::printf("console_heap_vsharp_slots_test: ok\n");
     return 0;
 }

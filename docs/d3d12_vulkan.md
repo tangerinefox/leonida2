@@ -961,7 +961,8 @@ The compute path, end to end:
     primitive overestimation no greater than `0.5 - 1/512` pixels, leaving half a minimum grid step within the
     Tier 1 uncertainty bound. `ConservativeRaster=ON` uses overestimate mode with zero extra overestimation,
     including unbound-attachment variants. OFF keeps the ordinary pipeline. Missing support, unknown modes,
-    wireframe and non-triangle PSOs are refused; conservative TIR (`ForcedSampleCount != 0`) remains `E_NOTIMPL`.
+    wireframe and non-triangle PSOs are refused (a mesh PSO needs no topology type: its module has to output
+    triangles, `conservative_raster::mesh_outputs_triangles`); conservative TIR (`ForcedSampleCount != 0`) remains `E_NOTIMPL`.
     Tier 2 additionally requires `degenerateTrianglesRasterized` and primitive overestimation plus half a
     device subpixel step no greater than 1/256 pixel. Other eligible devices retain Tier 1. The standalone
     device does not expose Tier 3: the Xbox `SV_InnerCoverage` input mapping has not been confirmed. See
@@ -1697,6 +1698,18 @@ The copies:
   cannot fit between the title's address reservations can use a separate mapped buffer. The buffer's device address
   must fit as a positive 47-bit offset from the arena base. The same window cap and dirty-page refresh apply.
   `LEONIDA_STREAM_BUFFER_WINDOWS=0` requires the window to fit in the arena.
+- **What the GPU wrote goes back.** The same return copy serves slot-133 shadows (a buffer the driver would not
+  import, a compute result the title reads again): the ranges are recorded through the alias of the buffer's pages and
+  the tracker there carries them back. `d3d12_placed_write_back` covers it. A copy is a read-side mirror, so a UAV or a raw write into a window would land in
+  the copy and the title would never see it ([#1537](https://github.com/ubiquitarianism/leonida/issues/1537), the
+  `WRITE_INVALID` stop at the world start). Every title range a submission's bindings reach is kept, and the next
+  refresh copies those ranges from the copy to the title's pages *before* it copies the pages forward, so a page the
+  title itself wrote in between keeps the title's newer bytes and its GPU result is dropped. Up to 8,192 ranges and
+  64 MiB a submission (a V# has no read/write bit, so a read-only view costs a copy too; past the caps the ranges are
+  left behind, logged once). `LEONIDA_TITLE_WRITEBACK=0` turns it off. A batch is fenced: it is kept with the ticket
+  of the submission that will use it and copied back only when the context reports that ticket retired, so a range
+  another submission is still writing is never read half done. A queue held deep (console ordering) can leave batches
+  waiting: past 64 of them the oldest go back without their ticket, logged once.
 - A **window that is refused** (the budget is spent, the arena is full, or the pages are not committed yet) is backed
   by a persistent geometry copy of exactly the requested range (`LEONIDA_GEOMETRY_MB`) instead; when no copy can be
   made either, the view is written with **no base and no records** — loads return 0 and stores are dropped. A raw
@@ -1719,6 +1732,22 @@ The copies:
   encoding reuses only an independently established geometry view. An explicit table or placed SRV can
   establish that view. The Vulkan memory probe reports populated views, payload and reserved bytes,
   upload totals, cap refusals and allocation failures.
+  - **Where the copies live**: device-local memory through the BAR by default. `LEONIDA_GEOMETRY_HOST=1` puts them
+    in system memory outside VRAM (write-back where the device offers a cached host type, `=2` write-combined),
+    as VIctory keeps its copies of title memory (approach only). In a world run on the RX 7900 XTX the copies held
+    4.4-6 GB of VRAM. The cost moves to the bus: the GPU reads every vertex and index of a copy from system memory,
+    so a geometry-heavy pass can take longer; measure frame time with and without it before making it a default.
+  - **When a copy goes**: a view is retired when its title range is freed, decommitted or unmapped, and also when a
+    remap gives one of its pages another frame or none (`XMemMapPhysicalPages` with pages, the scatter call,
+    `CopyPageMappingsBatchX`; xmem's `RemapReleases`, `LEONIDA_GEOMETRY_REMAP_RELEASE=0` turns it off): the title
+    streams by remapping its pools' frames, and before this the copies of what those pages held stayed for the
+    device's life (`evicted 0` in every world run). A page mapped again to the frame it had is no change. A retired
+    view leaves the lookups at once, its alias ranges and translated heap slots are invalidated, its stream-pool
+    extent is forgotten, and its memory is freed only after every ExecuteCommandLists replay in progress at the
+    retirement has recorded its submissions and those have completed (`kAfterExecutes`). Before it leaves the
+    refresh it is copied once more from its pages if they are readable: a list recorded before a remap that took the
+    view's address (a root view) reads the new bytes, as on the console. The next view of the range makes a new copy.
+    `geometry_views_test` cases 14-16 and `xmem_test` (`test_remap_releases`) cover this without a GPU.
 - **Which pages changed** since the last refresh: where xmem reserved the title's memory with `MEM_WRITE_WATCH`
   (`XMemVirtualAlloc`'s ordinary regions and the title's `VirtualAlloc` reservations, not placeholders or
   physical-page windows), the kernel says (`GetWriteWatch` with reset, its answers kept for every copy over the page:
@@ -1804,6 +1833,178 @@ fit on smaller PC GPUs. This is a product requirement, not something the layer c
 **Reserved resources.** `CreateReservedResource` and the queue tile APIs use Vulkan sparse binding for buffers and
 compatible single-mip RGBA8 2D textures (section 4.2). Other descriptions have fully allocated backing. Wider
 texture coverage and the game's use of tile streaming remain open.
+
+**Diagnostics for descriptors the title builds itself** (all off by default, logging only unless said otherwise):
+
+- `LEONIDA_UNKNOWN_TSHARP=1`: one line for each distinct base address a title-written T# names with no texture there
+  (its shape, the tiling bits and whether the address is title memory), up to 300 addresses, and every 8192 such
+  lookups a summary by format, type and tiling.
+- `LEONIDA_UNBACKED_VSHARP=1`: the buffer V#s `fix_vsharp` writes empty because nothing backs their base; one line for
+  each of the first 120 distinct bases and every 8192 a summary by 4 GiB range of the base.
+- `LEONIDA_UPLOAD_LOG=1` (`d3d12_xs_device.cpp`): each upload chunk (CPU base, device address, size) and the first 96,
+  then every 8192nd, `AllocateUploadMemory` result as an offset into its chunk.
+- `LEONIDA_UPLOAD_ALIAS=1` (an experiment, changes behaviour): enters each upload chunk's CPU range in the title VA
+  table, so a V# the title wrote with the CPU pointer `AllocateUploadMemory` handed it is rewritten to the chunk
+  instead of left empty. A chunk below the arena needs `LEONIDA_IMPORT_BELOW_ARENA=1` as well.
+
+#### Address guard (`LEONIDA_ADDRESS_GUARD=1`, `rdna2spirv.py --address-guard`)
+
+**Prototype, off by default.**
+
+**Why.** The layer rewrites the addresses it can see: root views, the V#s it writes, and the V#s the title writes into
+shader-visible heaps. It writes an empty V# when nothing backs an address (above). The translator checks a V#'s
+record count but not its base. Any other address becomes `heap_base` plus an arbitrary value:
+- a V# a shader builds in SGPRs from data;
+- a raw `global_`/`flat_` address (530 of the 26,503 shaders of package 1.0.2.1, 69 of the 2,684 pipeline-library
+  programs);
+- a stale or offset-like value.
+
+On RADV such an access page-faults. Two RX 7900 XTX runs (Mesa 26.3.1, under Wine) ended with the same sequence:
+- a `gfxhub` fault from client TCP with PERMISSION_FAULTS 0x3;
+- a compute-ring timeout and "MES failed to respond";
+- a MODE1 reset ("VRAM is lost").
+
+Both faults were 4.8 GiB and 20 GiB above `heap_base`, past the arena's end.
+
+"Inside the arena" is not the right bound. Several buffers are legitimately outside it, at a positive offset from
+`heap_base` (a negative one with `LEONIDA_IMPORT_BELOW_ARENA=1`):
+- geometry copies;
+- upload and readback buffers;
+- imported title memory;
+- separate window buffers.
+
+The guard checks each access against what the runtime actually backs. An access that fails reads 0 and drops its
+store, so a wild address never reaches the GPU. The overall process follows VIctory
+([`crates/victory-gpu/src/memory.rs`](https://github.com/marvisak/victory), GPL-3.0). Its page table of 64 KiB pages
+routes every computed address, and memory no copy holds reads 0 and takes no writes. The structure below is our own:
+VIctory's table names descriptor views, this one is a bitmap over device addresses.
+
+**Structure: a two-level page table of 4 KiB pages over the 48-bit offset space, behind an arena compare.** The
+check works on the heap offset, the sign-extended 48-bit value `Gen.host_addr` adds to `heap_base`:
+- **Level 1:** 65,536 words indexed by offset bits 47..32. Each word names the level-2 block of one 4 GiB chunk.
+- **Level 2:** blocks of 32,768 words, one bit per 4 KiB page (bits 31..12).
+- **Two fixed blocks:** block 0 is empty and block 1 is full; allocated blocks start at 2.
+- **Size:** the table is a host-visible buffer of its own, 256 KiB plus 128 KiB per block (8.25 MiB for 62 blocks).
+
+Why this structure:
+- **Pages of 4 KiB** are the GPU's own mapping granularity. A page any byte of a backing touches is mapped as a whole,
+  so marking pages outward is exact for faults. A 64 KiB page would mark memory that may not be mapped.
+- **Level 1 by 4 GiB chunk** covers the whole signed 48-bit space (negative offsets index from 0x8000 up). A real run
+  touches a handful of chunks, so the table stays small.
+- **Other structures cost more per access.** A sorted range table needs a binary search: about 10 dependent loads for
+  a thousand backings, against 2 here. A coarse region bitmap plus a fine range table needs a search in the fine part.
+- **The arena needs no lookup.** It is one fully bound `VkBuffer`, so any offset below its size passes on a compare.
+  That is the common case: descriptor heaps, default-heap buffers and windows in the arena.
+
+**The header.** It sits at arena offset `0x70000`, after the zero page and the quad indices, and holds:
+- a 64-bit magic (`"LGUARD01"`);
+- the arena's size (the compare's limit);
+- the table's address minus `heap_base`;
+- a refusal count and the last refused offset, which the shaders write.
+
+Two sinks follow the header: `0x71000` (zero area, what refused loads read) and `0x78000` (dump area, where refused
+stores and atomics go). None of `[0x70000, 0x80000)` is handed out. With `LEONIDA_ARENA_NULL_MB` the range lies in the
+null region, so its offset never moves. `runtime/src/address_guard.h` and `tools/address_guard.py` (the Python
+reference) hold the format.
+
+**Each access.** `Gen.host_addr` takes the access kind (load, store or atomic) and its span. Under `--address-guard`
+it calls one function per module, `%guard_fn`, which is straight-line at the call site, so no caller's block
+structure changes. The function computes `end = offset + span - 1` and then decides:
+- **Passes on a compare:** the runtime's guard is off (no magic), or `offset` and `end` are both below the limit. The
+  result is `heap_base + offset`. The cost is a 64-bit add, two 64-bit compares and a select.
+- **Otherwise, a lookup:** the bits of the pages of `offset` and of `end`. That is two independent pairs of dependent
+  32-bit loads (level 1, then level 2).
+- **Refused:** an access whose bits are not both set adds 1 to the header's count, writes its offset, and goes to the
+  zero area (a load) or the dump area (a store or atomic), at its offset within its page. Alignment is kept, and every
+  span fits inside a sink.
+- **Atomics** run on the dump area, and their returned value is replaced by 0 (`Gen.guard_zero`). The CAS loops (float
+  min/max, inc/dec) end there too, as on any other memory.
+
+The entry block reads the header's first six dwords once per invocation, from the arena, so that read is always
+backed. When the base is uniform, as for `s_load`, `s_buffer_load` and a V# from SGPRs plus a uniform offset, the
+compiler keeps the whole check scalar: one check per instruction, not per lane. A per-lane address (`global_` with a
+VGPR address, `offen`/`idxen`) is checked per lane, and the slow path runs only for lanes outside the arena.
+
+**What is checked.** Every `heap_base` access goes through `host_addr`:
+- buffer loads and stores (dword, sub-dword, typed, format; swizzled spans are computed at run time);
+- `global_` loads, stores, sub-dword and atomics;
+- buffer atomics, `_x2` included;
+- `s_load` and `s_buffer_load`;
+- the BVH node reads of `image_bvh*_intersect_ray` (span by node type).
+
+These are not checked:
+- images (T#s go through the hash table, not an address);
+- LDS;
+- the `--mesh-compute` output buffer (a runtime address);
+- `s_getpc` code reads.
+
+The translator does not translate `flat_` instructions (they raise `Unsupported`), so none reaches memory today. A
+translation added later must go through `host_addr` like `global_` does.
+
+**Keeping the table current.** The spans are the same backings the console heap pass's backed table uses
+(`update_gpu_backed`):
+- every `gpu_backings` entry outside the arena (upload and readback buffers, imports, slot-133 buffers, windows
+  outside the arena);
+- the geometry copies' blocks;
+- the separate window buffers' blocks.
+
+`update_address_guard` runs in the queue's `before_execute`, after the heap refresh, the windows and the geometry
+copies. It differs from that table in four ways:
+- It rebuilds whenever `backing_generation` or a block layout changed, with no 100 ms limit, because a backing made
+  since the last submission must not read 0.
+- It writes only the words that changed, level 2 before level 1.
+- A chunk keeps its block for good, so a submission still in flight never reads a block that now means another chunk.
+- When the 62 blocks run out, a new chunk gets the full block (unchecked, as without the guard), and that is logged.
+
+A release clears its bits at the next submission. D3D12 forbids releasing memory the GPU still uses, so only a wild
+access in flight at that moment could still pass.
+
+**Cost per access:**
+- **Fast path:** about 8 scalar or vector ALU operations.
+- **Outside the arena:** about 40 operations and 4 loads, from a table small enough to stay in cache.
+- **Per invocation:** 6 uniform header loads.
+- **Per submission (runtime):** nothing until a backing changes, then a rebuild of the used blocks (128 KiB each)
+  and a diff.
+
+**Switches.**
+- `--address-guard` records `"address_guard": true` in `index.json`.
+- `LEONIDA_ADDRESS_GUARD=1` makes the runtime reserve the range, create the table and write the header.
+- Either alone does nothing: a guarded module on a runtime without the guard finds no magic, and every access passes
+  after one compare.
+- Without the flag the module is byte for byte what it was.
+
+**What a run with the guard shows.**
+- One line when the device is made: `[rt] d3d12: address guard on ...`.
+- At most one line a second: `[rt] d3d12: address guard: N access(es) refused so far (+k), the last at heap offset
+  0x...`. Each refusal is a wild access that would have reached the GPU. The offset says where to look (above the
+  arena's end, as in the two faults).
+- A run that reset the GPU before should keep going, with wrong pixels where a refused access mattered.
+
+**Risks and open points.**
+- A refused access that mattered (a backing the layer never registered) now reads 0 instead of faulting. That is
+  silent apart from the count.
+- An access is checked as a whole. A multi-dword load whose first dwords are inside a V# and a backing, but whose
+  last dword is past both on an unbacked page, reads 0 in full.
+- The table is read through the GPU's caches. A page whose bit changes while a submission is in flight can be seen
+  either way by that submission.
+- Sparse buffers outside the arena are guarded only if they are registered as backings.
+
+**Checked:**
+- `tests/semantic/test_address_guard.py`: the fixture `cs_address_guard` with the guard on, with it off at run time
+  and without the flag, through `spirv_mini_interp`; the kind and span of each instruction family; the table model;
+  the constants shared by the translator, the runtime and `tools/address_guard.py`.
+- `runtime/test/address_guard_test.cpp`: the page table, incremental writes, negative offsets, wrap, chunks and
+  overflow.
+- `scripts/run_address_guard_gpu_test.py`: the fixture on a 2 MiB heap whose table backs one page outside the
+  "arena". Every address it touches is inside the buffer, so no run can fault. With the guard on, the refused loads
+  read 0 although memory is there, the store and the atomic land in the dump area and the count is 6. With the guard
+  off, the same module reads that memory. It passed on lavapipe (Mesa 26.3.1).
+- Corpus (package 1.0.2.1, 2026-11-26):
+  - `--shard 0/8` of the shaders: 3,313 translated and 3,313 `spirv-val`-valid, with the guard and without.
+  - The pipeline library: 2,683 of 2,684 translated and valid, with the guard and without (the same one fails
+    either way).
+  - Without the flag, every module is byte for byte the same as before the change.
+  - With it, the SPIR-V grows by 1.8% (shaders) and 1.6% (library).
 
 ### 3.4 Descriptor heaps and the bindless model
 
@@ -2413,13 +2614,32 @@ Pipeline creation:
   merges into the offline seed. `LEONIDA_DIRECT_SESSION_CACHE=0` also uses a merge when only the session exists.
   The files must match the Vulkan vendor, device and pipeline-cache UUID. Vulkan supplies an opaque snapshot.
   Replacing part of the previous file would corrupt it.
-  `LEONIDA_PIPELINE_CACHE_BYTES` caps session writes (256 MiB by default, zero disables the session file).
+  `LEONIDA_PIPELINE_CACHE_BYTES` caps what a session adds, at a checkpoint or at teardown (an offline `pipeline_cache.bin` seed, which the driver hands back as part of the union, is not counted; 4 GiB by default, zero disables
+  the session file).
+  The session file can't keep a crashed run's compiles: it is written at teardown and at the optional checkpoints
+  below only. The heavy pipeline cache (RT-HEAVY-PIPELINE-CACHE, `runtime/src/heavy_pipeline_cache.h`) keeps the graphics ones; compute pipelines go to the per-pipeline journal
+  described below. Every graphics build first asks the corpus cache with
+  `VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT`. A pipeline the corpus doesn't have is built against a
+  second cache, seeded from `pipeline_cache.heavy.bin` next to `pipeline_cache.bin`, so that cache holds only the
+  corpus's misses.
+  A build that takes at least `LEONIDA_HEAVY_PIPELINE_CACHE_MS` (500 by default) marks the heavy cache for writing.
+  A thread of its own writes it whole: 3 s after the newest slow build, and no later than 20 s after the first unwritten
+  one, through the same staging file and rename as the session cache. A crash therefore loses at most the last 20 s
+  of slow builds, and the next launch starts with the rest. A write that fails, or whose
+  `vkGetPipelineCacheData` returns anything but `VK_SUCCESS` (`VK_INCOMPLETE` means the cache grew after the size
+  query, so the blob is truncated), leaves the previous file in place and the cache dirty: it is tried again 5 s
+  later, the delay doubling with each failure in a row up to 2 min, so the cache is not left unsaved until teardown
+  and a write that keeps failing does not spin. At device teardown the thread stops, and the cache is
+  written if any build went into it. Fast builds are kept that way: without an offline seed every build is a miss,
+  so they no longer reach `pipeline_cache.session.bin`. `LEONIDA_HEAVY_PIPELINE_CACHE_MS=0` turns the heavy cache off, and with it the
+  `pipelineCreationCacheControl` feature unless `LEONIDA_PIPELINE_COMPILE=cache-only` asks for it. A cache-only create
+  (`cache-only`) is left as it is.
   `LEONIDA_SKIP_COMPUTE=<part of a name>[,<part>...]` (`all`: every compute program) never builds the matching
   compute programs and drops their dispatches, direct and indirect; the first dropped dispatch of each is logged.
   It is a way past a program that hangs the GPU while the program or its input is fixed, not a fix.
   `LEONIDA_STARTUP_CACHE_CHECKPOINTS=1` also schedules a snapshot after a successful pipeline build,
   at most once per 120 seconds. It starts on the compile worker when queued builds have drained and the device
-  has no active builds. These snapshots have an additional 512 MiB ceiling. The driver fills a mapped staging
+  has no active builds. The driver fills a mapped staging
   file directly. A successful snapshot atomically replaces the session. An interrupted write preserves the
   previous cache; the next launch removes unheld staging files older than ten minutes.
   While the compute warm-up has builds queued that idle checkpoint never starts, and a boot that ends by a crash,

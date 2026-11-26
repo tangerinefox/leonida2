@@ -46,4 +46,21 @@ inline InnerCoverageRequirements inner_coverage_requirements(std::span<const std
     result.valid = true;
     return result;
 }
+
+// True when the mesh shader module outputs triangles (OutputTrianglesEXT, 5298). A module with lines (5269), points (27)
+// or no output mode does not. Each mesh entry point of a valid module has exactly one of the three.
+inline bool mesh_outputs_triangles(std::span<const std::uint32_t> words) {
+    if (words.size() < 5 || words[0] != 0x07230203) return false;
+    bool triangles = false;
+    for (std::size_t i = 5; i < words.size();) {
+        const auto count = words[i] >> 16, op = words[i] & 0xffff;
+        if (!count || count > words.size() - i) return false;
+        if (op == 16 && count >= 3) {  // OpExecutionMode
+            if (words[i + 2] == 5298) triangles = true;
+            else if (words[i + 2] == 5269 || words[i + 2] == 27) return false;
+        }
+        i += count;
+    }
+    return triangles;
+}
 } // namespace leonida::conservative_raster

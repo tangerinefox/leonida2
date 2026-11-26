@@ -1281,9 +1281,12 @@ class LocalExecFoldTests(unittest.TestCase):
 class StructuredEmulationTests(unittest.TestCase):
     """Structured --wave64-emulate (`inline_all` for <=64 threads, `structured_hybrid` for >64 threads)."""
 
-    def test_single_wave_round_fallback_and_loop_carried_war(self):
+    def test_single_wave_inline_all_zero_switch_and_loop_carried_war(self):
         # 64-thread and partial 40-thread shaders with live-out scalars, loop-carried store->load->store WAR/RAW,
-        # and v_readfirstlane require uniform exchange barriers on both scheduling orders.
+        # and v_readfirstlane emit 0 OpSwitch cases and 0 x_spills while staying bit-exact on both scheduling
+        # orders. Their exchange barriers sit under `%pc`-only guards, which a single wave takes as one, so the
+        # barrier fallback of translate() does not apply to them (docs/design.md, "Wave64 emulation:
+        # single-wave barrier fallback").
         insns = [
             ("s_mov_b64 exec, -1", 4),
             ("s_mov_b32 s16, 10", 4),
@@ -1314,10 +1317,11 @@ class StructuredEmulationTests(unittest.TestCase):
         for threads in (64, 40):
             with self.subTest(threads=threads):
                 spv, gen = _translate_encoded(f"cs_inline_{threads}", insns, (threads, 1, 1), emulate=True)
-                self.assertEqual(gen.control_flow, "emulated wave64 rounds")
-                self.assertIsNone(gen.emulate_plan)
-                self.assertIn("OpSwitch", spv)
-                self.assertFalse(rdna2spirv.barriers_under_control_flow(spv))
+                self.assertEqual(gen.control_flow, "emulated wave64 structured")
+                self.assertEqual(gen.emulate_plan["mode"], "inline_all")
+                self.assertNotIn("OpSwitch", spv)
+                self.assertEqual(len(gen.x_spills), 0)
+                self.assertNotIn("OpGroupNonUniform", spv)
                 for rev in (False, True):
                     mem, _ = run_emulated_workgroup(spv, (threads, 1, 1), push_constants=VSHARP + [0] * 28, reverse_order=rev)
                     # Reference simulation

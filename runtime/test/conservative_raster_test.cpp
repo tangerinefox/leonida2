@@ -1,6 +1,7 @@
 #include "../src/conservative_raster.h"
 #include <cstdio>
 #include <limits>
+#include <vector>
 
 int main() {
     using leonida::conservative_raster::tier1;
@@ -38,6 +39,18 @@ int main() {
     const auto requirements = inner_coverage_requirements(module);
     check(requirements.valid && requirements.fully_covered && requirements.post_depth);
     check(!inner_coverage_requirements(std::span(module).first(9)).valid);
+    using leonida::conservative_raster::mesh_outputs_triangles;
+    const auto with_mode = [](std::uint32_t mode) {
+        return std::vector<std::uint32_t>{0x07230203, 0x00010500, 0, 2, 0, (3u << 16) | 16, 1, mode};
+    };
+    check(mesh_outputs_triangles(with_mode(5298)));   // OutputTrianglesEXT
+    check(!mesh_outputs_triangles(with_mode(5269)));  // OutputLinesEXT
+    check(!mesh_outputs_triangles(with_mode(27)));    // OutputPoints
+    check(!mesh_outputs_triangles(with_mode(26)));    // OutputVertices: no output topology
+    check(!mesh_outputs_triangles({}));
+    auto truncated = with_mode(5298);
+    truncated.pop_back();
+    check(!mesh_outputs_triangles(truncated));
     const std::uint32_t zero_count[] = {0x07230203, 0x00010500, 0, 2, 0, 0};
     check(!inner_coverage_requirements(zero_count).valid);
     const std::uint32_t ordinary[] = {0x07230203, 0x00010500, 0, 2, 0, (2u << 16) | 17, 1};

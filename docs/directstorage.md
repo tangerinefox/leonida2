@@ -84,6 +84,19 @@ The first boot with the executable settles most of this: the dry-run report show
   `DSTORAGE_QUEUE_OPTIONS::AutoSubmitDisabled`). An enqueue into a full queue waits for space, as the reference
   says; with auto-submit disabled only a `Submit` from another thread frees it. One worker thread per queue runs
   the submitted entries in order, so every notification follows all the entries before it.
+- **Reads into physical pages wait for `Submit`**: an automatic submit stops at the first request whose
+  destination is a physical page list; that request and every entry behind it wait for the title's own `Submit`.
+  A title may fill the page-number table such a list points into only in its submit path, so an early read finds
+  page 0 (the entry fails) or the number the slot held before (the data lands in a page that now belongs to
+  something else, with no error). A full queue submits the held entries too, since the title cannot call `Submit`
+  while it waits in an enqueue, and so does `Close`. The idea is from VIctory (`Marvisak/VIctory` `eddde73`, also
+  in `fxceless/victory-fork` `79cfdd9`); the queue here keeps its order, so entries behind a held read wait with
+  it. `LEONIDA_DSTORAGE_HOLD_PAGES=0` restores the automatic submit of everything. A hold ends after
+  `LEONIDA_DSTORAGE_HOLD_MS` milliseconds without a `Submit` (2000 unless set): the held entries are submitted with
+  their page lists as they are, as a timed release, so a path that never calls `Submit` cannot stall for good. `0`
+  is no time limit (a hold of five seconds is then logged once). The `[rt] ds-hold` line counts automatic submits,
+  reads held, full-queue and timed releases, and destination lists that named page 0 when written (`event=`, at
+  each power of two of the counter that moved).
 - **Requests**: copied at enqueue. A file request reads `SourceSize` bytes at `FileOffset` into `Destination`; a
   memory request copies `Source` to `Destination` (`memmove`, so an overlapping pair is safe); a zlib request
   inflates those `SourceSize` bytes into `Destination` (below). Checked in this order when the worker reaches the
@@ -190,7 +203,16 @@ The first boot with the executable settles most of this: the dry-run report show
   256 blocks of a stream. It combines adjacent mips from the same layer with full-stream index anchor
   and shared-p-bit constraints. A shared p-bit can relate low red endpoint bits even when its sibling
   mip supplies only the leading bits. These local fits preserve the recorded precision and exact reference
-  bits. A profile can still lack endpoint values or exceed the reference consistency tolerance. Such a request reports a decompression error before publication.
+  bits. A packed tail whose larger mips are BCPack-coded too has no raw or zlib sibling, so a history field that
+  only such tails use stayed unknown: in the game runs of 2026-11-25 two BC7 tail streams of one pool failed
+  with `missing-endpoint` (alpha fields of two history entries). For the streams that still start a chain at a
+  missing field, the fitter now decodes the nearest BCPack sibling with the profile so far and fits against it,
+  repeating while a round adds fields. The sibling may sit in the same refused BC7 stream: every block whose
+  chains start elsewhere is still determined, and the undetermined ones are left out of the reference. Those
+  fields are fitted, never confirmed, and fill only what the other fits left empty. On the 1.0.2.1 package this
+  raised the BC7 endpoint fields from 4,228 to 4,406 of 6,144; the runtime decoder then refuses 8 of 5,167 BC7
+  streams instead of 60 (both failing requests decode), and the 268 BC6H streams are unchanged (10 refused; a
+  refused BC6H sibling is not used as a reference yet). A profile can still lack endpoint values or exceed the reference consistency tolerance. Such a request reports a decompression error before publication.
 - The four swizzle modes interleave stripes from request-wide component planes into 16 KiB (mode 1) or
   32 KiB (modes 2–4) groups. The enum names give the successive stripe widths. The shipped BC4 sample
   separates its endpoint planes from indices across the inflated source. The title's compute shader does
@@ -213,8 +235,9 @@ The first boot with the executable settles most of this: the dry-run report show
 
 `runtime/test/dstorage_test.cpp` (ctest `dstorage`) runs on synthetic files in `%TEMP%` through the registry entries
 under all three module names: `GAME:` reads with an overlay copy winning, offsets, zero size, a range past the end,
-cancellation, auto-submit, a full queue, status arrays, fences (a CPU fence object that checks the data is in place
-when it is signalled), events, error records, file and queue close with requests in flight, a destination the
+cancellation, auto-submit, reads into physical pages held for `Submit` (a page list changed or filled before it,
+a full queue, the time limit, the switch), a full queue, status arrays, fences (a CPU fence object that checks the
+data is in place when it is signalled), events, error records, file and queue close with requests in flight, a destination the
 process cannot write, four threads enqueueing at once, the interface-id policy (unknown and system ids refused by
 `QueryInterface`, learned by creating calls), a `GetHandle` handle with its own file position, an event closed (and
 its handle value reused) before it is set, and cancelled requests that also had an enqueue error. zlib requests use

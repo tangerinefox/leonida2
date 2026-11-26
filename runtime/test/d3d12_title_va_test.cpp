@@ -512,7 +512,194 @@ int check_window_overflow(Context& c) {
     VirtualFree(ring, 0, MEM_RELEASE);
     return 0;
 }
-// These fixtures register their own pairs without XMem. Retire each before Wine can reuse either VA.
+// What the GPU writes into a title window goes back to the title's pages (#1537, the WRITE_INVALID stop: a window is
+// a read-side mirror, so a UAV write used to land in the copy and the title never saw it). The shader's write is read
+// back through the pages themselves; then a write by the title must survive the next submission's forward copy.
+struct WriteBack {
+    Context* c;
+    ID3D12CommandAllocator* allocator;
+    ID3D12GraphicsCommandList* list;
+    ID3D12Resource* out;
+    ID3D12DescriptorHeap* heap;
+    UINT64 gpu;
+};
+
+// One submission that dispatches through a root UAV at `va` and waits for it. False on a failed call.
+int submit_write(WriteBack& s, std::uint64_t va) {
+    EXPECT(s.allocator->Reset() == S_OK);
+    EXPECT(s.list->Reset(s.allocator, s.c->pso) == S_OK);
+    ID3D12DescriptorHeap* heaps[] = {s.heap};
+    s.list->SetDescriptorHeaps(1, heaps);
+    s.list->SetComputeRootSignature(s.c->root);
+    s.list->SetComputeRoot32BitConstant(0, 0, 0);
+    s.list->SetComputeRoot32BitConstant(0, 1, 1);  // the step: a word the shader writes
+    s.list->SetComputeRootUnorderedAccessView(1, va);
+    s.list->SetComputeRootDescriptorTable(2, D3D12_GPU_DESCRIPTOR_HANDLE{s.gpu});
+    s.list->Dispatch(1, 1, 1);
+    D3D12_RESOURCE_BARRIER to_copy{};
+    to_copy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    to_copy.Transition.pResource = s.out;
+    to_copy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    to_copy.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    to_copy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    s.list->ResourceBarrier(1, &to_copy);
+    EXPECT(s.list->Close() == S_OK);
+    ID3D12CommandList* lists[] = {s.list};
+    s.c->queue->ExecuteCommandLists(1, lists);
+    EXPECT(rt::d3d12::last_execute_result(s.c->queue) == leonida::ReplayResult::success);
+    EXPECT(SUCCEEDED(s.c->queue->Signal(s.c->fence, ++s.c->fence_value)));
+    s.c->fence->SetEventOnCompletion(s.c->fence_value, nullptr);  // a null event waits, as D3D12 does
+    return 0;
+}
+
+// The same gap on a buffer the title places at its own address (slot 133, the retail case for a compute result it
+// reads back): the pages are not imported here, so the buffer is a shadow, and the write of a root UAV over the
+// title's VA must reach the pages at the next submission - and the title's own newer words must still win.
+int check_placed_write_back(Context& c, bool geometry) {
+    void* pages = VirtualAlloc(nullptr, kPages, MEM_TOP_DOWN | MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    EXPECT(pages);
+    const auto title_va = reinterpret_cast<std::uint64_t>(pages);
+    auto* words = static_cast<std::uint32_t*>(pages);
+    for (UINT i = 0; i < kPages / 4; ++i) words[i] = 0xA0000000u + i * 3u;  // never zero, unlike the shader's rows
+    auto& aliases = leonida::title_va_aliases();
+    aliases.add_title_memory(title_va, kPages);  // what the xmem shims do for the title's allocations
+    const D3D12_RESOURCE_DESC desc = buffer_desc(kPages);
+    Ref<ID3D12Resource> placed;
+    EXPECT(SUCCEEDED(
+        rt::d3d12::create_buffer_at_host_address(c.inner, pages, desc, 0xFFFFFFFFu, IID_PPV_ARGS(&placed.p))));
+    EXPECT(placed->GetGPUVirtualAddress() == title_va);
+    EXPECT(aliases.shader_va(title_va) != title_va);  // there is a copy to be reached through
+
+    const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT}, readback_heap{D3D12_HEAP_TYPE_READBACK};
+    const auto uav = buffer_desc(kBytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    const auto readback_desc = buffer_desc(kBytes);
+    Ref<ID3D12Resource> out, readback;
+    EXPECT(SUCCEEDED(c.device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &uav,
+                                                       D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                                       IID_PPV_ARGS(&out.p))));
+    EXPECT(SUCCEEDED(c.device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &readback_desc,
+                                                       D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                       IID_PPV_ARGS(&readback.p))));
+    D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 8,
+                                         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    Ref<ID3D12DescriptorHeap> heap;
+    EXPECT(SUCCEEDED(c.device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap.p))));
+    Ref<ID3D12CommandAllocator> allocator;
+    Ref<ID3D12GraphicsCommandList> list;
+    EXPECT(SUCCEEDED(c.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
+    EXPECT(SUCCEEDED(c.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, c.pso,
+                                                 IID_PPV_ARGS(&list.p))));
+    EXPECT(list->Close() == S_OK);
+    WriteBack s{&c, allocator.p, list.p, out.p, heap.p,
+                reinterpret_cast<XboxHeapHandleFn>(slot(heap.p, 10))(heap.p)};
+
+    const std::vector<std::uint32_t> before(words, words + kElements);
+    EXPECT(submit_write(s, title_va) == 0);
+    UINT untouched = 0;
+    for (UINT i = 0; i < kElements; ++i) untouched += words[i] == before[i];
+    // An imported buffer is the same memory and needs no copy; only a shadow owes the pages the GPU's words.
+    const bool shadow = !geometry && aliases.shader_va(title_va) >= c.arena;
+    if (shadow) {
+        std::printf("placed buffer write back: %u/%u words still held the title's before the next submission\n",
+                    untouched, kElements);
+        EXPECT(untouched == kElements);
+    }
+
+    EXPECT(submit_write(s, title_va) == 0);
+    std::vector<std::uint32_t> written(words, words + kElements);
+    UINT reached = 0, changed = 0, nonzero = 0;
+    for (UINT i = 0; i < kElements; ++i) {
+        reached += written[i] == (0xA0000000u + i * 3u);
+        changed += written[i] != before[i];
+        nonzero += written[i] != 0;
+    }
+    std::printf("placed buffer write back: %u/%u words reached the pages (%u changed, %u nonzero)\n", kElements - reached,
+                kElements, changed, nonzero);
+    EXPECT(changed == kElements && nonzero > 0);
+    (void)reached;
+
+    // The title writes its own words over the result: the next submission copies them forward and they stay.
+    for (UINT i = 0; i < kElements; ++i) words[i] = 0xB16B00B5u;
+    EXPECT(submit_write(s, title_va) == 0);
+    UINT kept = 0;
+    for (UINT i = 0; i < kElements; ++i) kept += words[i] == 0xB16B00B5u;
+    std::printf("placed buffer write back: the title's own words survived %u/%u\n", kept, kElements);
+    EXPECT(kept == kElements);
+
+    placed.reset();  // the shadow goes, the pages stay writable
+    aliases.remove_title_memory(title_va);
+    VirtualFree(pages, 0, MEM_RELEASE);
+    return 0;
+}
+
+int check_window_write_back(Context& c, bool geometry) {
+    constexpr UINT64 ring_bytes = 256 * 1024;
+    auto* ring = static_cast<std::uint32_t*>(
+        VirtualAlloc(nullptr, ring_bytes, MEM_TOP_DOWN | MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    EXPECT(ring);
+    const auto ring_va = reinterpret_cast<std::uint64_t>(ring);
+    for (UINT i = 0; i < ring_bytes / 4; ++i) ring[i] = 0;
+    auto& aliases = leonida::title_va_aliases();
+    aliases.add_title_memory(ring_va, ring_bytes);
+
+    const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT}, readback_heap{D3D12_HEAP_TYPE_READBACK};
+    const auto uav = buffer_desc(kBytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    const auto readback_desc = buffer_desc(kBytes);
+    Ref<ID3D12Resource> out, readback;
+    EXPECT(SUCCEEDED(c.device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &uav,
+                                                       D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                                       IID_PPV_ARGS(&out.p))));
+    EXPECT(SUCCEEDED(c.device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &readback_desc,
+                                                       D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                       IID_PPV_ARGS(&readback.p))));
+    D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 8,
+                                         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    Ref<ID3D12DescriptorHeap> heap;
+    EXPECT(SUCCEEDED(c.device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap.p))));
+    Ref<ID3D12CommandAllocator> allocator;
+    Ref<ID3D12GraphicsCommandList> list;
+    EXPECT(SUCCEEDED(c.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
+    EXPECT(SUCCEEDED(c.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, c.pso,
+                                                 IID_PPV_ARGS(&list.p))));
+    EXPECT(list->Close() == S_OK);  // Reset needs it closed, as the title leaves it
+    WriteBack s{&c, allocator.p, list.p, out.p, heap.p,
+                reinterpret_cast<XboxHeapHandleFn>(slot(heap.p, 10))(heap.p)};
+
+    // The shader writes the range the root UAV names, which is the title's own pages here, far past the arena: the
+    // resolve already has to make a window for them before the submission.
+    EXPECT(aliases.shader_va(ring_va) == ring_va);
+    EXPECT(submit_write(s, ring_va) == 0);
+    EXPECT(aliases.shader_va(ring_va) != ring_va);  // a window was made for the title's pages
+    if (!geometry) EXPECT(ring[0] == 0);  // the copy took the write: the pages get it only after the next submission
+
+    // The next submission's refresh copies the GPU's writes back, before it copies the pages forward.
+    EXPECT(submit_write(s, ring_va) == 0);
+    const std::vector<std::uint32_t> written(ring, ring + kElements);
+    UINT nonzero = 0;
+    for (std::uint32_t w : written) nonzero += w != 0;
+    std::printf("write back: %u of %u words the shader wrote are in the title's pages\n", nonzero, kElements);
+    EXPECT(nonzero > 0);
+
+    // The same submission again: the pages keep what they hold, the values do not drift.
+    EXPECT(submit_write(s, ring_va) == 0);
+    UINT stable = 0;
+    for (UINT i = 0; i < kElements; ++i) stable += ring[i] == written[i];
+    std::printf("write back: the pages kept those words across two submissions %u/%u\n", stable, kElements);
+    EXPECT(stable == kElements);
+
+    // A write by the title after a submission is copied forward over the result again, not overwritten by it.
+    for (UINT i = 0; i < kElements; ++i) ring[i] = 0xB16B00B5u;
+    EXPECT(submit_write(s, ring_va) == 0);
+    UINT kept = 0;
+    for (UINT i = 0; i < kElements; ++i) kept += ring[i] == 0xB16B00B5u;
+    std::printf("write back: the title's own words survived the next submission %u/%u\n", kept, kElements);
+    EXPECT(kept == kElements);
+
+    aliases.remove_title_memory(ring_va);
+    VirtualFree(ring, 0, MEM_RELEASE);
+    return 0;
+}
+
 void remove_test_pair(std::uintptr_t gpu, std::uintptr_t cpu) {
     auto& state = leonida::title_gpu_views::state();
     std::unique_lock lock(state.mutex);
@@ -987,6 +1174,8 @@ int main(int argc, char** argv) {
     const bool api_copy = api_copy_off || (argc == 2 && std::strcmp(argv[1], "--api-descriptor-copy") == 0);
     const bool rebind = api_copy || mirror_off || second_device || (argc == 2 && std::strcmp(argv[1], "--rebound-tables") == 0);
     const bool window_cap = argc == 2 && std::strcmp(argv[1], "--window-cap") == 0;
+    const bool window_write_back = argc == 2 && std::strcmp(argv[1], "--window-writeback") == 0;
+    const bool placed_write_back = argc == 2 && std::strcmp(argv[1], "--placed-writeback") == 0;
     if (window_cap) {
         const char* cap = std::getenv("LEONIDA_TITLE_WINDOWS_MB");
         if (!cap || std::strcmp(cap, "0")) {
@@ -1099,6 +1288,25 @@ int main(int argc, char** argv) {
                 return 1;
             }
             std::printf("title memory past the window cap: the views were zero-size and the shader read zeros\n");
+            return 0;
+        }
+        if (placed_write_back) {
+            if (check_placed_write_back(c, geometry)) return 1;
+            if (d.validation_errors()) {
+                std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
+                return 1;
+            }
+            std::printf("title-placed buffer write back: the GPU's writes reached the title's pages\n");
+            return 0;
+        }
+        if (window_write_back) {
+            if (check_window_write_back(c, geometry)) return 1;
+            if (d.validation_errors()) {
+                std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
+                return 1;
+            }
+            std::printf("title window write back: the GPU's writes reached the title's pages and the title's own "
+                        "words won\n");
             return 0;
         }
         if (geometry && check_declined_imports(c)) return 1;

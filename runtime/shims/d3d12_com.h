@@ -169,6 +169,9 @@ struct VulkanDeviceInfo {
     bool occlusion_query_precise = false;
     bool prepare_on_bind = false;
     bool cold_graphics_compile = false;  // Driver supports a cache-only create and reports when compilation is pending.
+    // pipelineCreationCacheControl is on for the heavy pipeline cache (src/heavy_pipeline_cache.h): a pipeline the
+    // offline cache does not have is created against the cache of pipeline_cache.heavy.bin, written back as it grows.
+    bool heavy_pipeline_cache = false;
     bool pipeline_statistics_query = false;
     bool presentation = false;  // VK_KHR_surface + VK_KHR_win32_surface on the instance, VK_KHR_swapchain on the device
     // VK_KHR_swapchain_maintenance1 (or VK_EXT_swapchain_maintenance1) and its swapchainMaintenance1 feature are
@@ -387,6 +390,10 @@ std::uint64_t device_arena_size(ID3D12Device* device);
 // Copies `bytes` of the device's GPU address arena at console VA `va` (what shaders read there: a heap's GPU copy,
 // the null slots after it) into `out`. False without an arena or when the range is not inside it. For tests.
 bool read_arena(ID3D12Device* device, std::uint64_t va, void* out, std::size_t bytes);
+// The slots whose host-RAM mirror differs from the GPU copy of the console descriptor heap at `console_va`
+// (src/console_heap_copy.h), compared now: 0 when they agree, -1 when there is no such heap or it has no mirror.
+// For tests.
+long long console_heap_mirror_mismatches(ID3D12Device* device, std::uint64_t console_va);
 
 // The blocks of device memory that textures share (src/image_memory.h): how many, their bytes, and the textures in
 // them. For tests.
