@@ -654,6 +654,93 @@ void test_initialise_rejects() {
     }
 }
 
+// IMAGE_FILE_RELOCS_STRIPPED against a relocation directory, when the preferred base is taken. Measured on the
+// Windows 11 (26200) loader with synthetic DLLs (runtime/README.md): with no relocation directory the flag refuses
+// the move and an image with the flag clear is moved with nothing fixed up; with a relocation table the image is
+// moved and fixed up whatever the flag says. The DllMain stub stores through an absolute address in this process,
+// not in the image, so it runs correctly wherever the image lands.
+void test_moved_without_relocations() {
+    auto img = make_image();
+    auto* nt = nt_of(img);
+    nt->FileHeader.Characteristics |= IMAGE_FILE_DLL;
+    nt->OptionalHeader.ImageBase = leonida_test::free_image_base(0x1C0000000);
+    nt->OptionalHeader.AddressOfEntryPoint = 0x1040;
+    emit_store_stub(img, 0x240, reinterpret_cast<uint64_t>(&g_main_ran), 5, 1);
+    const uint64_t preferred = nt->OptionalHeader.ImageBase;
+    void* held = VirtualAlloc(reinterpret_cast<void*>(preferred), 0x2000, MEM_RESERVE, PAGE_NOACCESS);
+    if (!held) {
+        // Something else holds it already, which is the case under test as well; but make sure it is held.
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(reinterpret_cast<void*>(preferred), &info, sizeof info) || info.State == MEM_FREE)
+            return failed("an image without relocations moves when its base is taken", "cannot hold its base");
+    }
+    {
+        const char* what = "an image without relocations, flag clear, moves when its base is taken";
+        g_main_ran = 0;
+        auto p = write_image(img);
+        try {
+            rt::Loader loader(g_dir);
+            rt::Module& m = loader.load(p);
+            if (reinterpret_cast<uint64_t>(m.base) == preferred || !m.relocated)
+                failed(what, "it was not moved");
+            else if (std::memcmp(m.base + 0x1000, text_raw(img), 0x200) != 0)
+                failed(what, "the mapped section doesn't match the file (something was fixed up)");
+            else {
+                loader.initialise();
+                if (g_main_ran != 5) failed(what, "its DllMain never ran at the new address");
+                else pass(what);
+            }
+        } catch (const std::exception& e) {
+            failed(what, e.what());
+        }
+    }
+    {
+        auto stripped = img;
+        nt_of(stripped)->FileHeader.Characteristics |= IMAGE_FILE_RELOCS_STRIPPED;
+        std::string error;
+        const char* what = "an image with IMAGE_FILE_RELOCS_STRIPPED is refused when its base is taken";
+        if (load(write_image(stripped), error) == 0) failed(what, "the image loaded");
+        else if (error.find("stripped") == std::string::npos) failed(what, "refused for another reason: " + error);
+        else pass(what);
+    }
+    if (held) VirtualFree(held, 0, MEM_RELEASE);
+    {
+        // At a free base such an image maps, as it did before. Not Windows parity: the Windows 11 loader refused these
+        // DLLs (error 487) at a free base too, for a reason not yet known; runtime/README.md keeps the question.
+        auto stripped = img;
+        nt_of(stripped)->FileHeader.Characteristics |= IMAGE_FILE_RELOCS_STRIPPED;
+        expect_loads("an image with IMAGE_FILE_RELOCS_STRIPPED and no relocations maps at its free base", stripped);
+    }
+    {
+        // With a relocation table the flag does not stop the move: the table is applied, as Windows does it.
+        // ImageBase 0 makes the loader move it; the one DIR64 entry points at the qword at RVA 0x1100.
+        const char* what = "an image with IMAGE_FILE_RELOCS_STRIPPED and a relocation table is moved and fixed up";
+        auto stripped = make_image();
+        auto* snt = nt_of(stripped);
+        snt->FileHeader.Characteristics |= IMAGE_FILE_RELOCS_STRIPPED;
+        snt->OptionalHeader.ImageBase = 0;
+        snt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC] = {0x1000, 0x0A};
+        auto* block = reinterpret_cast<IMAGE_BASE_RELOCATION*>(stripped.data() + 0x200);
+        block->VirtualAddress = 0x1000;
+        block->SizeOfBlock = 0x0A;
+        reinterpret_cast<uint16_t*>(block + 1)[0] = (IMAGE_REL_BASED_DIR64 << 12) | 0x100;
+        uint64_t original;
+        std::memcpy(&original, stripped.data() + 0x300, sizeof original);
+        auto p = write_image(stripped);
+        try {
+            rt::Loader loader(g_dir);
+            rt::Module& m = loader.load(p);
+            uint64_t moved;
+            std::memcpy(&moved, m.base + 0x1100, sizeof moved);
+            if (!m.relocated) failed(what, "it was not moved");
+            else if (moved != original + reinterpret_cast<uint64_t>(m.base)) failed(what, "the pointer wasn't fixed up");
+            else pass(what);
+        } catch (const std::exception& e) {
+            failed(what, e.what());
+        }
+    }
+}
+
 // The images below jump to host observers so notifications remain observable after the mappings are freed.
 // The FLS destructor itself starts in mapped code: leaving it registered would call unmapped memory at exit.
 void emit_jump_stub(std::vector<uint8_t>& img, size_t off, uint64_t target) {
@@ -1471,6 +1558,7 @@ int main() {
         test_section_bounds();
         test_truncation();
         test_relocations();
+        test_moved_without_relocations();
         test_exports();
         test_empty_named_export();
         test_imports();

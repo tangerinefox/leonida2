@@ -13,10 +13,11 @@
 // into a bound table itself, a created CBV and a root view.
 // Negative controls: a second title buffer with other data must not be what the first one's V# reads; an arena
 // buffer's V# keeps its VA; the title's range is forgotten when the buffer is released; a raw arena V# and a
-// T#-shaped slot in a scanned table keep their bytes; a reserved, uncommitted address is left alone. The shader is test/glsl/cs_user_data.comp. No game data. LEONIDA_VK_VALIDATION=1 for the
+// T#-shaped slot in a scanned table keep their bytes; a reserved, uncommitted title address and memory that is nobody's get zero-size views. The shader is test/glsl/cs_user_data.comp. No game data. LEONIDA_VK_VALIDATION=1 for the
 // Khronos validation layer.
 #include "shader_fixture_path.h"
 #include "test_temp_dir.h"
+#include "d3d12_test_shaders.h"
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
@@ -46,7 +47,6 @@ namespace {
 using XboxHeapHandleFn = std::uint64_t(WINAPI*)(void* heap);  // heap slots 9/10: handle in RAX
 using XboxComputePipelineFn = HRESULT(WINAPI*)(void* device, const D3D12_COMPUTE_PIPELINE_STATE_DESC*, std::uint64_t,
                                                std::uint64_t, const IID*, void**);
-using SerializeFn = HRESULT(WINAPI*)(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC*, ID3DBlob**, ID3DBlob**);
 
 template<class T>
 struct Ref {
@@ -106,19 +106,9 @@ std::vector<std::uint8_t> shader_container(const std::vector<std::uint8_t>& fssm
     return out;
 }
 
+// The shared helper: Windows 10's in-box d3d12.dll refuses the heap-directly-indexed flags at every version.
 std::vector<std::uint8_t> serialize(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC& desc) {
-    const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-    const auto fn = d3d12 ? reinterpret_cast<SerializeFn>(
-                                reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12SerializeVersionedRootSignature")))
-                          : nullptr;
-    std::vector<std::uint8_t> out;
-    ID3DBlob* blob = nullptr;
-    if (fn && SUCCEEDED(fn(&desc, &blob, nullptr)) && blob) {
-        const auto* p = static_cast<const std::uint8_t*>(blob->GetBufferPointer());
-        out.assign(p, p + blob->GetBufferSize());
-        blob->Release();
-    }
-    return out;
+    return d3d12test::serialize_root_signature(desc);
 }
 
 D3D12_RESOURCE_DESC buffer_desc(UINT64 bytes, D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE) {
@@ -731,7 +721,9 @@ int check_title_memory(Context& c, int& checks, bool geometry) {
                 static_cast<unsigned long long>(aliases.translated(leonida::TitleVaAliases::root_view) - root_before));
     EXPECT(raw_ok == kElements && cbv_ok == kElements && root_ok == kElements);
     EXPECT(rewritten && arena_kept && image_kept);
-    // Neither unrelated host memory nor a reserved-only title page has a GPU copy.
+    // Committed memory that is not the title's (the runtime's own, say) and that no allocation of the device's holds:
+    // heap_base + its address is no allocation either, so its view gets no base and no records, as a title range
+    // with no committed page does (it gets no copy). Neither is counted as left untranslated, and neither has a copy.
     const std::uint64_t untranslated_before = aliases.untranslated(leonida::TitleVaAliases::created_view);
     void* host = VirtualAlloc(nullptr, 65536, MEM_TOP_DOWN | MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     void* gone = VirtualAlloc(nullptr, 65536, MEM_TOP_DOWN | MEM_RESERVE, PAGE_READWRITE);

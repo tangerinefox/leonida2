@@ -121,10 +121,10 @@ struct ThreadTrace {
     size_t count = 0;
 };
 
-void print_traces(unsigned at, const std::vector<ThreadTrace>& traces) {
-    std::string out = "[rt] stacks t=" + std::to_string(at) + ": " + std::to_string(traces.size()) + " threads\n";
+void print_traces(const std::string& tag, const std::vector<ThreadTrace>& traces) {
+    std::string out = "[rt] stacks " + tag + ": " + std::to_string(traces.size()) + " threads\n";
     for (auto it = traces.begin(); it != traces.end(); ++it) {
-        out += "[rt] stacks t=" + std::to_string(at) + " thread " + std::to_string(it->tid) + " (" + it->label + "):\n";
+        out += "[rt] stacks " + tag + " thread " + std::to_string(it->tid) + " (" + it->label + "):\n";
         const auto same = std::find_if(traces.begin(), it, [&](const ThreadTrace& earlier) {
             return it->count && it->count == earlier.count &&
                    std::equal(it->frames.begin(), it->frames.begin() + it->count, earlier.frames.begin());
@@ -142,10 +142,11 @@ void print_traces(unsigned at, const std::vector<ThreadTrace>& traces) {
     std::fflush(stderr);
 }
 
-void snapshot_threads(unsigned at, StackSampler& sampler, GetDescription describe, QueryThread query) {
+void snapshot_threads(const std::string& tag, StackSampler& sampler, GetDescription describe, QueryThread query,
+                      DWORD only = 0) {
     const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if (snapshot == INVALID_HANDLE_VALUE) {
-        std::fprintf(stderr, "[rt] stacks t=%u: thread list failed (error %lu)\n", at, GetLastError());
+        std::fprintf(stderr, "[rt] stacks %s: thread list failed (error %lu)\n", tag.c_str(), GetLastError());
         return;
     }
     std::vector<ThreadTrace> traces;
@@ -157,6 +158,7 @@ void snapshot_threads(unsigned at, StackSampler& sampler, GetDescription describ
     for (BOOL ok = Thread32First(snapshot, &entry); ok; ok = Thread32Next(snapshot, &entry)) {
         entry.dwSize = sizeof(entry);
         if (entry.th32OwnerProcessID != pid || entry.th32ThreadID == self) continue;
+        if (only && entry.th32ThreadID != only) continue;
         const HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
                                          FALSE, entry.th32ThreadID);
         if (!thread) continue;
@@ -169,7 +171,7 @@ void snapshot_threads(unsigned at, StackSampler& sampler, GetDescription describ
         CloseHandle(thread);
     }
     CloseHandle(snapshot);
-    print_traces(at, traces);
+    print_traces(tag, traces);
 }
 
 }  // namespace
@@ -207,6 +209,20 @@ bool parse_stack_times(std::string_view text, std::vector<unsigned>& seconds) {
     return true;
 }
 
+void print_thread_stacks_now(std::uint32_t tid, const char* why) noexcept {
+    static std::mutex mutex;
+    try {
+        std::lock_guard lock(mutex);
+        static StackSampler sampler;
+        const auto describe = reinterpret_cast<GetDescription>(reinterpret_cast<void*>(
+            GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetThreadDescription")));
+        const auto query = reinterpret_cast<QueryThread>(reinterpret_cast<void*>(
+            GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread")));
+        snapshot_threads(why ? why : "now", sampler, describe, query, tid);
+    } catch (...) {
+    }
+}
+
 std::jthread start_thread_stacks() {
     const auto start = Clock::now();
     char spec[1024];
@@ -229,7 +245,7 @@ std::jthread start_thread_stacks() {
         for (const unsigned at : times) {
             wake.wait_until(lock, stop, start + std::chrono::seconds(at), [] { return false; });
             if (stop.stop_requested()) break;
-            snapshot_threads(at, sampler, describe, query);
+            snapshot_threads("t=" + std::to_string(at), sampler, describe, query);
         }
     });
 }

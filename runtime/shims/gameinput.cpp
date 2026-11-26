@@ -45,6 +45,7 @@
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <map>
 #include <string>
 #include <thread>
 #include <utility>
@@ -53,6 +54,7 @@
 #include "gameinput.h"
 #include "gameinput_abi.h"
 #include "gameinput_script.h"
+#include "keyboard_pad_connection.h"
 #include "shims.h"
 
 using namespace gi;
@@ -1004,6 +1006,9 @@ leonida::InputFamily family_of(SDL_JoystickID jid, SDL_Gamepad* p) {
 // in bits 0-7, forced in bit 8, the generation from bit 16.
 leonida::ActiveInputTracker g_tracker;
 std::atomic<uint64_t> g_active{0};
+// GetCurrentReading calls so far, any device: a scripted press is held until the title has read the pads a few
+// times since it began (update_keyboard_pad).
+std::atomic<uint64_t> g_reading_calls{0};
 
 void publish_active() {
     g_active.store(static_cast<uint64_t>(g_tracker.active()) | (g_tracker.forced() ? 1ull << 8 : 0) |
@@ -1766,10 +1771,7 @@ std::atomic<rt::gameinput::KeyDownFn> g_key_down{async_key_down};
 std::atomic<rt::gameinput::HasFocusFn> g_has_focus{foreground_is_ours};
 std::atomic<rt::gameinput::CursorPosFn> g_cursor_pos{system_cursor_pos};
 
-struct KeyboardPad {
-    SDL_JoystickID id = 0;
-    SDL_Joystick* js = nullptr;
-    bool failed = false;  // attaching failed once; not retried every 2 ms
+struct KeyboardPad : rt::gameinput::detail::KeyboardPadConnection<SDL_JoystickID, SDL_Joystick*> {
     int right_x = 0, right_y = 0;    // the mouse's right stick, SDL axis units (+Y down)
     int cursor_x = 0, cursor_y = 0;  // the cursor at the last poll
     bool have_cursor = false;        // cursor_x/y are valid; false after focus loss, so the first poll moves nothing
@@ -1777,13 +1779,6 @@ struct KeyboardPad {
 KeyboardPad g_keyboard;
 
 bool is_keyboard_pad(SDL_JoystickID jid) { return jid != 0 && jid == g_keyboard.id; }
-
-void detach_keyboard_pad() {
-    if (g_keyboard.js) SDL_CloseJoystick(g_keyboard.js);
-    if (g_keyboard.id) SDL_DetachVirtualJoystick(g_keyboard.id);
-    if (g_keyboard.id) std::fprintf(stderr, "[rt] gameinput: keyboard pad removed\n");
-    g_keyboard = {};
-}
 
 // Keeps the cursor inside the game window while it has focus, so a click cannot land on another window, and releases
 // it on focus loss. Only with raw input (a clipped plain cursor would stop the stick at the window edge) and only for
@@ -1812,29 +1807,34 @@ void clip_cursor(bool want) {
     }
 }
 
-bool attach_keyboard_pad() {
-    SDL_VirtualJoystickDesc d;
-    SDL_INIT_INTERFACE(&d);
-    d.type = SDL_JOYSTICK_TYPE_GAMEPAD;
-    d.naxes = SDL_GAMEPAD_AXIS_COUNT;
-    d.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
-    d.button_mask = (1u << SDL_GAMEPAD_BUTTON_COUNT) - 1;
-    d.axis_mask = (1u << SDL_GAMEPAD_AXIS_COUNT) - 1;
-    d.name = "Keyboard pad (Leonida)";
-    g_keyboard.id = SDL_AttachVirtualJoystick(&d);
-    g_keyboard.js = g_keyboard.id ? SDL_OpenJoystick(g_keyboard.id) : nullptr;
-    if (!g_keyboard.js) {
-        std::fprintf(stderr, "[rt] gameinput: cannot attach the keyboard pad: %s\n", SDL_GetError());
-        detach_keyboard_pad();
-        g_keyboard.failed = true;
-        return false;
+struct KeyboardPadBackend {
+    static uint64_t now() { return now_us(); }
+    static SDL_JoystickID attach() {
+        SDL_VirtualJoystickDesc d;
+        SDL_INIT_INTERFACE(&d);
+        d.type = SDL_JOYSTICK_TYPE_GAMEPAD;
+        d.naxes = SDL_GAMEPAD_AXIS_COUNT;
+        d.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
+        d.button_mask = (1u << SDL_GAMEPAD_BUTTON_COUNT) - 1;
+        d.axis_mask = (1u << SDL_GAMEPAD_AXIS_COUNT) - 1;
+        d.name = "Keyboard pad (Leonida)";
+        return SDL_AttachVirtualJoystick(&d);
     }
-    std::fprintf(stderr, "[rt] gameinput: keyboard pad attached (arrows d-pad, Enter A, Backspace B, X X, Y Y, "
-                         "Q/E shoulders, Esc Menu, Tab View, WASD left stick, mouse right stick, right/left "
-                         "button LT/RT)\n");
-    start_raw_mouse();
-    return true;
-}
+    static SDL_Joystick* open(SDL_JoystickID id) { return SDL_OpenJoystick(id); }
+    static void close(SDL_Joystick* js) { SDL_CloseJoystick(js); }
+    static bool detach(SDL_JoystickID id) { return SDL_DetachVirtualJoystick(id); }
+    static bool is_virtual(SDL_JoystickID id) { return SDL_IsJoystickVirtual(id); }
+    static void removed() { std::fprintf(stderr, "[rt] gameinput: keyboard pad removed\n"); }
+    static void failed() {
+        std::fprintf(stderr, "[rt] gameinput: cannot attach the keyboard pad: %s\n", SDL_GetError());
+    }
+    static void attached() {
+        std::fprintf(stderr, "[rt] gameinput: keyboard pad attached (arrows d-pad, Enter A, Backspace B, X X, Y Y, "
+                             "Q/E shoulders, Esc Menu, Tab View, WASD left stick, mouse right stick, right/left "
+                             "button LT/RT)\n");
+        start_raw_mouse();
+    }
+};
 
 // Before SDL_UpdateGamepads, so the buttons set here are in this poll's reading.
 void update_keyboard_pad() {
@@ -1845,13 +1845,14 @@ void update_keyboard_pad() {
         mode = g().config.keyboard_pad;
         sens = g().config.mouse_sensitivity;
     }
-    if (mode == rt::gameinput::KeyboardPadMode::Off) {
+    KeyboardPadBackend backend;
+    const bool enabled = mode != rt::gameinput::KeyboardPadMode::Off;
+    if (!enabled) {
         clip_cursor(false);
-        if (g_keyboard.id) detach_keyboard_pad();
-        g_keyboard.failed = false;
-        return;
+        g_keyboard.right_x = g_keyboard.right_y = 0;
+        g_keyboard.have_cursor = false;
     }
-    if (!g_keyboard.js && (g_keyboard.failed || !attach_keyboard_pad())) return;
+    if (!g_keyboard.update(enabled, backend)) return;
 
     bool down[SDL_GAMEPAD_BUTTON_COUNT] = {};
     int lx = 0, ly = 0;
@@ -1901,7 +1902,26 @@ void update_keyboard_pad() {
     if (!scripted.empty()) {
         static const ULONGLONG origin = GetTickCount64();
         const double now = (GetTickCount64() - origin) / 1000.0;
-        const script::Held held = script::held_at(scripted, now);
+        script::Held held{};
+        static constexpr uint64_t kReads = 6;
+        static constexpr double kMaxHold = 5.0;
+        static std::vector<uint64_t> began(scripted.presses.size(), 0);
+        static std::vector<char> started(scripted.presses.size(), 0);
+        const uint64_t calls = g_reading_calls.load(std::memory_order_relaxed);
+        for (std::size_t i = 0; i < scripted.presses.size(); ++i) {
+            const auto& press = scripted.presses[i];
+            bool active = false;
+            if (now >= press.at && now < press.at + kMaxHold) {
+                if (!started[i]) {
+                    started[i] = 1;
+                    began[i] = calls;
+                }
+                active = now < press.at + 0.3 || calls - began[i] < kReads;
+            }
+            if (!active) continue;
+            if (press.stick) held.stick = press.stick;
+            else held.buttons |= press.button;
+        }
         if (held.stick) right_y = held.stick > 0 ? -kStickFull : kStickFull;  // SDL's +Y is down
         for (const script::Button& b : script::kButtons) {
             if (!(scripted.named & b.bit)) continue;
@@ -1959,6 +1979,10 @@ void poll_once() {
     SDL_JoystickID* ids = SDL_GetGamepads(&count);
     std::vector<SDL_JoystickID> present(ids, ids + (ids ? count : 0));
     SDL_free(ids);
+    // An unopened virtual device may still be waiting for SDL to finish detaching it.
+    // Do not advertise it to the title until it has a working keyboard handle.
+    if (g_keyboard.id && !g_keyboard.js)
+        present.erase(std::remove(present.begin(), present.end(), g_keyboard.id), present.end());
 
     std::vector<Device*> connected;
     {
@@ -2411,7 +2435,75 @@ public:
 
     uint64_t STDMETHODCALLTYPE GetCurrentTimestamp() override { return now_us(); }
 
+    // LEONIDA_INPUT_STATS=1 (diagnostic): every 10 s, how the title asked for readings (by method and device
+    // argument) and what it got (by the reading's device, and whether a gamepad button was down in it).
+    static void note_reading(int method, IGameInputDevice* asked, HRESULT hr, IGameInputReading* got) {
+        static const bool on = env("LEONIDA_INPUT_STATS") == "1";
+        if (!on) return;
+        struct Stats {
+            std::mutex mu;
+            uint64_t calls[3][3] = {};  // method x (null, aggregate, a device)
+            uint64_t found[3] = {}, pressed[3] = {};
+            std::map<std::string, std::pair<uint64_t, uint64_t>> by_device;  // name -> (readings, with buttons)
+            uint64_t since = 0;
+        };
+        static Stats st;
+        std::string name;
+        bool buttons = false;
+        if (SUCCEEDED(hr) && got) {
+            IGameInputDevice* d = nullptr;
+            got->GetDevice(&d);
+            if (d) {
+                name = as_device(d)->name;
+                d->Release();
+            }
+            GameInputGamepadState g{};
+            if (got->GetGamepadState(&g)) buttons = g.buttons != 0;
+        }
+        const int arg = !asked ? 0 : as_device(asked)->info.deviceFamily == GameInputFamilyAggregate ? 1 : 2;
+        std::lock_guard lock(st.mu);
+        ++st.calls[method][arg];
+        if (SUCCEEDED(hr) && got) {
+            ++st.found[method];
+            st.pressed[method] += buttons;
+            auto& e = st.by_device[name];
+            ++e.first;
+            e.second += buttons;
+        }
+        const uint64_t now = now_us();
+        if (!st.since) st.since = now;
+        if (now - st.since < 10'000'000) return;
+        static const char* methods[] = {"GetCurrentReading", "GetNextReading", "GetPreviousReading"};
+        std::string line;
+        for (int m = 0; m < 3; ++m) {
+            char t[200];
+            std::snprintf(t, sizeof(t), " %s %llu/%llu/%llu found %llu pressed %llu;", methods[m],
+                          (unsigned long long)st.calls[m][0], (unsigned long long)st.calls[m][1],
+                          (unsigned long long)st.calls[m][2], (unsigned long long)st.found[m],
+                          (unsigned long long)st.pressed[m]);
+            line += t;
+        }
+        for (const auto& [n, c] : st.by_device) {
+            char t[160];
+            std::snprintf(t, sizeof(t), " [%s: %llu readings, %llu with buttons]", n.c_str(), (unsigned long long)c.first,
+                          (unsigned long long)c.second);
+            line += t;
+        }
+        std::fprintf(stderr, "[rt] gameinput stats (calls null/aggregate/device): %s\n", line.c_str());
+        std::memset(st.calls, 0, sizeof(st.calls));
+        std::memset(st.found, 0, sizeof(st.found));
+        std::memset(st.pressed, 0, sizeof(st.pressed));
+        st.by_device.clear();
+        st.since = now;
+    }
+
     HRESULT STDMETHODCALLTYPE GetCurrentReading(uint32_t kind, IGameInputDevice* device, IGameInputReading** out) override {
+        g_reading_calls.fetch_add(1, std::memory_order_relaxed);
+        const HRESULT hr = current_reading(kind, device, out);
+        note_reading(0, device, hr, out ? *out : nullptr);
+        return hr;
+    }
+    HRESULT current_reading(uint32_t kind, IGameInputDevice* device, IGameInputReading** out) {
         if (!out) return E_POINTER;
         *out = nullptr;
         if (kind != GameInputKindUnknown && !(kind & kSupportedKinds)) return GAMEINPUT_E_READING_NOT_FOUND;
@@ -2445,11 +2537,15 @@ public:
 
     HRESULT STDMETHODCALLTYPE GetNextReading(IGameInputReading* ref, uint32_t kind, IGameInputDevice* device,
                                              IGameInputReading** out) override {
-        return find_reading(ref, kind, device, out, true);
+        const HRESULT hr = find_reading(ref, kind, device, out, true);
+        note_reading(1, device, hr, out ? *out : nullptr);
+        return hr;
     }
     HRESULT STDMETHODCALLTYPE GetPreviousReading(IGameInputReading* ref, uint32_t kind, IGameInputDevice* device,
                                                  IGameInputReading** out) override {
-        return find_reading(ref, kind, device, out, false);
+        const HRESULT hr = find_reading(ref, kind, device, out, false);
+        note_reading(2, device, hr, out ? *out : nullptr);
+        return hr;
     }
     // E_NOTIMPL is GameInput v0's own answer: Microsoft's reference page says the method "was never implemented in
     // v0" and returns E_NOTIMPL, and v1 removed it. A history lookup here would give a title what no GameInput does.

@@ -78,7 +78,7 @@ void note_attributes(const char* api, uint64_t attributes, size_t size, const vo
     rt::startup_trace::event("xmem_attributes", fields);
 }
 
-// LEONIDA_TITLE_HEAP=1: the title's XMemAlloc blocks come from a heap of their own instead of the CRT heap. Slot-133
+// The title's XMemAlloc blocks come from a heap of their own instead of the CRT heap (LEONIDA_TITLE_HEAP=0: not). Slot-133
 // imports pin title memory page by page for the GPU, and on the CRT heap a pinned page also holds the runtime's own
 // objects (g_pages' nodes among them): a GPU store past a buffer's end, or into a block freed while its import still
 // lived, then corrupted the runtime (speed-30/41/49-52: g_pages found corrupt under g_phys_mutex). Each block keeps its
@@ -89,8 +89,9 @@ struct TitleHeapHeader {
 };
 HANDLE title_heap() {
     static const HANDLE heap = [] {
+        // Set LEONIDA_TITLE_HEAP=0 to use the CRT heap.
         const char* v = std::getenv("LEONIDA_TITLE_HEAP");
-        if (!v || std::strcmp(v, "1") != 0) return HANDLE(nullptr);
+        if (v && std::strcmp(v, "0") == 0) return HANDLE(nullptr);
         const HANDLE h = HeapCreate(0, 0, 0);
         std::fprintf(stderr, "[rt] xmem: XMemAlloc blocks come from a heap of their own (%p)\n", h);
         return h;
@@ -145,7 +146,12 @@ void free_title_block(void* p) {
     if (p) leonida::title_va_aliases().remove_title_memory(reinterpret_cast<uintptr_t>(p));
     const size_t size = block_size(p);
     free_block(p);
-    if (p) leonida::title_memory_map::changed(p, size ? size : 1);
+    if (p) {
+        const auto from = reinterpret_cast<uintptr_t>(p);
+        const size_t bytes = size ? size : 1;
+        leonida::title_memory_map::changed(p, bytes);
+        leonida::geometry_writes::note_released(from, from + bytes);
+    }
 }
 
 void* __stdcall XMemAlloc(size_t size, uint64_t attributes) {
@@ -391,7 +397,7 @@ uintptr_t stream_cpu, stream_gpu, stream_size;
 bool mirror_stream;
 leonida::host_heap::map<uintptr_t, Window> stream_offsets;
 std::mutex g_phys_mutex;
-std::map<uintptr_t, Window> g_windows;              // base -> window
+leonida::host_heap::map<uintptr_t, Window> g_windows;  // base -> window (host_heap: see g_pages)
 // The same table for the fault handler, which may not wait for g_phys_mutex: a holder of that mutex allocates
 // (g_mapped, g_windows) and the faulting title thread can hold the process heap's lock (see g_fault_lock). Host heap,
 // read and written under g_fault_lock.
@@ -400,7 +406,10 @@ leonida::host_heap::map<uintptr_t, Window> g_fault_windows;
 // until the title releases them (TitleVirtualFree). With the windows these are the title's reserved memory: the only
 // place the fault handler commits a mapped section page it has no view of (commit_title_section_page).
 leonida::host_heap::map<uintptr_t, Window> g_title_placeholders;
-std::unordered_map<uint64_t, PhysicalPage> g_pages;  // page number -> backing
+// Keep page table nodes on the runtime heap alongside the window table.
+std::unordered_map<uint64_t, PhysicalPage, std::hash<uint64_t>, std::equal_to<uint64_t>,
+                   leonida::host_heap::Allocator<std::pair<const uint64_t, PhysicalPage>>>
+    g_pages;  // page number -> backing
 std::vector<uint64_t> g_free_slots;
 uint64_t g_next_slot = 1;
 // A mapped run: `count` pages of one section at consecutive offsets, mapped as one view at its base. One view per run
@@ -797,10 +806,15 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
     const DWORD host_type = allocation_type & kXmemHostAllocationTypeMask;
     if (result && host_type && !(host_type & MEM_COMMIT)) {
         const bool gpu_only = (protect & kPageGraphicsMask) && host_protect(protect) == PAGE_NOACCESS;
-        if (leonida::title_gpu_views::note_reservation(reinterpret_cast<uintptr_t>(result), size, gpu_only))
-            std::fprintf(stderr, "[rt] xmem: GPU-only view %p (%llu MiB, protect 0x%lx) reads at the CPU view %p\n",
+        const auto base = reinterpret_cast<uintptr_t>(result);
+        const bool stream_queue_view = allocation_type == 0x20402000 && gpu_only &&
+            reinterpret_cast<uintptr_t>(_ReturnAddress()) - kTitleImage == 0x1e1d03e &&
+            rt::xmem::slot31_runs() && rt::xmem::queue_page_mappings_enabled();
+        if (leonida::title_gpu_views::note_reservation(base, size, gpu_only, stream_queue_view))
+            std::fprintf(stderr, "[rt] xmem: GPU-only view %p (%llu MiB, protect 0x%lx) paired with CPU view %p (%s)\n",
                          result, static_cast<unsigned long long>(size >> 20), static_cast<unsigned long>(protect),
-                         reinterpret_cast<void*>(leonida::title_gpu_views::to_cpu(reinterpret_cast<uintptr_t>(result))));
+                         reinterpret_cast<void*>(leonida::title_gpu_views::other_view(base)),
+                         stream_queue_view ? "separate queue mappings" : "CPU backing");
         else if (gpu_only && size >= (64u << 20))
             std::fprintf(stderr, "[rt] xmem: GPU-only reservation %p (%llu MiB, protect 0x%lx) has no CPU view\n", result,
                          static_cast<unsigned long long>(size >> 20), static_cast<unsigned long>(protect));
@@ -1823,8 +1837,13 @@ void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint
     const uintptr_t end = start + page_count * kPhysicalPageSize;
     const UnmapCause cause(page_array ? "XMemMapPhysicalPages (remap)" : "XMemMapPhysicalPages (unmap)");
     if (!page_array) {
-        const FaultLockExclusive view_lock;
-        return unmap_range_locked(start, end) ? address : nullptr;
+        bool ok = false;
+        {
+            const FaultLockExclusive view_lock;
+            ok = unmap_range_locked(start, end);
+        }
+        if (ok) leonida::geometry_writes::note_released(start, end);
+        return ok ? address : nullptr;
     }
     const Window* const window = find_window(start, page_count * kPhysicalPageSize);
     if (!window) {
@@ -2196,6 +2215,14 @@ BOOL title_release(void* address, SIZE_T size, DWORD free_type, const void* call
 BOOL title_free_impl(LPVOID address, SIZE_T size, DWORD free_type) {
     drain_fault_notes();
     const bool releases = (free_type & MEM_RELEASE) && !(free_type & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS));
+    const uintptr_t start = reinterpret_cast<uintptr_t>(address);
+    uintptr_t release_end = 0;
+    if (releases && address) allocation_extent(address, release_end);
+    uintptr_t decommit_end = 0;
+    if ((free_type & MEM_DECOMMIT) && address) {
+        decommit_end = size ? start + size : leonida::title_write_watch::end_of(start);
+        if (decommit_end <= start) allocation_extent(address, decommit_end);
+    }
     BOOL result;
     if (releases) {
         result = title_release(address, size, free_type, _ReturnAddress());
@@ -2213,6 +2240,10 @@ BOOL title_free_impl(LPVOID address, SIZE_T size, DWORD free_type) {
     if (result && (free_type & MEM_DECOMMIT)) note_unwatched_change(address, size, 0, true);
     if (result && (free_type & MEM_RELEASE) && !(free_type & MEM_PRESERVE_PLACEHOLDER))
         leonida::title_write_watch::remove(reinterpret_cast<uintptr_t>(address));
+    if (result && releases && release_end > start)
+        leonida::geometry_writes::note_released(start, release_end);
+    if (result && (free_type & MEM_DECOMMIT) && decommit_end > start)
+        leonida::geometry_writes::note_released(start, decommit_end);
     return result;
 }
 
@@ -2434,6 +2465,7 @@ bool copy_page_mappings(std::uint32_t count, const PageBatch* batches, std::uint
             if (!mirror && r.spec.kind == 2) {
                 const UnmapCause cause("CopyPageMappingsBatchX (unmap range)");
                 ok = unmap_range(r.at, r.at + bytes);
+                if (ok) leonida::geometry_writes::note_released(r.at, r.at + bytes);
             } else if (!mirror && !slot31_runs()) {
                 for (uint32_t j = 0; j < r.spec.count; ++j) {
                     const auto at = r.at + uint64_t(j) * kPhysicalPageSize;

@@ -32,6 +32,7 @@
 
 #include "../src/root_signature.h"
 #include "../src/subgroup_size.h"
+#include "../src/vulkan_memory_budget.h"
 
 namespace leonida {
 class VulkanPresenter;
@@ -103,14 +104,20 @@ struct VulkanDeviceInfo {
     std::vector<VkQueue> compute_queues;
     std::vector<VkQueue> copy_queues;
     bool pipeline_creation_feedback = false;
+    // Vulkan 1.3 pipelineCreationCacheControl, enabled: FAIL_ON_PIPELINE_COMPILE_REQUIRED asks a cache without a compile.
+    // Implies core VkPipelineCreationFeedback, which then needs no extension.
+    bool pipeline_cache_control = false;
     bool device_fault_diagnostics = false;
     bool device_fault_info = false;
     bool device_checkpoints = false;
     bool device_diagnostics_config = false;
+    bool device_markers = false;  // VK_AMD_buffer_marker enabled for LEONIDA_DEVICE_MARKERS=1
     bool separate_depth_stencil_layouts = true;
     bool depth_range_unrestricted = false;  // VK_EXT_depth_range_unrestricted enabled on this device.
     std::uint32_t max_push_constants_size = 0;
     bool push_constants_need_fallback = false;
+    // Top location for relocated f16 halves (0: read from device limits; non-zero: override for testing low-limit devices).
+    std::uint32_t f16_half_top_location = 0;
     // maxBufferSize and maxMemoryAllocationSize, which cap the GPU address arena (src/arena_size.h). 0: read from
     // the physical device when the D3D12 device is created; a test sets smaller ones to simulate a device.
     VkDeviceSize max_buffer_size = 0;
@@ -217,13 +224,20 @@ struct VulkanDeviceInfo {
     // VK_EXT_mesh_shader's meshShaderQueries feature is enabled on `device`, so the clipping invocations of a mesh
     // segment come from a mesh-primitives query (D3D-MESH-CLIPPING-COUNTER). Without it they read 0.
     bool mesh_shader_queries = false;
-    // VK_EXT_transform_feedback with its transformFeedback feature is detected and enabled on `device` (D3D-302).
-    // Nothing uses it yet: a graphics PSO that declares StreamOutput is still refused and SOSetTargets is still not
-    // implemented. (#1630 adds the SO_STATISTICS query pools, which use it.)
+    // VK_EXT_transform_feedback with its transformFeedback feature is enabled on `device` (D3D-302): an
+    // SO_STATISTICS heap is a real VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT pool, begun and ended indexed on the
+    // stream. StreamOutput PSOs are still refused and SOSetTargets is still not implemented.
     bool transform_feedback = false;
-    // VK_EXT_transform_feedback's geometryStreams feature is enabled when the device offers it. Nothing rasterizes a
-    // StreamOutput RasterizedStream yet; it is here for the capture implementation that follows.
+    // VK_EXT_transform_feedback's geometryStreams feature is offered by the device. The device-enable chain requests
+    // it when present so the pipeline cache key matches vk_pipeline_check; nothing rasterizes a stream other than 0.
     bool transform_feedback_geometry_streams = false;
+    // VK_EXT_transform_feedback's transformFeedbackQueries property (D3D-302): the device can begin/end a
+    // VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT query. Without it an SO_STATISTICS heap is made without a pool and
+    // every SO_STATISTICS query resolves zero, even when the transformFeedback feature is enabled.
+    bool transform_feedback_queries = false;
+    // The device's maxTransformFeedbackStreams property: an SO_STATISTICS_STREAMn query runs only for n below it.
+    // Streams from this count up (to the D3D12 maximum of four) run nothing and resolve zero.
+    std::uint32_t max_transform_feedback_streams = 0;
     // The core features enabled on `device`. Graphics PSOs that need independentBlend, fillModeNonSolid,
     // depthBiasClamp or dualSrcBlend are refused unless it is set here.
     VkPhysicalDeviceFeatures features{};
@@ -248,6 +262,9 @@ struct VulkanDeviceInfo {
     bool draw_indirect_count_enabled = false;
     // Both VK_KHR_maintenance5 and robustBufferAccess2 (with core robustBufferAccess) are enabled.
     bool robust_index_view = false;
+    // VK_EXT_memory_budget is enabled on `device`: vulkan_vram_budget reads the GPU memory in use and the budget
+    // from it (the title HUD's VRAM figure). Without it that figure is not available.
+    bool memory_budget = false;
     std::uint32_t max_draw_indirect_count = 1;
 };
 
@@ -285,6 +302,11 @@ HRESULT create_console_descriptor_heap(ID3D12Device* device, const D3D12_DESCRIP
                                        D3D12_GPU_VIRTUAL_ADDRESS console_address, std::uint64_t console_size,
                                        REFIID riid, void** out);
 
+// Calls `fn` on the device's fence-wait thread once `fence` (a fence of such a device) reaches `value` (at once on that
+// thread if it has). Released or device lost, `fn` still runs once: it must not use the fence then. False for a fence
+// of another kind. For the console fence's slot-12 mirror (d3d12_xs_device.cpp).
+bool fence_callback_at(ID3D12Fence* fence, std::uint64_t value, std::function<void()> fn);
+
 // The VkImage behind a texture created by such a device, or VK_NULL_HANDLE. For tests and the swapchain.
 VkImage vulkan_image(ID3D12Resource* resource);
 // Resolves the resource that a UAV clear writes. Xbox depth/stencil UAVs name one of two color images by T#.
@@ -293,6 +315,10 @@ leonida::ResourceId uav_image_resource(ID3D12Resource* resource, std::uint64_t a
 VkBuffer vulkan_buffer(ID3D12Resource* resource);
 // What a device from create_vulkan_device* was created with (enabled features included), or null. For tests.
 const VulkanDeviceInfo* vulkan_device_info(ID3D12Device* device);
+// The GPU memory a device from create_vulkan_device* (or its Xbox-ABI proxy) uses and may use, from
+// VK_EXT_memory_budget, read now (src/vulkan_memory_budget.h). Not available without the extension or the device.
+// Any thread: the title HUD calls it from its own, at most once per refresh.
+leonida::VramBudget vulkan_vram_budget(ID3D12Device* device);
 // The device's pipeline workers (src/pipeline_workers.h) and what they have compiled; zeros without any. For tests.
 leonida::PipelineWorkers::Stats pipeline_worker_stats(ID3D12Device* device);
 // True when a slot-133 buffer is a shadow copied from the title's pages, false when they were imported. For tests.
@@ -559,8 +585,16 @@ struct RootArgumentLayout {
 const RootArgumentLayout* root_signature_layout(ID3D12RootSignature* signature);
 std::uintptr_t compute_pipeline_id(ID3D12PipelineState* pipeline);
 std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline);
+// Record time, for LEONIDA_ASYNC_PIPELINES=1: starts the pipeline's build on the compile worker before the list is
+// submitted, without waiting (PipelineState::queue_build). `id` is what compute_pipeline_id or graphics_pipeline_id gave (0:
+// nothing). Compute: at SetPipelineState; graphics: at each draw, with the render-target slots it binds (bit per slot)
+// and whether it binds a depth buffer.
+void request_pipeline_build(std::uintptr_t id, std::uint32_t bound_targets, bool depth_bound);
 // What each stage of a Vulkan device's PSO asked for (src/subgroup_size.h), in creation order; null for another PSO.
 const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12PipelineState* pipeline);
+// The linked SPIR-V stage modules for a lazy pipeline (in recipe stages order); false when not a lazy pipeline.
+bool pipeline_stage_words(ID3D12PipelineState* pipeline, std::vector<std::vector<std::uint32_t>>& words,
+                          std::string& why);
 // PSOs of any Vulkan device not yet deleted, counting one whose deletion waits for its running build (tests).
 long live_pipeline_states();
 
@@ -586,6 +620,8 @@ bool write_placed_texture_view(ID3D12Device* device, bool unordered, const std::
 // The VA shaders read a descriptor table at: for one inside a console descriptor heap (Xbox slot 14) whose arena copy
 // lies elsewhere, the matching VA in that copy; any other VA unchanged.
 D3D12_GPU_VIRTUAL_ADDRESS console_descriptor_table_va(D3D12_GPU_VIRTUAL_ADDRESS va);
+// The console descriptor heap holding `va` (its console VA and bytes); false when none with a copy holds it.
+bool console_descriptor_heap_range(D3D12_GPU_VIRTUAL_ADDRESS va, std::uint64_t& console_va, std::uint64_t& bytes);
 
 // XDXR acceleration-structure commands (docs/d3d12_vulkan.md 4.8) of a list of `device`: every address the command
 // writes or reads, as the title named it, becomes the VA shaders reach that memory by (src/title_va_alias.h: a

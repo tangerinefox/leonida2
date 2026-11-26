@@ -323,8 +323,8 @@ The loader-side runs behind these numbers are recorded in [`runtime/test/bink_de
   1-, 2-, and 4-track samples; later frames were not swept and may return 7,680 or 0 bytes). Which language or mix
   role the game assigns to track IDs `0, 1, 2, 3` at run time remains unknown.
 - **Startup playback.** In two boots the title opened the archive twice about 1.2 s after entering the loader.
-  The separately loaded `Bink2Scarlett.dll` opens metadata at title RVA `0x442ebe6`; playback retains the handle
-  at `0x442f056` and registers mapped frame buffers at `0x442f9b8`. The frame wrapper at `0x2ef0e0` has a CPU
+  The separately loaded `Bink2Scarlett.dll` opens the metadata from the title; playback retains the handle
+  and registers mapped frame buffers. The title's frame wrapper has a CPU
   multi-worker decode and wait path and a synchronous fallback. Three rotating sets of linear R8 planes (one
   3840×2160 and two 1920×1080 per set) reach the slot-133 texture uploader. `VS_Bink` / `PS_BinkNoAlpha` bind
   the three plane descriptors at table offsets 0x20, 0x40 and 0x60 and draw to an RGBA8 intermediate. The UI

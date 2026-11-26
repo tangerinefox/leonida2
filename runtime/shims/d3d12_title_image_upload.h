@@ -219,11 +219,15 @@ private:
         transfer.pCommandBuffers = &slot.command;
         transfer.signalSemaphoreCount = 1;
         transfer.pSignalSemaphores = &ready_;
-        auto r = vk.vkQueueSubmit(d.info.queue, 1, &transfer, VK_NULL_HANDLE);
+        // Through the compile gate, as every other submission: it waits here, not in the driver, while a pipeline
+        // create holds it, and the caller observes a device loss from it.
+        auto r = d.context->queue_submit(d.info.queue, 1, &transfer, VK_NULL_HANDLE);
         if (r != VK_SUCCESS) {
-            --value_;
+            --value_;  // nothing signalled it
             return r;
         }
+        // No CPU wait: the slot's buffer is reused only after this value (wait_slot), the image's later reads are
+        // ordered behind the transfer on the GPU, and a retired image is destroyed through the deferred queue.
         slot.value = value_;
         // GPU writes become visible to later submissions on every other queue. The primary queue has the image barrier.
         VkTimelineSemaphoreSubmitInfo acquire{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
@@ -235,7 +239,7 @@ private:
         wait.pWaitSemaphores = &ready_;
         wait.pWaitDstStageMask = &stages;
         for (auto q : consumers_)
-            if ((r = vk.vkQueueSubmit(q, 1, &wait, VK_NULL_HANDLE)) != VK_SUCCESS) return r;
+            if ((r = d.context->queue_submit(q, 1, &wait, VK_NULL_HANDLE)) != VK_SUCCESS) return r;
         return VK_SUCCESS;
     }
 

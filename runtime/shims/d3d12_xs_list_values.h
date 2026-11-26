@@ -602,7 +602,9 @@ private:
             stall_logged_ = false;
             return;
         }
-        const std::uint64_t ms = GetTickCount64() - since;
+        // `since` is the start tick with its low bit set (never 0 while inside), so it can be one past now.
+        const std::uint64_t now = GetTickCount64();
+        const std::uint64_t ms = now > since ? now - since : 0;
         if (ms < kStallMs || stall_logged_) return;
         stall_logged_ = true;
         bump(counters().release_stalls);

@@ -84,6 +84,15 @@ class CTestRegistrationTest(unittest.TestCase):
             src.write_text('std::printf("SKIP: none\\n");\nreturn kUnknown;\n', encoding="utf-8", newline="\n")
             self.assertEqual(whole_test_skips_not_77(cmake, Path(tmp)), [("test/a_test.cpp:2", "kUnknown")])
 
+    def test_host_parity_and_storage_tests_have_timeouts(self):
+        for test_name in ("dstorage", "dxgi_host_parity", "dxgi_waitable_latency"):
+            m = re.search(
+                r"set_tests_properties\(\s*" + test_name + r"\b[^)]*TIMEOUT\s+[1-9]\d*",
+                self.cmake,
+                re.S,
+            )
+            self.assertIsNotNone(m, f"{test_name} must have an explicit TIMEOUT property")
+
 
 def whole_test_skips_not_77(cmake_text, runtime_dir):
     """[(source:line, code)] for a SKIP print directly followed by `return N;` (N != 77) in the sources of a test

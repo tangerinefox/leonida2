@@ -1,17 +1,21 @@
 // Timing and scheduling for Vulkan pipeline creation on the D3D12 device.
 #pragma once
 
+#include "../src/vulkan_device_fault.h"
 #include "../src/vulkan_replay.h"
 #include <windows.h>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <functional>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <string>
+#include <cstring>
 #include <vector>
 
 namespace rt::d3d12 {
@@ -29,6 +33,30 @@ inline bool async_replay_compile() {
         return GetEnvironmentVariableW(L"LEONIDA_ASYNC_PIPELINES", v, 2) == 1 && v[0] == L'1';
     }();
     return on && !leonida::strict_replay();
+}
+
+// LOCAL FIX (post-load stalls): LEONIDA_FAST_PIPELINES=graphics, compute, or all (1 = all) creates those pipelines with
+// VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT. After the story load, graphics creates measured about 4.5 s each, and
+// every submission waits at the compile gate while one is in the driver (frames stopped for 130 s); the title's large
+// compute programs take 30-220 s each. Slower shaders, much shorter builds: the trade for reaching the world before
+// it looks right. The flag is part of the compute journal key, so optimized and fast builds keep separate files.
+inline VkPipelineCreateFlags fast_pipeline_flags(bool compute) {
+    static const unsigned mask = [] {
+        wchar_t v[16]{};
+        const DWORD n = GetEnvironmentVariableW(L"LEONIDA_FAST_PIPELINES", v, 16);
+        unsigned m = 0;
+        if (n > 0 && n < 16) {
+            if (!wcscmp(v, L"1") || !_wcsicmp(v, L"all")) m = 3;
+            else if (!_wcsicmp(v, L"graphics")) m = 1;
+            else if (!_wcsicmp(v, L"compute")) m = 2;
+            else std::fprintf(stderr, "[rt] d3d12: LEONIDA_FAST_PIPELINES: unknown value, ignored (graphics, compute, all)\n");
+        }
+        if (m)
+            std::fprintf(stderr, "[rt] d3d12: LEONIDA_FAST_PIPELINES: %s pipelines are built without driver optimization\n",
+                         m == 3 ? "graphics and compute" : m == 1 ? "graphics" : "compute");
+        return m;
+    }();
+    return (mask & (compute ? 2u : 1u)) ? VkPipelineCreateFlags(VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT) : 0;
 }
 
 // Absolute monotonic timestamps let trace readers distinguish time in the ICD from time queued for the worker.
@@ -59,29 +87,106 @@ struct CompileTrace {
                                                nullptr, &feedback, 0, nullptr};
     long long started = 0;
     const char* key = "-";
+    bool linked = false;  // chain is in a create info's pNext chain
 
     template<class Info> void begin(Info& info, bool supported, const char* trigger, const char* shaders,
                                     std::uint32_t variant, std::size_t bytes, const std::string& description_key) {
         if (!trace_pipeline_compile()) return;
         if (!description_key.empty()) key = description_key.c_str();
-        if (supported) {
-            chain.pNext = info.pNext;
-            info.pNext = &chain;
-        }
+        if (supported) request_feedback(info);
         std::fprintf(stderr, "[rt] pipeline-compile-begin trigger=%s tid=%lu bytes=%zu variant=%u begin_ms=%lld key=%s shaders=%s\n",
                      trigger, GetCurrentThreadId(), bytes, variant, compile_wall_ms(), key, shaders);
         started = compile_us();
     }
 
+    // Chains the feedback struct ahead of info.pNext, once. begin() does when tracing; the pipeline journal does on a
+    // Vulkan 1.3 device (feedback is core there) to learn whether a pipeline came out of its cache.
+    template<class Info> void request_feedback(Info& info) {
+        if (linked) return;
+        chain.pNext = info.pNext;
+        info.pNext = &chain;
+        linked = true;
+    }
+
+    // 1 when the driver reports the pipeline was found in the application's VkPipelineCache, 0 when it reports it was
+    // not, -1 when it reported nothing (no feedback chained, or not VALID).
+    int hit() const {
+        return !(feedback.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT) ? -1 :
+               int((feedback.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT) != 0);
+    }
+
     void end(const char* trigger, const char* shaders, std::uint32_t variant, std::size_t bytes, VkResult result) const {
         if (!started) return;
         const auto ended = compile_us();
-        const int hit = !(feedback.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT) ? -1 :
-                        int((feedback.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT) != 0);
+        const int hit = this->hit();
         std::fprintf(stderr, "[rt] pipeline-compile trigger=%s tid=%lu start_us=%lld us=%lld hit=%d bytes=%zu "
                              "variant=%u result=%d end_ms=%lld key=%s shaders=%s\n", trigger, GetCurrentThreadId(), started,
                              ended - started, hit, bytes, variant, int(result), compile_wall_ms(), key, shaders);
     }
+};
+
+// The triggers of builds on the compile worker (PipelineCompiler): "warmup", "dispatch-worker", "draw-worker".
+inline bool compile_worker_trigger(const char* trigger) {
+    if (!trigger) return false;
+    const std::size_t n = std::strlen(trigger);
+    return !std::strcmp(trigger, "warmup") || (n > 7 && !std::strcmp(trigger + n - 7, "-worker"));
+}
+
+// LOCAL FIX (early device loss): one driver call that builds or drops shader code, kept out of the way of queue
+// submissions (leonida::SubmitMutex). Before the call:
+//   - let_submit_finish: a submit in progress finishes first. The compile worker also lets the submitters queued
+//     behind it go first, and does so before its vkCreateShaderModule and vkDestroyShaderModule too; a title thread
+//     waits only for the holder, and only before a pipeline create (it may wait out a vkDeviceWaitIdle or a present:
+//     waits of 50 ms or more are logged).
+//   - a pipeline create passes the compile gate (SubmitMutex::CompileTurn) for the length of the call.
+//   - the compile worker, which runs below normal priority, runs the call at normal priority, so a preempted worker
+//     does not sit on a driver lock a submit waits for.
+class DriverTurn {
+public:
+    DriverTurn(leonida::SubmitMutex& submits, const char* trigger, const char* call, bool pipeline,
+               const char* name = nullptr)
+        : worker_(compile_worker_trigger(trigger)) {
+        // Normal priority first: a below-normal worker that waits its turn at normal priority cannot keep losing the
+        // race to the next submit, and holds the gate (below) only at normal priority.
+        if (worker_) {
+            const HANDLE self = GetCurrentThread();
+            const int priority = GetThreadPriority(self);
+            if (priority != THREAD_PRIORITY_ERROR_RETURN && priority < THREAD_PRIORITY_NORMAL &&
+                SetThreadPriority(self, THREAD_PRIORITY_NORMAL))
+                restore_ = priority;
+        }
+        if (worker_ || pipeline) {
+            const std::int64_t waited = submits.let_submit_finish(worker_);
+            if (waited >= 50) note("waited for the submit lock", trigger, call, name, waited);
+        }
+        if (pipeline) {
+            gate_.emplace(submits);
+            if (gate_->waited_ms() >= 50) note("waited at the compile gate", trigger, call, name, gate_->waited_ms());
+        }
+    }
+    ~DriverTurn() {
+        // Leave the gate before dropping back to below normal: a worker preempted while still counted in the gate
+        // would hold every submitter waiting there (each with the submit lock held) until the scheduler's starvation
+        // boost runs it again.
+        gate_.reset();
+        if (restore_ != THREAD_PRIORITY_ERROR_RETURN) SetThreadPriority(GetCurrentThread(), restore_);
+    }
+    DriverTurn(const DriverTurn&) = delete;
+    DriverTurn& operator=(const DriverTurn&) = delete;
+
+private:
+    // Every wait of a second or more, and the first 32 of 50 ms or more.
+    static void note(const char* what, const char* trigger, const char* call, const char* name, std::int64_t ms) {
+        static std::atomic<unsigned> logged{0};
+        if (ms < 1000 && logged.fetch_add(1, std::memory_order_relaxed) >= 32) return;
+        std::fprintf(stderr, "[rt] submit-handoff: %s (%s, %s) on thread %lu %s %lld ms at t=%.3f s\n", call,
+                     trigger ? trigger : "-", name ? name : "-", GetCurrentThreadId(), what, static_cast<long long>(ms),
+                     double(leonida::diagnostic_ms()) / 1000.0);
+    }
+
+    bool worker_;
+    std::optional<leonida::SubmitMutex::CompileTurn> gate_;
+    int restore_ = THREAD_PRIORITY_ERROR_RETURN;
 };
 
 
@@ -116,27 +221,32 @@ public:
         std::uint64_t deferred = 0;   // after_running calls that left something to run after a running job
     };
 
-    // False, with nothing queued, after stop_for_exit.
-    bool submit(const void* owner, const void* device, std::size_t priority, std::function<void()> work) {
+    // False, with nothing queued, after stop_for_exit. A `graphics` job (a graphics pipeline build) may also run on a
+    // second worker that takes only graphics jobs, so a compute build the driver takes minutes over does not hold
+    // up later graphics pipelines. LEONIDA_GRAPHICS_COMPILE_WORKER=0 uses one shared worker.
+    bool submit(const void* owner, const void* device, std::size_t priority, std::function<void()> work,
+                bool graphics = false) {
         std::lock_guard lock(mutex_);
         if (closed_) {
             ++stats_.refused;
             return false;
         }
         if (!worker_.joinable()) {
-            const std::uint64_t generation = ++generation_;
-            worker_ = std::thread([this, generation] { run(generation); });
+            const std::uint64_t generation = generation_;
+            worker_ = std::thread([this, generation] { run(generation, false); });
         }
-        jobs_.emplace(priority, Job{owner, device, std::move(work)});
+        if (graphics && graphics_worker_enabled() && !graphics_worker_.joinable()) {
+            const std::uint64_t generation = generation_;
+            graphics_worker_ = std::thread([this, generation] { run(generation, true); });
+        }
+        jobs_.emplace(priority, Job{owner, device, std::move(work), graphics});
         ++stats_.submitted;
-        wake_.notify_one();
+        wake_.notify_all();
         return true;
     }
 
-    bool closed() {
-        std::lock_guard lock(mutex_);
-        return closed_;
-    }
+    // Lock-free: replay asks at every draw and dispatch whose pipeline is not built yet.
+    bool closed() const { return closed_flag_.load(std::memory_order_acquire); }
 
     bool has_compile_waiter() {
         std::lock_guard lock(mutex_);
@@ -206,7 +316,7 @@ public:
     }
     void release() {
         std::vector<Job> dropped;
-        std::thread worker;
+        Workers worker;
         {
             std::lock_guard lock(mutex_);
             if (users_ && --users_) return;
@@ -219,11 +329,12 @@ public:
     // one, so ExitProcess does not end the worker inside the driver. False when a job was still running.
     bool stop_for_exit(std::chrono::milliseconds wait) {
         std::vector<Job> dropped;
-        std::thread worker;
+        Workers worker;
         bool idle = true;
         {
             std::unique_lock lock(mutex_);
             closed_ = true;
+            closed_flag_.store(true, std::memory_order_release);
             worker = stop_locked(dropped);
             const auto me = std::this_thread::get_id();
             idle = done_.wait_for(lock, wait, [&] {
@@ -240,7 +351,7 @@ public:
     }
     bool worker_running() {
         std::lock_guard lock(mutex_);
-        return worker_.joinable();
+        return worker_.joinable() || graphics_worker_.joinable();
     }
     // Tests: called on the worker with each job's owner, once the job counts as running and before its work.
     void set_job_probe(std::function<void(const void* owner)> probe) {
@@ -253,6 +364,18 @@ private:
         const void* owner = nullptr;
         const void* device = nullptr;
         std::function<void()> work;
+        bool graphics = false;  // a graphics pipeline build: the graphics worker may take it too
+    };
+    static bool graphics_worker_enabled() {
+        static const bool on = [] {
+            wchar_t v[2]{};
+            return !(GetEnvironmentVariableW(L"LEONIDA_GRAPHICS_COMPILE_WORKER", v, 2) == 1 && v[0] == L'0');
+        }();
+        return on;
+    }
+    // Both workers: the general one, and the graphics one when it was started.
+    struct Workers {
+        std::thread general, graphics;
     };
     struct Running {
         const void* owner;
@@ -274,11 +397,11 @@ private:
         }
     }
 
-    std::thread stop_locked(std::vector<Job>& dropped) {
+    Workers stop_locked(std::vector<Job>& dropped) {
         drop_locked(dropped, [](const Job&) { return true; });
-        ++generation_;  // the worker returns when it next looks: after the job it is running, if any
+        ++generation_;  // the workers return when they next look: after the job each is running, if any
         wake_.notify_all();
-        return std::move(worker_);
+        return {std::move(worker_), std::move(graphics_worker_)};
     }
 
     static void finish(std::thread worker, bool join) {
@@ -286,19 +409,30 @@ private:
         if (join && worker.get_id() != std::this_thread::get_id()) worker.join();
         else worker.detach();
     }
+    static void finish(Workers workers, bool join) {
+        finish(std::move(workers.general), join);
+        finish(std::move(workers.graphics), join);
+    }
 
     Running& mine(std::thread::id me) {
         return *std::find_if(running_.begin(), running_.end(), [me](const Running& r) { return r.thread == me; });
     }
 
-    void run(std::uint64_t generation) {
+    // The first job this worker may take, most urgent first: any job for the general worker, a graphics job for the
+    // graphics one.
+    std::multimap<std::size_t, Job>::iterator next_locked(bool graphics_only) {
+        if (!graphics_only) return jobs_.begin();
+        return std::find_if(jobs_.begin(), jobs_.end(), [](const auto& entry) { return entry.second.graphics; });
+    }
+
+    void run(std::uint64_t generation, bool graphics_only) {
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
         const auto me = std::this_thread::get_id();
         std::unique_lock lock(mutex_);
         for (;;) {
-            wake_.wait(lock, [&] { return generation_ != generation || !jobs_.empty(); });
+            wake_.wait(lock, [&] { return generation_ != generation || next_locked(graphics_only) != jobs_.end(); });
             if (generation_ != generation) return;
-            auto first = jobs_.begin();
+            auto first = next_locked(graphics_only);
             Job job = std::move(first->second);
             jobs_.erase(first);
             running_.push_back({job.owner, job.device, me});
@@ -338,9 +472,11 @@ private:
     std::multimap<std::size_t, Job> jobs_;
     std::vector<Running> running_;  // one per worker; a stopped worker may still be finishing one
     std::thread worker_;
+    std::thread graphics_worker_;  // graphics jobs only (submit's `graphics`), started at the first one
     std::uint64_t generation_ = 0;  // a worker runs while this is the value it started with
     unsigned users_ = 0;            // live devices (retain/release)
     bool closed_ = false;           // stop_for_exit: nothing more is queued
+    std::atomic<bool> closed_flag_{false};  // closed_, for closed()
     Stats stats_;
     std::function<void(const void*)> probe_;
 };

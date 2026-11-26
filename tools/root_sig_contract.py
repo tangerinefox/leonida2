@@ -21,8 +21,8 @@ import json
 import sys
 
 # Packing order mirrors runtime/src/root_signature.{h,cpp}: constants take
-# NumValues dwords, root descriptors and tables take 2 (VA lo/hi), static
-# samplers take none. With a stage (--model console) it mirrors pack_stage():
+# NumValues dwords (none for 0 values), root descriptors and tables take 2
+# (VA lo/hi), static samplers take none. With a stage (--model console) it mirrors pack_stage():
 # from the stage's base, a table takes ONE dword (its 32-bit VA), and the
 # SGPRs below the base are the driver's (D3D-448).
 STAGE_BASE = {"ps": 8, "vs": 8, "gs": 8, "cs": 4, "ms": 16}
@@ -66,8 +66,11 @@ def pack_layout(sig, stage=None):
         ptype = p.get("type", "")
         if ptype == "constants":
             count = p.get("count", 0)
-            if type(count) is not int or count < 1:
-                return [], f"param {index}: constants need an integer count >= 1"
+            # A count of 0 is valid, as in rt::rootsig::pack and pack_stage: the host serializer warns and
+            # CreateRootSignature answers S_OK. Such a parameter takes no dwords and its neighbours pack as if it
+            # were absent.
+            if type(count) is not int or count < 0:
+                return [], f"param {index}: constants need an integer count >= 0"
             width, cost_add = count, count
         elif ptype in ("cbv", "srv", "uav"):
             width, cost_add = 2, 2

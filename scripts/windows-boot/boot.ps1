@@ -66,7 +66,7 @@
 
 .PARAMETER EnvPairs
     Any further arguments, each KEY=VALUE, as scripts/linux-boot/run-boot.sh takes them. These work with
-    powershell -File too:  ... -Name x LEONIDA_PRESENT_PLANE1=0 "LEONIDA_PEEK=0x7446510,0x75e8eb0".
+    powershell -File too:  ... -Name x LEONIDA_PRESENT_PLANE1=0 "LEONIDA_PEEK=<rva>,<rva>".
     Applied after -SetEnv. KEY= removes the variable for this boot.
 
 .PARAMETER NoCapture
@@ -97,7 +97,7 @@
     powershell -NoProfile -File scripts\windows-boot\boot.ps1 -Name first -Seconds 200 -GameDir D:\GTA6pkg -Shaders E:\leonida-work\shaders\spirv
 
 .EXAMPLE
-    powershell -NoProfile -File scripts\windows-boot\boot.ps1 -Name stall -Seconds 90 -Stacks 40,80 "LEONIDA_PEEK=0x7446510,0x75e8eb0,0x75e8ea0,0x9844898"
+    powershell -NoProfile -File scripts\windows-boot\boot.ps1 -Name stall -Seconds 90 -Stacks 40,80 "LEONIDA_PEEK=<rva>,<rva>"
 
 .EXAMPLE
     powershell -NoProfile -File scripts\windows-boot\boot.ps1 -DigestOnly -Name first
@@ -234,7 +234,8 @@ $defaults = [ordered]@{
     LEONIDA_PIPELINE_CACHE_BYTES      = "4294967296"
     LEONIDA_STARTUP_CACHE_CHECKPOINTS = "1"
     LEONIDA_PIPELINE_CACHE_DIR        = (Join-Path $OutDir "pipeline-cache")
-    LEONIDA_PEEK                      = "0x7446510,0x98f828c"   # game state, session state (low dword)
+    # LEONIDA_PEEK: the game-state and session-state RVAs (measured locally, not kept in the repository) when
+    # LEONIDA_GAME_STATE_RVA and LEONIDA_SESSION_STATE_RVA name them; see below.
     LEONIDA_PEEK_SECONDS              = "5"
     LEONIDA_DEVICE_FAULT              = "1"            # device-loss report (VK_EXT_device_fault, checkpoints)
     LEONIDA_CAPTURE_EVERY             = "60"
@@ -243,6 +244,14 @@ $defaults = [ordered]@{
     DISABLE_VULKAN_OBS_CAPTURE        = "1"
 }
 if ($InputScript) { $defaults["LEONIDA_KEYBOARD_PAD"] = "always" }
+$gameStateRva = "$env:LEONIDA_GAME_STATE_RVA".ToLowerInvariant() -replace '^0x', ''
+$sessionStateRva = "$env:LEONIDA_SESSION_STATE_RVA".ToLowerInvariant() -replace '^0x', ''
+if ($gameStateRva -and $sessionStateRva) { $defaults["LEONIDA_PEEK"] = "0x$gameStateRva,0x$sessionStateRva" }
+else {
+    # The two RVAs were built in until they were taken out of the repository; say so rather than report "?" silently.
+    Write-Warning ("LEONIDA_GAME_STATE_RVA and LEONIDA_SESSION_STATE_RVA are not both set: no LEONIDA_PEEK by default, " +
+                   "so the RESULT game and session states read '?' (scripts/windows-boot/README.md)")
+}
 # Per-run values: always this script's (from its parameters), whatever the shell has.
 $perRun = [ordered]@{
     LEONIDA_CAPTURE      = $(if ($NoCapture) { "" } else { $Capture })
@@ -393,8 +402,8 @@ if (Test-Path -LiteralPath $LogFile) {
                 $game = "?"; $session = "?"
                 foreach ($v in $valRx.Matches($m.Groups[2].Value)) {
                     $rva = $v.Groups[1].Value; $val = $v.Groups[2].Value
-                    if ($rva -eq "7446510") { $game = $val }
-                    elseif ($rva -eq "98f828c" -and $val -ne "?") {
+                    if ($gameStateRva -and $rva -eq $gameStateRva) { $game = $val }
+                    elseif ($sessionStateRva -and $rva -eq $sessionStateRva -and $val -ne "?") {
                         $low = $val.PadLeft(16, '0').Substring(8).TrimStart('0')   # the session state is the low dword
                         $session = $(if ($low) { $low } else { "0" })
                     }

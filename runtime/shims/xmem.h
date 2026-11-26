@@ -24,6 +24,7 @@ static_assert(sizeof(PageRange) == 12 && sizeof(PageBatch) == 24 && offsetof(Pag
 // Record the two measured stream-pool reservation return sites; other callers are ignored.
 void note_stream_reservation(std::uintptr_t base, std::size_t size, std::uintptr_t caller_rva);
 bool queue_page_mappings_enabled();
+bool slot31_runs();
 bool copy_page_mappings(std::uint32_t count, const PageBatch* batches, std::uintptr_t pool,
                         std::uint32_t pool_pages, std::uint32_t flags);
 

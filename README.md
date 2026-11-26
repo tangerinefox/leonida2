@@ -52,7 +52,10 @@ Original author's Git Mirror: https://git.notrexed.dev/notrexed/Leonida
 **Early. Nothing is playable yet.** On `main`, the game boots from your own copy on native Windows and on Linux
 through Proton: it shows the launch movie, the first-run pages and the landing prompt, which respond to a pad or
 the keyboard pad, then runs the story load to its end and enters the world phase. A first world frame has not been
-verified yet on any test machine. [First-run UI on Windows](docs/first_run_ui.md) has the build and launch steps;
+verified yet on any test machine. On native Windows a scripted pad alone (`LEONIDA_INPUT_SCRIPT`, no keyboard or
+controller) gets through every first-run page, including the legal-terms page whose Confirm waits for both boxes, to
+the loading screen of the story load ([the route](docs/first_run_ui.md#through-the-first-run-pages-with-the-scripted-pad)).
+[First-run UI on Windows](docs/first_run_ui.md) has the build and launch steps;
 [the Linux/Proton report](docs/linux_proton.md) has the timings and where it stops.
 
 | What | Status |

@@ -63,7 +63,10 @@ inline void* commit_reserved(std::uint64_t base, std::uint64_t size) {
 }
 
 // The preferred range of `image` when it has no relocations and that range is not free in this process; nullopt
-// when the image can be mapped as it is (or is not a readable PE32+, which the loader reports itself).
+// when the image can be mapped as it is (or is not a readable PE32+, which the loader reports itself). Without a
+// relocation directory the loader refuses to move an image that has IMAGE_FILE_RELOCS_STRIPPED, and moves one with
+// the flag clear with nothing fixed up: that is right only for an image with no absolute addresses in it, so its
+// range is kept free either way. An image with a relocation table is moved and fixed up whatever the flag says.
 inline std::optional<Range> needed(const std::filesystem::path& image) {
     std::ifstream file(image, std::ios::binary);
     IMAGE_DOS_HEADER dos{};

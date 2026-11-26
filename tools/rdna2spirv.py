@@ -55,7 +55,20 @@ MAX_STRUCTURED_DEPTH = 64
 LOOP_LIMIT = spirv_loop_guard.DEFAULT_LIMIT
 DESCRIPTOR_HASHES = ("fnv1a", "fnv1a_fmix32")
 DESCRIPTOR_HASH = "fnv1a"
+# --descriptor-table: how the table's entries are read. "plain" is what every module read until the T# dimension
+# became part of the contract: key[8], index, and a pad word nothing reads. "tagged" puts the descriptor's kind in
+# that word: one bit per array (ImageDimension) the index is bound in, sampled at bits 0..5 and storage at bits
+# 8..11, so a shader can tell whether the index belongs to the array its instruction reads. A plain library keeps
+# the old modules' code byte for byte (docs/design.md, "Images and samplers (T# dimension)").
+DESCRIPTOR_TABLES = ("plain", "tagged")
+DESCRIPTOR_TABLE = "tagged"
+# The kind word's bit positions, shared with runtime/src/descriptor_table.h.
+DESC_SAMPLED_BIT = 0     # bit i: the index is bound in dimension i's sampled array
+DESC_STORAGE_BIT = 8     # bit 8 + i: ... in its storage arrays (dimensions 0..4 have them)
 WAVE64_EMULATE = False   # --wave64-emulate: wave64 compute/mesh shaders exact on any subgroup size (Gen.x_round)
+# --wave64-emulate: use wave64_emulate_opt's inline structured form when it does not put an exchange barrier
+# under control flow only some invocations take (translate() re-runs this module without it when it does).
+WAVE64_PLAN = True
 # --max-shared-memory: a cap on a compute shader's Workgroup variables, LDS plus %x_buf (SHADER-309, #1721). The
 # default is the hard cap: 64 KiB, RDNA2's LDS per workgroup and the largest maxComputeSharedMemorySize drivers
 # report (RADV, NVIDIA). It is not the device limit: the AMD Windows (RDNA4) and Intel drivers report 32768, the
@@ -282,6 +295,7 @@ class Gen:
     def __init__(self, stage, hoist_reg_ptrs=False, cache_active=False):
         self.stage = stage
         self.descriptor_hash = DESCRIPTOR_HASH
+        self.descriptor_table = DESCRIPTOR_TABLE
         self.hoist_reg_ptrs = hoist_reg_ptrs
         self.reg_ptrs = {}
         self.cache_active = cache_active
@@ -3260,8 +3274,9 @@ class Gen:
         if vdata["k"] != "vgpr":          # `off`, an SGPR or a constant where the VGPR range of the result goes
             raise Unsupported("image_get_lod destination")
         addr = self.addr_regs(a[1])
-        img_idx = self.desc_lookup_sgpr(a[2], 8)
-        smp_idx = self.desc_lookup_sgpr(a[3], 4)
+        img_idx, kind = self.desc_lookup_sgpr(a[2], 8)
+        img_idx = self.desc_sampled_index(img_idx, kind, dim)
+        smp_idx = self.desc_lookup_sgpr(a[3], 4)[0]
         ip, img, sp, smp, si = (self.tmp() for _ in range(5))
         self.dynamic_sampled_access(ip, "%_ptr_UC_imga" if arr else "%_ptr_UC_img",
                                     "%images_arr" if arr else "%images", img_idx)
@@ -4185,6 +4200,46 @@ class Gen:
                 ls, sw3 = self.tmp(), self.tmp()
                 self.emit(f"{ls} = OpIMul %uint {L} {stride}")
                 self.emit(f"{sw3} = OpINotEqual %bool {ls} {self.cu(0)}")
+        mode = None if lit3 is None else lit3 >> 28 & 3
+        # The hardware adds the offset to the 48-bit base without wrapping at 32 bits: index * stride is a full
+        # product and soffset is added in 64 bits. An index of 0xFFFFFFFF with a 20-byte stride therefore lands tens
+        # of GiB past the base, outside every buffer, and the access has no effect. `total` is that offset modulo
+        # 2^32, which would put the same access 20 bytes below the base: inside a view that covers a whole pool, where
+        # OOB_SELECT 3 does not look at the index and 2 looks at nothing. So an offset that does not fit 32 bits is out
+        # of range in every mode (a load reads 0, a store or atomic is dropped). `fits` is None where the mode's own
+        # check already bounds the index and no soffset is added. The rule and its hardware observation are
+        # five-star-recomp's (ThatRecompDev, GPL-3, commit b9b57e2).
+        fits = None
+
+        def u64(v):
+            t = self.tmp()
+            self.emit(f"{t} = OpUConvert %ulong {v}")
+            return t
+
+        def add64(x, y):
+            t = self.tmp()
+            self.emit(f"{t} = OpIAdd %ulong {x} {y}")
+            return t
+
+        if (idx is not None or not soff_zero) and not (mode in (0, 1) and soff_zero and swz_active is False):
+            if swz_active is False:
+                wide = u64(off)
+            else:
+                # the swizzled offset above, with the same terms in 64 bits
+                inner64, sh64 = self.tmp(), self.tmp()
+                self.emit(f"{inner64} = OpIMul %ulong {u64(msb)} {u64(stride)}")
+                inner64 = add64(inner64, u64(om4))
+                self.emit(f"{sh64} = OpShiftLeftLogical %ulong {inner64} {L}")
+                wide = add64(add64(sh64, u64(l4)), u64(ol))
+            if not soff_zero:
+                wide = add64(wide, u64(soff_v))
+            if idx is not None and swz_active is False:
+                prod = self.tmp()
+                self.emit(f"{prod} = OpIMul %ulong {u64(idx)} {u64(stride)}")
+                wide = add64(wide, prod)
+            fits = self.tmp()
+            self.emit(f"{fits} = OpULessThanEqual %bool {wide} {self.cl(0xFFFFFFFF)}")
+            self.uses_long = True
         self.uses_psb = True
         l64, h64, sh, base, o64, addr = (self.tmp() for _ in range(6))
         self.emit(f"{l64} = OpUConvert %ulong {d0}")
@@ -4193,7 +4248,6 @@ class Gen:
         self.emit(f"{base} = OpBitwiseOr %ulong {sh} {l64}")
         self.emit(f"{o64} = OpUConvert %ulong {total}")
         self.emit(f"{addr} = OpIAdd %ulong {base} {o64}")
-        mode = None if lit3 is None else lit3 >> 28 & 3
         mode0_rule = mode in (None, 0) or (mode == 3 and sw3 is not False)
         need_raw = mode in (None, 3) and sw3 is not True
         need_p3 = mode in (None, 3) and sw3 is not False
@@ -4276,7 +4330,16 @@ class Gen:
             return r
 
         def check_end(end_bytes):
-            """in-range bool of an access that ends end_bytes after its first byte."""
+            """in-range bool of an access that ends end_bytes after its first byte: the mode's rule, and an offset
+            that fits 32 bits."""
+            ok = mode_check_end(end_bytes)
+            if fits is None:
+                return ok
+            both = self.tmp()
+            self.emit(f"{both} = OpLogicalAnd %bool {ok} {fits}")
+            return both
+
+        def mode_check_end(end_bytes):
             if mode == 1:
                 return p1
             if mode == 2:
@@ -7712,10 +7775,19 @@ class Gen:
             d, x = a[0], a[1]
             wide_src = op == "s_quadmask_b64"
             wide_dst = op != "s_quadmask_b32"
+            mask_words = None
             if self.is_mask_op(x):
-                raise Unsupported(op + " on a lane mask")
+                # s_bitreplicate_b64_b32 of a 32-bit lane mask into plain scalar data (6 pipeline-library programs of
+                # 1.0.2.1): the wave's mask word as data, then replicated as any scalar (wave_mask, as s_ff1 reads it).
+                if op != "s_bitreplicate_b64_b32" or (d["k"] == "special" and d.get("t", "").startswith(("exec", "vcc"))):
+                    raise Unsupported(op + " on a lane mask")
+                lo, hi = self.wave_mask(x)
+                half = self.mask_half(x) if self.wave64 else None
+                mask_words = [hi if half == "hi" else lo]
             if d["k"] == "special" and d.get("t", "").startswith(("exec", "vcc")):
-                if op != "s_bitreplicate_b64_b32" or not (d["t"] == "exec" or (self.wave64 and d["t"] == "vcc")):
+                # VCC only in wave64: in wave32 its high word is data, which a lane mask cannot carry.
+                if (op != "s_bitreplicate_b64_b32" or not (d["t"] == "exec" or (self.wave64 and d["t"] == "vcc"))
+                        or mask_words is not None):
                     raise Unsupported(op + " on a lane mask")
                 # The mask bit for lane L comes from scalar-source bit L // 2.
                 shift, shifted, bit = (self.tmp() for _ in range(3))
@@ -7728,7 +7800,9 @@ class Gen:
                 self.emit(f"{mask} = OpISub %uint {self.cu(0)} {bit}")
                 self.mask_dst(d, mask)
                 return
-            if wide_src:
+            if mask_words is not None:
+                words = mask_words
+            elif wide_src:
                 lo, hi = self.src64_data(x, op)
                 words = [lo, hi]
             else:
@@ -12810,35 +12884,48 @@ class Gen:
 
     # ---- images: T#/S# -> bindless index through a runtime-filled hash table ----
     # Table layout (storage buffer, set 0 binding 2): uint mask; then entries of 10 uints:
-    #   key[0..7] (descriptor dwords; S# uses key[0..3] and key[4..7] = 0xFFFFFFFF), index, pad.
+    #   key[0..7] (descriptor dwords; S# uses key[0..3] and key[4..7] = 0xFFFFFFFF), index, kind.
     # Probes 8 slots from hash(key) & mask; a miss yields index 0 (the runtime puts a fallback there).
+    # The last word is the pad word a plain module never reads; --descriptor-table tagged fills it with the kind.
     PROBES = 8
 
     def desc_lookup(self, words):
-        """words: 8 uint ids. Returns a uint id with the bindless index.
+        """words: 8 uint ids. Returns (bindless index, kind), kind being None with --descriptor-table plain.
 
         The probe is about 400 instructions, so it is one function in the module (%desc_lookup_fn) that every
         image instruction calls. Inlined at each use it was most of the code of texture-heavy shaders: 194 image
         instructions made over half of a 7 MB module."""
         self.uses_tex = True
+        tagged = self.descriptor_table != "plain"
         if self.desc_fn is None:
             params = [f"%dl_w{i}" for i in range(8)]
             saved, self.body = self.body, []
             result = self.desc_probe(params)
             lines, self.body = self.body, saved
-            self.desc_fn = (["%desc_lookup_fn = OpFunction %uint None %fn_desc_lookup"] +
+            ret = "%desc_hit" if tagged else "%uint"
+            self.desc_fn = ([f"%desc_lookup_fn = OpFunction {ret} None %fn_desc_lookup"] +
                             [f"{p} = OpFunctionParameter %uint" for p in params] + ["%dl_entry = OpLabel"] +
                             lines + [f"         OpReturnValue {result}", "OpFunctionEnd"])
         r = self.tmp()
-        self.emit(f"{r} = OpFunctionCall %uint %desc_lookup_fn " + " ".join(words))
+        self.emit(f"{r} = OpFunctionCall {'%desc_hit' if tagged else '%uint'} %desc_lookup_fn " + " ".join(words))
+        if tagged:
+            idx, kind = self.tmp(), self.tmp()
+            self.emit(f"{idx} = OpCompositeExtract %uint {r} 0")
+            self.emit(f"{kind} = OpCompositeExtract %uint {r} 1")
+        else:
+            idx, kind = r, None
         if self.emulate:
-            return r
+            return idx, kind
         if self.wave32_fragment:
             # Each 32-lane half of a wider subgroup is its own wave with its own SGPRs: broadcast from the half's
             # first running lane, as OpGroupNonUniformBroadcastFirst does for the whole subgroup below.
             b = self.tmp()
-            self.g_shuffle(b, r, self.wave32_first_running_lane())
-            return b
+            self.g_shuffle(b, idx, self.wave32_first_running_lane())
+            if kind is not None:
+                k = self.tmp()
+                self.g_shuffle(k, kind, self.wave32_first_running_lane())
+                kind = k
+            return b, kind
         # The descriptor words are SGPRs, so the index is the same in every invocation of the subgroup; the
         # broadcast is an identity on every driver and makes that uniformity explicit to the compiler. Mesa ANV
         # (26.2.7, Alder Lake Xe-LP) segfaults compiling a sampler index straight from the probe loop when one
@@ -12846,9 +12933,13 @@ class Gen:
         # subgroup operation (x_round), so it is left out there. Track this separately from uses_subgroup: this
         # operation needs GroupNonUniform + GroupNonUniformBallot, but no Shuffle capability or lane input.
         b = self.tmp()
-        self.emit(f"{b} = OpGroupNonUniformBroadcastFirst %uint {self.cu(3)} {r}")
+        self.emit(f"{b} = OpGroupNonUniformBroadcastFirst %uint {self.cu(3)} {idx}")
         self.uses_bcast_first = True
-        return b
+        if kind is not None:
+            k = self.tmp()
+            self.emit(f"{k} = OpGroupNonUniformBroadcastFirst %uint {self.cu(3)} {kind}")
+            kind = k
+        return b, kind
 
     def desc_hash(self, words):
         """Hash a T# or padded S# exactly as the runtime descriptor table does."""
@@ -12874,6 +12965,7 @@ class Gen:
 
     def desc_probe(self, words):
         """Probe up to eight slots for the full descriptor key."""
+        tagged = self.descriptor_table != "plain"
         h = self.desc_hash(words)
         mp, mask = self.tmp(), self.tmp()
         self.emit(f"{mp} = OpAccessChain %_ptr_SB_uint %desc_map %c0 %c0")
@@ -12885,8 +12977,11 @@ class Gen:
         # on the loop header's phi, which Mesa ANV 26.1.6 (Intel UHD 630, CFL GT2) miscompiles in ps_table_fetch
         # by hoisting the binding-table-index add above the loop (reading slot 0 / magenta before %dl_idx is set).
         kv, iv = "%dl_k", "%dl_idx"                  # slot number, and the result (0 until a slot matches)
-        self.body[0:0] = [f"         {kv} = OpVariable %_ptr_Function_uint Function %c0",
-                          f"         {iv} = OpVariable %_ptr_Function_uint Function %c0"]
+        kvars = [f"         {kv} = OpVariable %_ptr_Function_uint Function %c0",
+                 f"         {iv} = OpVariable %_ptr_Function_uint Function %c0"]
+        if tagged:
+            kvars.append("         %dl_kind = OpVariable %_ptr_Function_uint Function %c0")
+        self.body[0:0] = kvars
         self.emit("OpBranch %dl_head")
         self.body.append("%dl_head = OpLabel")
         self.emit("OpLoopMerge %dl_end %dl_cont DontUnroll")
@@ -12914,6 +13009,13 @@ class Gen:
         self.emit(f"{p} = OpAccessChain %_ptr_SB_uint %desc_map %c0 {o}")
         self.emit(f"{v} = OpLoad %uint {p}")
         self.emit(f"OpStore {iv} {v}")
+        if tagged:
+            # The entry's last word: the arrays this index is bound in (the pad word a plain table leaves alone).
+            ko, kp, kk = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{ko} = OpIAdd %uint {base} {self.cu(10)}")
+            self.emit(f"{kp} = OpAccessChain %_ptr_SB_uint %desc_map %c0 {ko}")
+            self.emit(f"{kk} = OpLoad %uint {kp}")
+            self.emit(f"OpStore %dl_kind {kk}")
         self.emit("OpBranch %dl_end")                # the first match breaks out of the probe loop directly
         self.body.append("%dl_next = OpLabel")
         self.emit("OpBranch %dl_cont")
@@ -12926,7 +13028,12 @@ class Gen:
         self.emit(f"OpBranchConditional {more} %dl_head %dl_end")
         self.body.append("%dl_end = OpLabel")
         self.emit(f"{r} = OpLoad %uint {iv}")
-        return r
+        if not tagged:
+            return r
+        hit, kind = self.tmp(), self.tmp()
+        self.emit(f"{kind} = OpLoad %uint %dl_kind")
+        self.emit(f"{hit} = OpCompositeConstruct %desc_hit {r} {kind}")
+        return hit
 
     def desc_cache_ok(self):
         """True when the next instruction is emitted at the top level of the basic block, outside any selection or
@@ -13401,11 +13508,12 @@ class Gen:
     def desc_lookup_sgpr(self, a, n):
         """desc_lookup for an SGPR descriptor range (n=8: T#, n=4: S#), cached for the rest of the basic block.
 
-        The cache holds the id of the call's result per (first SGPR, n). It is dropped by store_reg when any
-        SGPR of the range is written (all writes to the %sgpr array go through store_reg, including the 64-bit
-        ones, which are two calls, s_load results, v_readlane/v_readfirstlane results and the spare slots lane
-        masks are parked in) and cleared when a basic block starts. Only lookups made at the block's top level
-        are remembered, see desc_cache_ok. Returns the bindless index (a uint id)."""
+        The cache holds the ids of the call's result per (first SGPR, n): the index and, with --descriptor-table
+        tagged, the kind. It is dropped by store_reg when any SGPR of the range is written (all writes to the %sgpr
+        array go through store_reg, including the 64-bit ones, which are two calls, s_load results,
+        v_readlane/v_readfirstlane results and the spare slots lane masks are parked in) and cleared when a basic
+        block starts. Only lookups made at the block's top level are remembered, see desc_cache_ok. Returns
+        (bindless index, kind), kind being None with --descriptor-table plain."""
         if a["k"] == "slist" and len(a["r"]) >= n:
             words = self.sgpr_words(a, n)
             if n < 8:
@@ -13425,6 +13533,41 @@ class Gen:
         if top:
             self.desc_cache[key] = idx
         return idx
+
+    # The dimension of an instruction's image array, indexed by STORE_DIMS' index (0 2D, 1 2D array, 2 3D, 3 1D).
+    # A cube instruction reads the 2D-array binding: a cube is six layers of a 2D array.
+    DIM_TAGS = {"dim:SQ_RSRC_IMG_2D": 0, "dim:SQ_RSRC_IMG_2D_ARRAY": 1, "dim:SQ_RSRC_IMG_CUBE": 1,
+                "dim:SQ_RSRC_IMG_3D": 2, "dim:SQ_RSRC_IMG_1D": 3, "dim:SQ_RSRC_IMG_1D_ARRAY": 4}
+
+    def desc_array_bit(self, kind, dim, base):
+        """A bool id: is bit `base + dim` of the descriptor's kind set (the index is bound in that array)?"""
+        bit = self.tmp()
+        self.emit(f"{bit} = OpBitFieldUExtract %uint {kind} {self.cu(base + self.DIM_TAGS[dim])} {self.cu(1)}")
+        out = self.tmp()
+        self.emit(f"{out} = OpINotEqual %bool {bit} {self.cu(0)}")
+        return out
+
+    def desc_sampled_index(self, idx, kind, dim):
+        """The bindless index for the sampled array of `dim`: the lookup's index when the entry says it is bound
+        there, else 0 (that array's fallback, a 1x1 image of zeros). With --descriptor-table plain nothing is
+        emitted and the index is used as before."""
+        if kind is None:
+            return idx
+        ok = self.desc_array_bit(kind, dim, DESC_SAMPLED_BIT)
+        out = self.tmp()
+        self.emit(f"{out} = OpSelect %uint {ok} {idx} {self.cu(0)}")
+        return out
+
+    def desc_storage_index(self, idx, kind, dim):
+        """The bindless index for the storage array of `dim`, or 0 (its fallback, where stores land and are
+        dropped) when the entry says the index is not bound in it: an image whose T# is of another dimension, or
+        one with a sampled view only."""
+        if kind is None:
+            return idx
+        ok = self.desc_array_bit(kind, dim, DESC_STORAGE_BIT)
+        out = self.tmp()
+        self.emit(f"{out} = OpSelect %uint {ok} {idx} {self.cu(0)}")
+        return out
 
     def sgpr_word(self, a, i):
         if a["k"] == "sgpr":
@@ -13524,7 +13667,13 @@ class Gen:
             if (dim != "dim:SQ_RSRC_IMG_2D" or dmask != 1 or len(addr) != (3 if a16 else 4)
                     or any(m not in (dim, dm, "a16", "d16") for m in mods)):
                 raise Unsupported(op + " needs scalar 2D depth comparison")
-        img_idx = self.desc_lookup_sgpr(a[2], 8)
+        img_idx, kind = self.desc_lookup_sgpr(a[2], 8)
+        # The T#'s own type decides which array holds this index. A read through another dimension's array (a
+        # slice-0 view of a 2D-array or cube T#, which the runtime binds in the 2D array) is valid only when the
+        # entry says so; otherwise the read is that array's fallback. A coherent read goes through the storage
+        # view the stores write, so it follows the storage arrays' rule instead.
+        img_idx = (self.desc_storage_index(img_idx, kind, view_dim) if coherent
+                   else self.desc_sampled_index(img_idx, kind, dim))
         img = None              # a coherent image_load reads the storage view, not this sampled one
         if not (coherent or storage_only):
             ip, img = self.tmp(), self.tmp()
@@ -13581,7 +13730,7 @@ class Gen:
                                   lod=self.cu(0), d16=d16)
             return
         else:
-            smp_idx = self.desc_lookup_sgpr(a[3], 4)
+            smp_idx = self.desc_lookup_sgpr(a[3], 4)[0]
             sp, smp, si = self.tmp(), self.tmp(), self.tmp()
             self.dynamic_sampled_access(sp, "%_ptr_UC_smp", "%samplers", smp_idx)
             self.emit(f"{smp} = OpLoad %smp {sp}")
@@ -14336,7 +14485,8 @@ class Gen:
             uv = vals
             sv = [self.as_int(v) for v in vals]
         coords = [self.as_int(c) for c in raw[:nc]]
-        idx = self.desc_lookup_sgpr(a[2], 8)
+        idx, kind = self.desc_lookup_sgpr(a[2], 8)
+        idx = self.desc_storage_index(idx, kind, view_dim)
         t1 = self.sgpr_word(a[2], 1)
         self.uses_store_views.add(di)
         for w in [16] + sum(self.int_format_masks(), []):      # constants used by assemble's format masks
@@ -14556,7 +14706,8 @@ class Gen:
             words = 2 if packed else ncoord + 1
             if len(addr) < words:
                 raise Unsupported("image_load_mip coords")
-            idx = self.desc_lookup_sgpr(a[2], 8)
+            idx, kind = self.desc_lookup_sgpr(a[2], 8)
+            idx = self.desc_sampled_index(idx, kind, dim)
             ip, img, iv = self.tmp(), self.tmp(), self.tmp()
             if is3d:
                 self.uses_tex_3d = True
@@ -14578,7 +14729,7 @@ class Gen:
                 or ("a16" in mods and not is_atomic) or "d16" in mods):
             raise Unsupported(op + " " + dim.split("SQ_RSRC_IMG_")[-1])
         vdata, addr = a[0], self.addr_regs(a[1])
-        idx = self.desc_lookup_sgpr(a[2], 8)
+        idx, kind = self.desc_lookup_sgpr(a[2], 8)
 
         def atomic_coords(nc):
             raw = [self.load_reg("vgpr", r) for r in addr]
@@ -14618,6 +14769,9 @@ class Gen:
                 self.emit(f"{iv} = OpCompositeConstruct %v2int {coords[0]} {coords[1]}")
                 ptr_ty, arr_var = "%_ptr_UC_simg", "%simages"
                 run = self.active_b()
+            # A store, atomic or coherent read through a T# of another dimension, or through one whose image has
+            # no storage views, goes to that dimension's storage fallback: writes and atomics there are dropped.
+            idx = self.desc_storage_index(idx, kind, dim)
             if op in self.IMG_ATOMICS_EXTRA:
                 self.emit_image_atomic_extra(op, ptr_ty, arr_var, idx, iv, vdata, mods,
                                              volume_active=run)
@@ -14651,6 +14805,7 @@ class Gen:
             self.emit(f"{end} = OpLabel")
             return
         ip, img = self.tmp(), self.tmp()
+        idx = self.desc_sampled_index(idx, kind, dim)
         if array_query:
             self.uses_tex_array = True
             self.dynamic_sampled_access(ip, "%_ptr_UC_imga", "%images_arr", idx)
@@ -16095,7 +16250,13 @@ def assemble(gen):
         types.append(f"{name} = OpConstant %uint {v}")
     written = dict(gen.consts)     # what the module defines; insert_late_constants adds what assemble asks for later
     if gen.desc_fn:
-        types.append("%fn_desc_lookup = OpTypeFunction %uint " + " ".join(["%uint"] * 8))
+        # --descriptor-table tagged: the probe also returns the entry's kind word, so the function returns (index,
+        # kind) as a uvec2.
+        if gen.descriptor_table != "plain":
+            types.append("%desc_hit = OpTypeVector %uint 2")
+            types.append("%fn_desc_lookup = OpTypeFunction %desc_hit " + " ".join(["%uint"] * 8))
+        else:
+            types.append("%fn_desc_lookup = OpTypeFunction %uint " + " ".join(["%uint"] * 8))
     if gen.tbuffer_norm_fns:
         types.append("%fn_tbuffer_norm = OpTypeFunction %uint %uint")
     if gen.fmt_fn or gen.fmt_enc_fn:
@@ -17956,7 +18117,54 @@ def marker_wave64(path, name, stage, insns):
     return code_w64 or stage == "ms"    # NGG mesh shaders here are wave64 (thread = wave id * 64 + lane)
 
 
-def translate(path):
+_FLOW = re.compile(r"(?m)^[ \t]*(?:(%[\w.]+)\s*=\s*)?(OpLabel|OpSelectionMerge|OpLoopMerge|OpBranch|"
+                   r"OpBranchConditional|OpControlBarrier)\b([^;\n]*)")
+
+
+def barriers_under_control_flow(text):
+    """Whether some OpControlBarrier is reached by only part of the workgroup.
+
+    SPIR-V requires a workgroup-scope barrier to be reached by every invocation in uniform control flow.
+    NVIDIA's wait is for every thread (docs/design.md "Workgroup barriers"): a barrier one invocation never
+    reaches stands the whole group until the driver resets the card (Xid 109 / device lost). Emulated wave64
+    exchanges (`Gen.x_round`, `x_order_barrier`) emit such barriers inline, so the inline structured form may
+    bury one inside a `%pc` guard, a lane-local region or a loop body; `Gen.x_scheduler` keeps one barrier at
+    the end of every round instead, in the loop's continue block.
+
+    A barrier in a loop's continue block counts as uniform: every invocation runs the round loop."""
+    label_at, constructs, pending = {}, [], []
+    for match in _FLOW.finditer(text):
+        result, op, operands = match.groups()
+        args = operands.split()
+        if op == "OpLabel":
+            label_at[result] = match.start()
+        elif op in ("OpLoopMerge", "OpSelectionMerge"):
+            nxt = _FLOW.search(text, match.end())
+            if nxt is None or nxt.group(2) not in ("OpBranch", "OpBranchConditional"):
+                continue                                   # a switch head has no body label to compare
+            body = nxt.group(3).split()[0 if nxt.group(2) == "OpBranch" else 1]
+            pending.append((op, body, args[0], args[1] if op == "OpLoopMerge" else None))
+    for op, body, merge, cont in pending:
+        if body in label_at and merge in label_at:
+            constructs.append({"kind": op, "cont": cont,
+                               "start": label_at[body], "end": label_at[merge]})
+    if not constructs:
+        return False
+    block_at = sorted((match.start(), match.group(1)) for match in _FLOW.finditer(text)
+                      if match.group(2) == "OpLabel")
+    for match in _FLOW.finditer(text):
+        if match.group(2) != "OpControlBarrier":
+            continue
+        block = next((name for at, name in reversed(block_at) if at < match.start()), None)
+        inside = [c for c in constructs if c["start"] <= match.start() < c["end"]]
+        while inside and inside[-1]["kind"] == "OpLoopMerge" and inside[-1]["cont"] == block:
+            inside.pop()                                   # the round barrier: the whole workgroup runs it
+        if inside:
+            return True
+    return False
+
+
+def _translate(path):
     info = parse_file(path)
     stage = stage_of(info["name"], path)
     if stage not in ("vs", "ps", "cs", "ms", "gs"):
@@ -17985,7 +18193,8 @@ def translate(path):
                 while pos in bad and not same_encoding(blob[pos:pos + len(enc)], enc, op, operand_count):
                     pos += 4
                 window = blob[pos:pos + len(enc)]
-                if not same_encoding(window, enc, op, operand_count):
+                # The same repairs as the forward search below: a signed-byte dot's stored op_sel_hi first.
+                if not same_encoding(window, enc, op, operand_count) and not restore_dot4_inline_sel(ins, window, enc):
                     literal = mix_literal(window, enc, base_op(op))
                     if literal is not None:
                         restore_mix_literal(ins, window, literal)
@@ -18337,7 +18546,7 @@ def translate(path):
         end = next((k for k, ins in enumerate(insns) if base_op(ins["op"]) == "s_endpgm"), len(insns))
         g.exec_changes = any(g.may_write_exec(ins) for ins in insns[:end])
         g.insns(insns[:end])
-        translate.last_gen = g
+        _translate.last_gen = g
         return finish_module(g)
 
     # ---- basic blocks ----
@@ -18410,7 +18619,7 @@ def translate(path):
         g.scc_live = wave64_emulate_opt.scc_live_outs(blocks, succ)
         folds, fold_chain, absorbed = wave64_emulate_opt.find_local_exec_folds(
             blocks, raw_edges, succ, g.lane_masks, g.scc_live, g.mask_writes)
-        if STRUCTURED:
+        if STRUCTURED and WAVE64_PLAN:
             g.emulate_plan = wave64_emulate_opt.plan_structured_emulation(
                 blocks, raw_edges, succ, folds, fold_chain, absorbed, g.lane_masks, g.scc_live, g.x_lanes)
     g.fit_shared_memory()
@@ -18662,11 +18871,33 @@ def translate(path):
     g.emulate_inline = False
     assert succ == g.succ, "the lane-mask analysis ran on a different graph"
     g.body = []
-    translate.last_gen = g
+    _translate.last_gen = g
     return finish_module(g)
 
 
 _DEF = re.compile(r"(%\w+) = (Op\w+)(?: (%\w+))?")
+
+
+def translate(path):
+    """translate() with one fallback: an emulated wave64 program whose inline structured form puts an
+    exchange barrier under control flow only some invocations take is translated again as the round loop
+    (`Gen.x_scheduler`, one OpControlBarrier per round in uniform control flow).
+
+    A workgroup barrier has to be reached by every invocation. NVIDIA waits for every thread, so one that
+    an invocation never reaches stands the group until the driver resets the card (Xid 109, device lost).
+    A program that hangs costs a whole run; re-translating it costs one more pass offline."""
+    global WAVE64_PLAN
+    asm = _translate(path)
+    gen = _translate.last_gen
+    if (gen is not None and getattr(gen, "emulate_plan", None) is not None
+            and barriers_under_control_flow(asm)):
+        WAVE64_PLAN = False
+        try:
+            asm = _translate(path)
+        finally:
+            WAVE64_PLAN = True
+    translate.last_gen = _translate.last_gen
+    return asm
 
 
 def finish_module(g):
@@ -19190,6 +19421,10 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
          "wave64_emulated": bool(g.wave64 and (g.stage in ("vs", "ps", "gs") or g.emulate))}
     if g.descriptor_hash != "fnv1a":
         m["descriptor_hash"] = g.descriptor_hash
+    if g.descriptor_table != "plain":
+        # The module reads the kind word from every table entry it hits: the runtime must fill it
+        # (runtime/src/descriptor_table.h, docs/design.md "Images and samplers (T# dimension)").
+        m["descriptor_table"] = g.descriptor_table
     if g.w64g:
         # SHADER-10: partition invariance on 32-wide subgroups. A and B are exact there (B: aggregated atomics up to
         # the order of the slots), C is not; the reasons name the construct (docs/design.md, Wave64 graphics).
@@ -19579,7 +19814,7 @@ def _out_inside_input(src, out):
 
 
 def main():
-    global MAX_SHARED_BYTES, MAX_STRUCTURED_DEPTH, LOOP_LIMIT, DESCRIPTOR_HASH
+    global MAX_SHARED_BYTES, MAX_STRUCTURED_DEPTH, LOOP_LIMIT, DESCRIPTOR_HASH, DESCRIPTOR_TABLE
     ap = argparse.ArgumentParser()
     ap.add_argument("src")
     ap.add_argument("--out", required=True)
@@ -19647,6 +19882,10 @@ def main():
                          "for devices whose maxPushConstantsSize is below 144")
     ap.add_argument("--descriptor-hash", choices=DESCRIPTOR_HASHES, default="fnv1a",
                     help="bindless descriptor table hash shared with the runtime (default: fnv1a)")
+    ap.add_argument("--descriptor-table", choices=DESCRIPTOR_TABLES, default="tagged",
+                    help="descriptor table entry layout: 'tagged' also carries each image's array kind, recorded as "
+                         "descriptor_table in the module meta (default: tagged; 'plain' is the old layout, for a "
+                         "library that keeps the runtime's old behaviour)")
     ap.add_argument("--loop-limit", type=spirv_loop_guard.parse_limit, default=spirv_loop_guard.DEFAULT_LIMIT,
                     help="maximum visits to each loop header, including dispatch loops (default %(default)s, 0 disables)")
     ap.add_argument("--max-structured-depth", type=_depth_arg, default=MAX_STRUCTURED_DEPTH, metavar="N",
@@ -19676,6 +19915,7 @@ def main():
         ap.error(f"cannot create {a.out}: {ancestor} is a file, not a folder")
     MAX_SHARED_BYTES = a.max_shared_memory
     DESCRIPTOR_HASH = a.descriptor_hash
+    DESCRIPTOR_TABLE = a.descriptor_table
     LOOP_LIMIT = a.loop_limit
     MAX_STRUCTURED_DEPTH = a.max_structured_depth
     global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, SHADER_CLOCK, F16_HALVES, OPT_SPIRV

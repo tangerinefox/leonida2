@@ -91,6 +91,11 @@ public:
 
     std::size_t size() const { return ranges_.size(); }
     std::uint64_t longest() const { return longest_; }
+    // f(first VA, bytes) for every range, in VA order.
+    template <class F>
+    void for_each(F&& f) const {
+        for (const auto& [key, bytes] : ranges_) f(key.first, bytes);
+    }
 
 private:
     static constexpr Id max_id() { return ~Id(0); }

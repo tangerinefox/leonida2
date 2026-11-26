@@ -5,15 +5,16 @@
 //   - With it: MeshShaderTier 1; CreatePipelineState builds an MS + PS PSO and a VS + PS PSO from streams laid out as
 //     d3dx12.h lays them out (each subobject a type and its description, pointer-aligned); streams the PC runtime
 //     refuses (MS with VS, CS with PS, a subobject twice or in two versions, an unknown type, a truncated stream) are E_INVALIDARG, and
-//     state not built yet (an amplification shader, a depth-bounds test) is E_NOTIMPL.
+//     state not built yet (an amplification shader) is E_NOTIMPL; a depth-bounds test builds where the device
+//     reports DepthBoundsTestSupported, and is E_NOTIMPL where it does not.
 //   - Draws: DispatchMesh(2, 2, 1) with root constants (0, 0) and a red tint fills the top-left quadrant;
 //     DispatchMesh(1, 1, 2) moved by (1, -1) with a green tint fills the top half of the bottom-right one, so the
 //     Y and Z counts reach the shader; the stream's VS PSO draws a full-screen triangle through a viewport on the
 //     bottom-left quadrant (yellow). Each pixel is read back and compared.
 //   - A vertex draw with the mesh PSO, and DispatchMesh with the VS one, fail at execution (ReplayResult::
 //     invalid_draw); a mesh grid beyond D3D12's limits fails at Close; an empty grid records nothing.
-//   - A DISPATCH_MESH command signature is created only with the extension; ExecuteIndirect with it records nothing
-//     yet, so its list closes.
+//   - A DISPATCH_MESH command signature is created only with the extension; ExecuteIndirect with it draws as
+//     DispatchMesh (one record {2, 1, 1} fills two cells), and without graphics state it records nothing and closes.
 // The shaders are GLSL written to the translator's contract (test/glsl/ms_draw.mesh, ps_draw.frag, vs_fullscreen.vert).
 // No game data. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
 #include "vk_test_device.h"
@@ -317,7 +318,14 @@ int main(int argc, char** argv) {
         D3D12_DEPTH_STENCIL_DESC1 bounds{};
         bounds.DepthBoundsTestEnable = TRUE;
         bad.add(DepthStencil1Subobject{.inner = bounds});
-        EXPECT(create(device.p, bad, refused) == E_NOTIMPL && !refused.p);
+        {
+            D3D12_FEATURE_DATA_D3D12_OPTIONS2 o2{};
+            EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS2, &o2, sizeof o2)));
+            Ref<ID3D12PipelineState> with_bounds;
+            const HRESULT bounds_hr = create(device.p, bad, with_bounds);
+            EXPECT(o2.DepthBoundsTestSupported ? SUCCEEDED(bounds_hr) && with_bounds.p
+                                               : bounds_hr == E_NOTIMPL && !with_bounds.p);
+        }
 
         // A console stream: its numbering has no gap at 23, so its mesh shader is 24 (the PC's AS) and its
         // RASTERIZER1 26 (the PC's DEPTH_STENCIL2). An AS without an MS is no PC stream, so the layer reads it with the
@@ -468,6 +476,54 @@ int main(int argc, char** argv) {
         EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
         std::memcpy(pixels.data(), mapped, pixels.size());
 
+        // ExecuteIndirect with a DISPATCH_MESH signature draws as DispatchMesh (vkCmdDrawMeshTasksIndirectEXT after
+        // the clamp pass): one record {2, 1, 1} at upload + 768 fills columns 0 and 1 of row 0, the top half of the
+        // top-left quadrant, red; the rest of the cleared target stays blue.
+        {
+            const std::uint32_t record[3] = {2, 1, 1};
+            std::memcpy(up + 768, record, sizeof record);
+            const D3D12_INDIRECT_ARGUMENT_DESC mesh_arg{D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH};
+            const D3D12_COMMAND_SIGNATURE_DESC mesh_sig{12, 1, &mesh_arg, 0};
+            Ref<ID3D12CommandSignature> sig;
+            Ref<ID3D12Fence> indirect_fence;
+            EXPECT(SUCCEEDED(device->CreateCommandSignature(&mesh_sig, nullptr, IID_PPV_ARGS(&sig.p))) && sig.p);
+            EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&indirect_fence.p))));
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, mesh_pso.p)));
+            D3D12_RESOURCE_BARRIER again =
+                transition(target.p, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            list->ResourceBarrier(1, &again);
+            list->ClearRenderTargetView(rtv, blue, 0, nullptr);
+            list->SetGraphicsRootSignature(root.p);
+            list->RSSetViewports(1, &viewport);
+            list->RSSetScissorRects(1, &scissor);
+            list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+            list->SetGraphicsRoot32BitConstants(0, 2, origin, 0);
+            list->SetGraphicsRootConstantBufferView(1, upload_va);
+            list->ExecuteIndirect(sig.p, 1, upload.p, 768, nullptr, 0);
+            list->ResourceBarrier(1, &to_copy);
+            list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            EXPECT(SUCCEEDED(queue->Signal(indirect_fence.p, 1)) &&
+                   SUCCEEDED(indirect_fence->SetEventOnCompletion(1, nullptr)));
+            unsigned wrong = 0;
+            for (UINT row = 0; row < size; ++row) {
+                for (UINT col = 0; col < size; ++col) {
+                    const bool red = row < size / 4 && col < size / 2;
+                    const std::uint8_t want[4] = {std::uint8_t(red ? 255 : 0), 0, std::uint8_t(red ? 0 : 255), 255};
+                    const auto* got = static_cast<const std::uint8_t*>(mapped) + row * 256 + col * 4;
+                    if (std::equal(want, want + 4, got)) continue;
+                    if (wrong++ < 6)
+                        std::fprintf(stderr, "indirect mesh pixel (%u, %u): got %u,%u,%u,%u want %u,%u,%u,%u\n", col,
+                                     row, got[0], got[1], got[2], got[3], want[0], want[1], want[2], want[3]);
+                }
+            }
+            EXPECT(!wrong);
+            std::printf("ExecuteIndirect DISPATCH_MESH {2, 1, 1} drew as DispatchMesh(2, 1, 1): %u pixels matched\n",
+                        size * size);
+        }
+
         // The wrong kind of draw for the pipeline fails at execution: a vertex draw with the mesh PSO, then
         // DispatchMesh with the VS PSO.
         for (const bool vertex_draw : {true, false}) {
@@ -591,8 +647,8 @@ int main(int argc, char** argv) {
                         enabled ? "" : " (LEONIDA_GRAPHICS_DIRECT_HEAPS=0: not written)");
         }
         // A DISPATCH_MESH command signature (D3D12_DISPATCH_MESH_ARGUMENTS, 12 bytes) is created; a stride below its
-        // 12 bytes is refused as the PC runtime refuses it. ExecuteIndirect with it records nothing yet (#3777 replays
-        // it), so the list still closes.
+        // 12 bytes is refused as the PC runtime refuses it. ExecuteIndirect with it and no viewport records
+        // nothing, so the list still closes.
         {
             const D3D12_INDIRECT_ARGUMENT_DESC mesh_arg{D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH};
             const D3D12_COMMAND_SIGNATURE_DESC mesh_sig{12, 1, &mesh_arg, 0};

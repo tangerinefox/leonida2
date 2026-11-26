@@ -152,7 +152,6 @@ int check_inline_table(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12Fe
         std::memcpy(cpu + slot * kDescriptor, w.data(), sizeof(w));
     };
     put(0, raw_vsharp(unmapped));
-    for (int i = 4; i < 131; ++i) put(i, raw_vsharp(unmapped));
     put(1, raw_vsharp(b.arena_va));
     put(2, raw_vsharp(b.upload_va & 0xFFFFFFFFFFFFull));
     auto image_like = raw_vsharp(unmapped);

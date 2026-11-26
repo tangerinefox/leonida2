@@ -462,6 +462,7 @@ struct Draw {
     std::uint32_t first_instance = 0;
     bool mesh = false;
     std::shared_ptr<const DrawViewports> viewports;  // non-null when >1 viewport or >1 scissor was bound
+    std::array<float, 2> depth_bounds{0, 1};  // OMSetDepthBounds (min, max); used by depth-bounds pipelines only
 };
 
 // Only indirect draws allocate this extra payload. Copies of the IR share both its

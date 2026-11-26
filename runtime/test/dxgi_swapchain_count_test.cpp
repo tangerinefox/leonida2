@@ -267,7 +267,7 @@ int run_case(const char* label, std::uint32_t requested, std::uint32_t native, s
     g = Fake{};
     g.min_image_count = minimum;
     g.returned_images = native;
-    std::mutex mutex;
+    leonida::SubmitMutex mutex;
     leonida::VulkanSwapchain swapchain(get_instance_proc, reinterpret_cast<VkInstance>(1),
                                       reinterpret_cast<VkPhysicalDevice>(2), get_device_proc,
                                       reinterpret_cast<VkDevice>(3), reinterpret_cast<VkQueue>(4), 0, mutex,
@@ -375,7 +375,7 @@ int run_failed_resize(const char* label, std::uint32_t requested, std::uint32_t 
     g = Fake{};
     g.min_image_count = 2;
     g.returned_images = native;
-    std::mutex mutex;
+    leonida::SubmitMutex mutex;
     leonida::VulkanSwapchain swapchain(get_instance_proc, reinterpret_cast<VkInstance>(1),
                                       reinterpret_cast<VkPhysicalDevice>(2), get_device_proc,
                                       reinterpret_cast<VkDevice>(3), reinterpret_cast<VkQueue>(4), 0, mutex,

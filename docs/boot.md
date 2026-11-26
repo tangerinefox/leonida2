@@ -98,7 +98,8 @@ Useful switches:
   `ROSETTA_ADVERTISE_AVX=1` instead). The game itself still needs AVX, so this is for the #UD emulation work (see
   [cpu_features.md](cpu_features.md#hosts-without-avx) for what works on a host without AVX).
 * `LEONIDA_SKIP_INT3=1` (with `--trace`) steps over each int3 in guest code and logs it once per address as an
-  `int3_skipped` event, so a boot can be followed past soft asserts (an int3 followed by code that carries on).
+  `int3_skipped` event, so a boot can be followed past soft asserts (an int3 followed by code that carries on). It is
+  read when the trace opens.
   Diagnostic only: a correct run reaches none, so each skipped address is a finding, not a fix. A failed guest file
   open is always traced as `file_open_failed` (path, error, caller) when `--trace` is on.
 * `LEONIDA_STUB_PIPELINES=1` creates a pipeline whose translated shader is missing (no shader library, or no entry
@@ -121,21 +122,42 @@ Useful switches:
   (`runtime/shims/title_hud.h`). It updates twice a second with:
   - the frame rate and the average and worst frame time from PresentX, or, when no frame came in that half
     second, how long since the last one (a hang reads "0 fps, no frame for 12.5 s");
-  - the process's private memory and working set;
-  - its local GPU memory against the DXGI budget, and its shared GPU memory;
+  - the process's private memory (its commit charge; Wine fills only `PagefileUsage`, which is the same figure)
+    and working set;
+  - its GPU memory: in use and the budget over the device-local heaps, and in use in the other heaps, read from
+    the Vulkan device through `VK_EXT_memory_budget`. Without that extension it falls back to DXGI's
+    `QueryVideoMemoryInfo`, which reads 0 under Wine; with neither the field reads `VRAM n/a`, not a false 0.
+    Both memory figures and their text come from `runtime/src/memory_figures.h`, which the dev overlay shows too;
   - the graphics and compute pipelines created, and the seconds spent in `vkCreate*Pipelines` in the last half
     second. A pipeline compiled in the frame shows up there as a hitch. This needs `LEONIDA_MEM_PROBE`; without it
     the field reads `PSO -`.
   - the time since the first present.
 
   A thread of its own sets the text with `SendMessageTimeout`, so a busy window thread never holds a present.
+* `LEONIDA_DEV_OVERLAY=1` (Windows) shows what the runtime is doing in a small click-through window over the top left
+  corner of the title's window, while that window is in front (`runtime/src/dev_overlay.h`): frames and submissions a
+  second, where a submission's CPU time goes, the phase that is running now and for how long, pipeline builds in
+  flight, indirect draws emitted and skipped, cores, free RAM, and the same private memory and GPU memory figures as
+  `LEONIDA_TITLE_HUD` (`VRAM n/a` without `VK_EXT_memory_budget`). The device publishes its GPU memory figure, and
+  the overlay and the HUD read it at most once per half second. The rates cover the last two seconds. It has its own
+  thread, so it also counts while the title presents nothing, and it is in no capture. `LEONIDA_TITLE_HUD` shows frame
+  times and compile times in the title bar instead; both can be on.
 * `DISABLE_RTSS_LAYER=1` and `DISABLE_VULKAN_OBS_CAPTURE=1` when MSI Afterburner or OBS is installed; their
   implicit layers add swapchain usage that shows up as validation errors ([testing.md](testing.md), "Known
   problems").
 * `--overlay DIR` sends the guest's writes to DIR instead of the default `<game-dir>\overlay` (useful when the
   package drive is read-only); the package itself is never written. Set `LEONIDA_WRITE_DIR` to override that folder
   for one run (it wins over `--overlay`). For a fresh first-run profile, also set `LEONIDA_SAVE_DIR` to a separate
-  empty directory for the local game-save provider.
+  empty directory for the local game-save provider. The title's `T:` drive (its temporary drive,
+  where it writes its crash dump `T:\<guid>.dmp` and crash log) is a folder of each process's own inside the overlay,
+  `<overlay>\.gta6rt-temp\<YYYYMMDD-HHMMSS-mmm>-pid<id>` (the process's start time in UTC and its id).
+  The folder is reserved with a create-only `CreateDirectoryW` when `gta6rt` starts the title (or on the first `T:`
+  call): when that name already exists, as after a reused process id in the same millisecond, it takes `-2`, `-3`,
+  ... (up to 1000 names), so a run never writes into a folder that existed before it. The startup line names it
+  (`console paths: GAME: -> ..., writes -> ..., T: -> ...`).
+  Folders of earlier runs are kept, so a run's crash files can be read after it stops; delete them by hand. With
+  one folder for every run, a `CREATE_NEW` of a name an earlier run had left failed with `ERROR_FILE_EXISTS` (80)
+  and no report landed (old upstream issue 7913).
 
 ### Under Wine on Linux
 

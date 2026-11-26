@@ -28,6 +28,7 @@
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
 #include "../shims/d3d12_com.h"
+#include "../shims/d3d12_pipeline_compile.h"
 #include "../shims/d3d12_xs_device.h"
 #include "../src/shader_library.h"
 #include "../src/vulkan_indirect_clamp.h"
@@ -96,7 +97,8 @@ Reference reference() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool check_journal = argc == 2 && std::strcmp(argv[1], "--check-async-journal") == 0;
     vktest::Device d;
     d.queue_count_wanted = 2;   // the copy queue and the compute queue each get a VkQueue where the family has two
     const auto device_status = d.initialize();
@@ -129,6 +131,7 @@ int main() {
         info.queue_family = d.family;
         if (distinct_queues) info.command_queues = d.queues;
         info.buffer_device_address = true;
+        info.pipeline_cache_control = d.pipeline_cache_control();
         info.bindless = d.bindless;
         info.bindless_partially_bound = d.partially_bound;
         info.image_view_min_lod = d.image_view_min_lod;
@@ -166,6 +169,24 @@ int main() {
         EXPECT(SUCCEEDED(device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&pso_fill.p))));
         pso_desc.CS = {indirect_container.data(), indirect_container.size()};
         EXPECT(SUCCEEDED(device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&pso_indirect.p))));
+
+        if (check_journal) {
+            // Check publication while the device and both PSOs are still alive. The async policy can
+            // drop a dispatch whose worker has not yet published its handle, so wait for these two.
+            EXPECT(rt::d3d12::async_replay_compile());
+            const auto deadline = GetTickCount64() + 30000;
+            while (rt::d3d12::PipelineCompiler::instance().stats().completed < 2 && GetTickCount64() < deadline)
+                Sleep(1);
+            EXPECT(rt::d3d12::PipelineCompiler::instance().stats().completed >= 2);
+            const auto* cache_dir = _wgetenv(L"LEONIDA_PIPELINE_CACHE_DIR");
+            EXPECT(cache_dir && *cache_dir);
+            unsigned entries = 0;
+            const auto dir = std::filesystem::path(cache_dir) / L"pipeline_cache.d";
+            EXPECT(std::filesystem::is_directory(dir));
+            for (const auto& file : std::filesystem::directory_iterator(dir))
+                if (file.path().extension() == L".bin" && file.file_size() > 32) ++entries;
+            EXPECT(entries == 2);
+        }
 
         D3D12_INDIRECT_ARGUMENT_DESC argument{};
         argument.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;

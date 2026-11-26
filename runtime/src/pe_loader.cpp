@@ -1721,10 +1721,7 @@ Module& Loader::map_image(const std::filesystem::path& path, const std::string& 
     if (!m->base)
         m->base = static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(oh.ImageBase), oh.SizeOfImage,
                                                      MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-    if (!m->base) {
-        const auto relocs = directory(nt, IMAGE_DIRECTORY_ENTRY_BASERELOC);
-        if (!relocs.Size)
-            throw std::runtime_error(m->name + ": preferred base is taken and the image has no relocations");
+    if (!m->base) {  // whether the image may move is decided at the relocation step below
         m->base = static_cast<uint8_t*>(VirtualAlloc(nullptr, oh.SizeOfImage, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
         if (!m->base) throw std::runtime_error(m->name + ": VirtualAlloc failed");
     }
@@ -1749,10 +1746,19 @@ Module& Loader::map_image(const std::filesystem::path& path, const std::string& 
     }
 
     int64_t delta = reinterpret_cast<int64_t>(m->base) - static_cast<int64_t>(oh.ImageBase);
-    if (delta) {
-        m->relocated = true;
-        const auto dir = directory(nt, IMAGE_DIRECTORY_ENTRY_BASERELOC);
-        if (!dir.Size) throw std::runtime_error(m->name + ": the image has no relocations and isn't at its base");
+    // A moved image with a relocation table is fixed up, whatever IMAGE_FILE_RELOCS_STRIPPED says. Without a table,
+    // the flag refuses the move; with the flag clear the image is moved and nothing is fixed up, so it is trusted to
+    // hold no absolute addresses. The Windows 11 loader does all three (runtime/README.md); that move is logged so
+    // it shows in traces. base_reservation::needed still keeps the main image's range free when it has no
+    // relocation directory, so a main image is moved this way only where the range could not be had.
+    const auto dir = directory(nt, IMAGE_DIRECTORY_ENTRY_BASERELOC);
+    if (delta) m->relocated = true;
+    if (delta && !dir.Size && (nt->FileHeader.Characteristics & IMAGE_FILE_RELOCS_STRIPPED))
+        throw std::runtime_error(m->name + ": preferred base is taken and the image's relocations are stripped");
+    if (delta && !dir.Size)
+        std::fprintf(stderr, "[rt] loader: %s: preferred base %#llx is taken, moved to %p with no relocations\n",
+                     m->name.c_str(), static_cast<unsigned long long>(oh.ImageBase), static_cast<void*>(m->base));
+    if (delta && dir.Size) {
         require_range(m->name, dir.VirtualAddress, dir.Size, m->size, "the relocation table");
         auto* block = at<IMAGE_BASE_RELOCATION>(m->base, dir.VirtualAddress);
         auto* end = reinterpret_cast<uint8_t*>(block) + dir.Size;
@@ -2123,7 +2129,10 @@ void Loader::bind_imports(Module& m) {
     const uint64_t headers_end = nt->OptionalHeader.SizeOfHeaders;
 
     // Thunk tables have no length field: they end at a zero entry, so each step is checked against the image.
-    auto bind_thunks = [&](const std::string& dll, uint64_t lookup_rva, uint64_t iat_rva) {
+    // `delayed`: a delay import that binds to an unimplemented thunk is traced. Windows' delay-load helper would raise
+    // 0xC06D007E (module) or 0xC06D007F (procedure) at its first call, which a title can catch for a fallback; the
+    // thunk returns 0 instead, so the trace names each such import before any image code runs.
+    auto bind_thunks = [&](const std::string& dll, uint64_t lookup_rva, uint64_t iat_rva, bool delayed) {
         for (;; lookup_rva += sizeof(IMAGE_THUNK_DATA64), iat_rva += sizeof(IMAGE_THUNK_DATA64)) {
             require_range(m.name, lookup_rva, sizeof(IMAGE_THUNK_DATA64), m.size, "an import lookup table");
             require_range(m.name, iat_rva, sizeof(IMAGE_THUNK_DATA64), m.size, "an import address table");
@@ -2141,6 +2150,10 @@ void Loader::bind_imports(Module& m) {
                 throw std::runtime_error(m.name + ": an import address table lands in the headers");
             at<IMAGE_THUNK_DATA64>(m.base, static_cast<uint32_t>(iat_rva))->u1.Function =
                 reinterpret_cast<uint64_t>(resolve(m, dll, name, ord, by_ord));
+            if (delayed && startup_trace::enabled() && m.imports.back().binding == Binding::Unimplemented)
+                startup_trace::event("delay_import_unimplemented",
+                                     "\"module\":" + startup_trace::quote(m.name) + ",\"import\":" +
+                                         startup_trace::quote(dll + "!" + m.imports.back().name));
         }
     };
 
@@ -2153,7 +2166,7 @@ void Loader::bind_imports(Module& m) {
             if (!d->Name) break;
             std::string dll = read_string(m.name, m.base, m.size, d->Name, "an imported DLL name");
             uint32_t lookup = d->OriginalFirstThunk ? d->OriginalFirstThunk : d->FirstThunk;
-            bind_thunks(dll, lookup, d->FirstThunk);
+            bind_thunks(dll, lookup, d->FirstThunk, false);
         }
     }
     // Delay imports are bound eagerly: simpler, and the full import surface shows up in --dry-run.
@@ -2176,7 +2189,7 @@ void Loader::bind_imports(Module& m) {
             // thunk addresses as name RVAs.
             if (!d->ImportNameTableRVA)
                 throw std::runtime_error(m.name + ": a delay-import descriptor has no name table");
-            bind_thunks(dll, d->ImportNameTableRVA, d->ImportAddressTableRVA);
+            bind_thunks(dll, d->ImportNameTableRVA, d->ImportAddressTableRVA, true);
         }
     }
 }

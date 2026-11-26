@@ -1742,8 +1742,15 @@ int main(int argc, char** argv) {
         Sleep(350);
         g_focus = true;
         rt::gameinput::poll();
+        // A scripted press lasts its 300 ms and then until the title has read the pads six times since it began
+        // (update_keyboard_pad: kReads, at most kMaxHold seconds), so a title that polls slowly still sees it. Each
+        // pad_state() is one GetCurrentReading, and this is the third since the X began.
+        check(pad_state(input, nullptr).buttons == (GameInputGamepadX | GameInputGamepadB),
+              "long script: past its 300 ms the press is still held while the title has read the pads fewer than six times");
+        for (int i = 0; i < 6; ++i) pad_state(input, nullptr);
+        rt::gameinput::poll();
         check(pad_state(input, nullptr).buttons == GameInputGamepadB,
-              "long script: the timed press ends while the physical key stays held");
+              "long script: the timed press ends once the title has read it, while the physical key stays held");
         input->Release();
         std::printf("%d checks, %d failures\n", g_checks, g_failures);
         return g_failures ? 1 : 0;

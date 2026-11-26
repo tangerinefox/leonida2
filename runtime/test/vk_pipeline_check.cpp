@@ -30,6 +30,9 @@
 //   --cache-feedback  count each stage's successful pipelines by VkPipelineCreationFeedback: hits (VALID and
 //                 APPLICATION_PIPELINE_CACHE_HIT), no hit reported (VALID only) and unavailable (no VALID bit, or a
 //                 pre-1.3 device without VK_EXT_pipeline_creation_feedback). The three add up to the ok count.
+//   --nv-diagnostics  create the device with VK_NV_device_diagnostics_config and the flags the runtime's
+//                 LEONIDA_DEVICE_FAULT=1 / LEONIDA_AFTERMATH=1 use (shader debug info, resource tracking, automatic
+//                 checkpoints), to measure what that does to compile times and to cache hits
 //   --isolate     check in child processes, --isolate-batch modules at a time (default 256), so a module
 //                 that kills the driver is recorded as failed ("MODULE CRASH") and the pass
 //                 goes on. A crashed batch is bisected to the module. Children run one after the other and share
@@ -806,7 +809,7 @@ int main(int argc, char** argv) {
     unsigned large_parallel = 0;   // 0 = by the memory budget
     double slow = 30.0;
     std::string stage_filter = "all";
-    bool cache_feedback = false, isolate = false, iso_child = false;
+    bool cache_feedback = false, isolate = false, iso_child = false, nv_diagnostics = false;
     size_t isolate_batch = 256;
     for (int i = 2; i < argc; i++) {
         std::string a = argv[i];
@@ -851,6 +854,7 @@ int main(int argc, char** argv) {
         else if (a == "--skip-file") valid = !(skip_path = value()).empty();
         else if (a == "--cache-feedback") cache_feedback = true;
         else if (a == "--isolate") isolate = true;
+        else if (a == "--nv-diagnostics") nv_diagnostics = true;
         else if (a == "--isolate-child") iso_child = true;   // internal: the parent's child runs
         else if (a == "--isolate-batch") {   // parsed like the other numbers (#1735); at least one per batch
             valid = number(isolate_batch);
@@ -1163,6 +1167,13 @@ int main(int argc, char** argv) {
 #endif
     VkPhysicalDeviceShaderClockFeaturesKHR clock{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR};
     const bool ext_clock = link(&clock, reinterpret_cast<VkBaseOutStructure*>(&clock), VK_KHR_SHADER_CLOCK_EXTENSION_NAME, want_clock);
+    VkPhysicalDeviceDiagnosticsConfigFeaturesNV diag_features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DIAGNOSTICS_CONFIG_FEATURES_NV};
+    const bool ext_diag = link(&diag_features, reinterpret_cast<VkBaseOutStructure*>(&diag_features),
+                               VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME, nv_diagnostics);
+    if (nv_diagnostics && !ext_diag) {
+        std::fprintf(stderr, "--nv-diagnostics: the device has no %s\n", VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME);
+        return 1;
+    }
     const bool ext_exe = link(&exe, reinterpret_cast<VkBaseOutStructure*>(&exe),
                               VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME, !stats_path.empty());
     if (!stats_path.empty() && !ext_exe) {
@@ -1206,6 +1217,15 @@ int main(int argc, char** argv) {
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci; dci.pNext = &f2;
     dci.enabledExtensionCount = uint32_t(enable.size()); dci.ppEnabledExtensionNames = enable.data();
+    VkDeviceDiagnosticsConfigCreateInfoNV diag_config{VK_STRUCTURE_TYPE_DEVICE_DIAGNOSTICS_CONFIG_CREATE_INFO_NV};
+    if (ext_diag) {
+        diag_config.flags = VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_SHADER_DEBUG_INFO_BIT_NV |
+                            VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_RESOURCE_TRACKING_BIT_NV |
+                            VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_AUTOMATIC_CHECKPOINTS_BIT_NV;
+        diag_config.pNext = dci.pNext;
+        dci.pNext = &diag_config;
+        std::printf("device: VK_NV_device_diagnostics_config on (shader debug info, resource tracking, checkpoints)\n");
+    }
     VkDevice dev;
     if (VkResult r = vkCreateDevice(pd, &dci, nullptr, &dev)) { std::fprintf(stderr, "vkCreateDevice %d\n", r); return 1; }
     leonida::SubgroupSizeCaps runtime_subgroups;

@@ -15,7 +15,7 @@ powershell -NoProfile -File scripts\windows-boot\boot.ps1 -DryRun -GameDir D:\GT
 powershell -NoProfile -File scripts\windows-boot\boot.ps1 -Name first -Seconds 200 -GameDir D:\GTA6pkg -Shaders E:\leonida-work\shaders\spirv
 
 # Extra or changed switches: trailing KEY=VALUE arguments (KEY= removes one), as run-boot.sh takes them.
-powershell -NoProfile -File scripts\windows-boot\boot.ps1 -Name split -Seconds 120 LEONIDA_PRESENT_PLANE1=0 "LEONIDA_PEEK=0x7446510,0x98f828c,0x78b2818"
+powershell -NoProfile -File scripts\windows-boot\boot.ps1 -Name split -Seconds 120 LEONIDA_PRESENT_PLANE1=0 "LEONIDA_PEEK=<rva>,<rva>,<rva>"
 
 # Every parameter.
 Get-Help -Full .\scripts\windows-boot\boot.ps1
@@ -38,7 +38,7 @@ Only when your shell has not set them already (`-DryRun` prints the final list):
 | `LEONIDA_PIPELINE_CACHE_BYTES` | `4294967296` | pipeline cache size limit |
 | `LEONIDA_STARTUP_CACHE_CHECKPOINTS` | `1` | save the pipeline cache during startup |
 | `LEONIDA_PIPELINE_CACHE_DIR` | `<out>\pipeline-cache` | one warmed cache shared by every build you boot |
-| `LEONIDA_PEEK` / `_SECONDS` | `0x7446510,0x98f828c` / `5` | game state and session state (low dword), the two numbers every RESULT reports |
+| `LEONIDA_PEEK` / `_SECONDS` | the game-state and session-state RVAs from `LEONIDA_GAME_STATE_RVA` and `LEONIDA_SESSION_STATE_RVA` (measured locally, not kept here; unset: no peek) / `5` | game state and session state (low dword), the two numbers every RESULT reports |
 | `LEONIDA_DEVICE_FAULT` | `1` | on device loss: `VK_EXT_device_fault` info, checkpoints, last replay steps |
 | `LEONIDA_KEYBOARD_PAD` | `always` (with an input script) | keyboard as a pad even unfocused, so the script's presses arrive |
 | `LEONIDA_CAPTURE_EVERY` / `_LIMIT` | `60` / `40` | a swapchain read-back every 60 presents, at most 40 |
@@ -72,8 +72,15 @@ frames:   14 captured, 0 non-black; last mean rgb 0.00 0.00 0.00; brightest 0.00
 states only, which is what goes into a RESULT on the board; the logs, traces, captures and dumps can quote the game
 and stay on your machine ([AGENTS.md](../../AGENTS.md), "No game data").
 
-How to read the states: game state `0x7446510` goes 1, 2 (init), 3 (running); session state goes 0, 1, 3 (landing
-screen waiting for A), `d` after A. `docs/linux_proton.md` (the same stages apply natively)
+How to read the states: game state goes 1, 2 (init), 3 (running); session state goes 0, 1, 3 (landing
+screen waiting for A), `d` after A.
+
+**Changed: the states need two variables now.** The script used to set `LEONIDA_PEEK` to the game-state and
+session-state RVAs by default. Those addresses of the retail executable are no longer kept in the repository, so set
+`LEONIDA_GAME_STATE_RVA` and `LEONIDA_SESSION_STATE_RVA` (hex, measured locally) in the shell before the boot.
+Without them the script warns, sets no `LEONIDA_PEEK`, and the `states:` line and the RESULT show `game=?
+session=?`. A `LEONIDA_PEEK` of your own still works for the log, but the digest reads only the two RVAs those
+variables name. `docs/linux_proton.md` (the same stages apply natively)
 section 2 has the healthy sequence with times and section 3 "which blank do you have".
 
 ## One game at a time

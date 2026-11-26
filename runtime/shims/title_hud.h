@@ -2,7 +2,11 @@
 // LEONIDA_TITLE_HUD=1 shows live counters in the title bar of the window the title presents in:
 //   frame rate and frame time from PresentX (average and worst frame of the last half second), or how long
 //   since the last frame when there was none;
-//   the process's private memory and its GPU memory (DXGI QueryVideoMemoryInfo, local and non-local segments);
+//   the process's private memory (its commit charge) and working set;
+//   its GPU memory: in use and the budget over the device-local heaps, and in use in the other heaps, from the
+//   device's VK_EXT_memory_budget; without it, DXGI's QueryVideoMemoryInfo (local and non-local segments), which
+//   Wine leaves at 0; "n/a" when neither has a figure. Both memory figures and their text come from
+//   src/memory_figures.h, which the dev overlay (src/dev_overlay.h) shows as well;
 //   graphics and compute pipelines created, and the seconds spent in vkCreate*Pipelines in the last interval,
 //   which is where an inline compile shows up as a hitch (needs LEONIDA_MEM_PROBE, src/mem_probe.h; else "-");
 //   time since the first present.
@@ -20,9 +24,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cwchar>
+#include <functional>
+#include <string>
 #include <thread>
+#include <utility>
 
 #include "../src/mem_probe.h"
+#include "../src/memory_figures.h"
 
 namespace rt::d3d12_xs {
 
@@ -36,7 +44,11 @@ public:
         return on;
     }
 
-    explicit TitleHud(HWND window) : window_(window) {
+    // The VRAM figure's source, called once per refresh on the HUD's thread. Empty: the figure the device publishes
+    // (memory_figures::latest_vram). A budget that is not available: DXGI's figures, else "n/a". Tests pass their own.
+    using VramSource = std::function<leonida::VramBudget()>;
+
+    explicit TitleHud(HWND window, VramSource vram = {}) : window_(window), vram_(std::move(vram)) {
         QueryPerformanceFrequency(&frequency_);
         stop_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         if (stop_) thread_ = std::thread([this] { run(); });
@@ -64,6 +76,18 @@ public:
         presents_.fetch_add(1, std::memory_order_relaxed);
     }
 
+    // DXGI's figures as a budget. A local segment with no usage or no budget is how Wine's stub answers (a process
+    // that presents through a GPU always has some memory there), so that is not available rather than a 0.
+    static leonida::VramBudget dxgi_budget(const DXGI_QUERY_VIDEO_MEMORY_INFO& local,
+                                           const DXGI_QUERY_VIDEO_MEMORY_INFO& non_local) {
+        leonida::VramBudget out;
+        out.local_usage = local.CurrentUsage;
+        out.local_budget = local.Budget;
+        out.shared_usage = non_local.CurrentUsage;
+        out.available = local.CurrentUsage != 0 && local.Budget != 0;
+        return out;
+    }
+
 private:
     static constexpr DWORD interval_ms = 500;
 
@@ -86,20 +110,15 @@ private:
             const double fps = seconds > 0 ? double(frames) / seconds : 0.0;
             const double frame_ms = frames ? seconds * 1000.0 / double(frames) : 0.0;
 
-            wchar_t memory[96] = L"RAM -";
-            PROCESS_MEMORY_COUNTERS_EX counters{};
-            counters.cb = sizeof counters;
-            if (GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
-                                     sizeof counters))
-                std::swprintf(memory, 96, L"RAM %.1f GB (ws %.1f)", gb(counters.PrivateUsage),
-                              gb(counters.WorkingSetSize));
-
-            wchar_t video[96] = L"VRAM -";
+            namespace mf = leonida::memory_figures;
+            const std::wstring memory = widen(mf::ram_text(mf::process_memory()));
+            leonida::VramBudget vram = vram_ ? vram_() : mf::latest_vram();
             DXGI_QUERY_VIDEO_MEMORY_INFO local{}, shared{};
-            if (adapter && SUCCEEDED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local)) &&
+            if (!vram.available && adapter &&
+                SUCCEEDED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local)) &&
                 SUCCEEDED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &shared)))
-                std::swprintf(video, 96, L"VRAM %.1f/%.1f GB +%.1f shared", gb(local.CurrentUsage),
-                              gb(local.Budget), gb(shared.CurrentUsage));
+                vram = dxgi_budget(local, shared);
+            const std::wstring video = widen(mf::vram_text(vram));
 
             wchar_t pipelines[128] = L"PSO -";
             auto& probe = leonida::mem_probe::state();
@@ -129,15 +148,16 @@ private:
                 std::swprintf(frame, 96, L"0 fps, no frame for %.1f s",
                               double(now.QuadPart - last_present) / double(frequency_.QuadPart));
             wchar_t text[512];
-            std::swprintf(text, 512, L"Leonida | %ls | %ls | %ls | %ls | %u:%02u", frame, memory, video, pipelines,
-                          up / 60, up % 60);
+            std::swprintf(text, 512, L"Leonida | %ls | %ls | %ls | %ls | %u:%02u", frame, memory.c_str(),
+                          video.c_str(), pipelines, up / 60, up % 60);
             DWORD_PTR ignored = 0;
             SendMessageTimeoutW(window_, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(text), SMTO_ABORTIFHUNG,
                                 interval_ms, &ignored);
         }
     }
 
-    static double gb(std::uint64_t bytes) { return double(bytes) / double(1ull << 30); }
+    // memory_figures' text is ASCII.
+    static std::wstring widen(const std::string& text) { return std::wstring(text.begin(), text.end()); }
 
     // The hardware adapter with the most dedicated memory: the one LEONIDA_VK_DEVICE picks on a machine with a
     // discrete GPU. The host's own dxgi.dll, not the title's shim.
@@ -163,6 +183,7 @@ private:
     }
 
     HWND window_;
+    VramSource vram_;
     HANDLE stop_ = nullptr;
     std::thread thread_;
     LARGE_INTEGER frequency_{};

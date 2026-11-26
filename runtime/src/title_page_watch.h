@@ -204,6 +204,18 @@ inline void set(std::uintptr_t va, bool aliased) {
 // Bumped by every change of set().
 inline std::uint64_t generation() { return state().generation.load(std::memory_order_acquire); }
 
+// Up to `n` aliased pages, and how many there are (a probe's sample; no order).
+inline std::size_t sample(std::vector<std::uintptr_t>& out, std::size_t n) {
+    State& s = state();
+    out.clear();
+    std::shared_lock lock(s.mutex);
+    for (const std::uintptr_t va : s.aliased) {
+        if (out.size() >= n) break;
+        out.push_back(va);
+    }
+    return s.aliased.size();
+}
+
 // Calls `f(va)` for each aliased 64 KiB page overlapping [begin, end).
 template<class F>
 void for_each_in(std::uintptr_t begin, std::uintptr_t end, F&& f) {
@@ -258,6 +270,19 @@ inline bool note_reservation(std::uintptr_t base, std::uintptr_t size, bool gpu_
     return true;
 }
 
+// Both addresses of every pair, as [start, end) ranges (LEONIDA_CONSOLE_HEAP_GPU's ask table); `count()` changes
+// with them.
+inline void spans(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) {
+    State& s = state();
+    out.clear();
+    if (!s.count.load(std::memory_order_acquire)) return;
+    std::shared_lock lock(s.mutex);
+    for (const View& v : s.views) {
+        out.emplace_back(v.gpu, v.gpu + v.size);
+        out.emplace_back(v.cpu, v.cpu + v.size);
+    }
+}
+inline std::size_t count() { return state().count.load(std::memory_order_acquire); }
 // Marks the pair whose GPU-only range starts at `gpu` as one whose GPU-only range has pages of its own (queue slot 31
 // or XMemMapPhysicalPages map them at that address, not through the CPU view): the host reads it there (to_cpu) and
 // a slot-133 buffer over it is a shadow, not an import (independently_mapped). False when no pair starts at `gpu`.

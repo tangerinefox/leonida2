@@ -344,6 +344,20 @@ bool check_tracking_lifetime_and_direct_indexing(DeviceHeaps& ours) {
     const rt::d3d12::RootArgumentLayout* layout = rt::d3d12::root_signature_layout(root.p);
     CHECK(layout && (layout->flags & di_flags) == di_flags);
 
+    // Direct heap indexing passes remapped console_descriptor_table_va into recorded user data.
+    ID3D12DescriptorHeap* heaps[2] = {ours.cbv1.p, ours.smp1.p};
+    list->SetDescriptorHeaps(2, heaps);
+    list->SetComputeRootSignature(root.p);
+    list->Dispatch(1, 1, 1);
+    std::vector<leonida::Command> cmds;
+    CHECK(rt::d3d12::recorded_commands(list.p, cmds) && !cmds.empty());
+    const auto* disp = std::get_if<leonida::Dispatch>(&cmds.back());
+    CHECK(disp != nullptr);
+    const auto expected_cbv = static_cast<std::uint32_t>(rt::d3d12::console_descriptor_table_va(cbv1_va));
+    const auto expected_smp = static_cast<std::uint32_t>(rt::d3d12::console_descriptor_table_va(smp1_va));
+    CHECK(disp->user_data[layout->compute_arguments_end] == expected_cbv);
+    CHECK(disp->user_data[layout->compute_arguments_end + 1] == expected_smp);
+
     CHECK(!rt::d3d12::bound_descriptor_heap_bases(nullptr, got_cbv, got_smp));
     return true;
 }

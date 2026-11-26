@@ -113,7 +113,8 @@ The title reads gamepads only, so keyboard input has to arrive as a gamepad. Wit
 shim attaches one SDL virtual gamepad named `Keyboard pad (Leonida)` and presses its buttons from the keyboard on
 every poll. It then goes through the same path as a real pad: a device object, the next free player slot, readings,
 reading and device callbacks, and UI navigation derived from its buttons. It reports no rumble motors. It is off by
-default.
+default. If SDL fails to attach or open the keyboard pad, the shim retries after one second while the pad is
+enabled. Only the first failure in a continuous series is logged; turning the pad off and back on retries immediately.
 
 | key | button |
 |---|---|

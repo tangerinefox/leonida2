@@ -117,6 +117,16 @@ void main() {
         const uint asked_x = p.arguments.data[src];
         const uint asked_y = p.arguments.data[src + 1u];
         const uint asked_z = p.arguments.data[src + 2u];
+        if (p.kind == 3u) {
+            // Before the clamp: how many mesh records ask for more than one group in y or z, and the largest y and z
+            // asked (stats words 8-11), which y = z = 1 below would cut.
+            atomicAdd(p.stats.data[8], 1u);
+            if (asked_y > 1u || asked_z > 1u) {
+                atomicAdd(p.stats.data[9], 1u);
+                atomicMax(p.stats.data[10], asked_y);
+                atomicMax(p.stats.data[11], asked_z);
+            }
+        }
         uint x = min(asked_x, max_group_dimension);
         uint y = min(asked_y, max_group_dimension);
         uint z = min(asked_z, max_group_dimension);

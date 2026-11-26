@@ -1402,6 +1402,58 @@ int check_mapped_plane(ID3D12Device* device) {
     return 0;
 }
 
+// LEONIDA_TEXTURE_REFRESH_ASYNC=1 (the d3d12_mapped_plane_async test): a texture the title maps and writes, and then
+// reads on the GPU in its very first submission, has its bytes there, though the refresh pass runs on a worker: the
+// submission fills a mapped texture that was never filled before it records anything (fill_first_mapped_textures).
+int check_mapped_plane_first_use(ID3D12Device* device) {
+    const char* who = "persistent slot-133 plane, first use";
+    constexpr UINT width = 256, height = 8, size = width * height;
+    void* pages = VirtualAlloc(nullptr, 65536, MEM_RESERVE, PAGE_NOACCESS);
+    EXPECT(pages);
+    EXPECT(VirtualAlloc(pages, size, MEM_COMMIT, PAGE_READWRITE) == pages);
+    std::memset(pages, 61, size);
+    GpuReader gpu;
+    EXPECT(!gpu.init(device, size));
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = width;
+    desc.Height = height;
+    desc.Format = DXGI_FORMAT_R8_UNORM;
+    desc.SampleDesc.Count = desc.DepthOrArraySize = desc.MipLevels = 1;
+    leonida::title_xg_layouts::note({UINT(desc.Dimension), UINT(desc.Format), height, 1, 1, width}, 1);
+    Ref<ID3D12Resource> texture;
+    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, desc, 6, IID_PPV_ARGS(&texture.p)), S_OK);
+    void* mapped = nullptr;
+    EXPECT_HR(texture->Map(0, nullptr, &mapped), S_OK);
+    EXPECT(mapped == pages);
+    EXPECT_HR(gpu.allocator->Reset(), S_OK);
+    EXPECT_HR(gpu.list->Reset(gpu.allocator.p, nullptr), S_OK);
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Transition = {texture.p, 0, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE};
+    gpu.list->ResourceBarrier(1, &barrier);
+    D3D12_TEXTURE_COPY_LOCATION src{texture.p, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+    D3D12_TEXTURE_COPY_LOCATION dst{gpu.readback.p, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+    dst.PlacedFootprint.Footprint = {desc.Format, width, height, 1, width};
+    gpu.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    EXPECT_HR(gpu.list->Close(), S_OK);
+    ID3D12CommandList* lists[]{gpu.list.p};
+    gpu.queue->ExecuteCommandLists(1, lists);
+    EXPECT_HR(gpu.queue->Signal(gpu.fence.p, 1), S_OK);
+    EXPECT_HR(gpu.fence->SetEventOnCompletion(1, gpu.done), S_OK);
+    EXPECT(WaitForSingleObject(gpu.done, 30000) == WAIT_OBJECT_0);
+    void* read = nullptr;
+    EXPECT_HR(gpu.readback->Map(0, nullptr, &read), S_OK);
+    const auto* bytes = static_cast<const std::uint8_t*>(read);
+    const bool filled = std::all_of(bytes, bytes + size, [](auto value) { return value == 61; });
+    gpu.readback->Unmap(0, nullptr);
+    EXPECT(filled);
+    texture->Unmap(0, nullptr);
+    texture.p->Release();
+    texture.p = nullptr;
+    VirtualFree(pages, 0, MEM_RELEASE);
+    return 0;
+}
+
 // Several threads write the same watched pages while submissions keep making them read-only again. Two threads that
 // fault on one page race: the first fault reopens it, a submission can protect it again before the second fault is
 // handled, and the second write must still be retried, not refused (refused, the process ends: seen natively). After
@@ -1990,7 +2042,9 @@ void print_cases(const std::vector<Case>& cases, const char* who) {
 
 int main(int argc, char** argv) {
     const bool prefix_only = argc == 2 && std::strcmp(argv[1], "--host-prefix-only") == 0;
-    if (argc != 1 && !prefix_only) return 2;
+    const bool async_plane = argc == 2 && std::strcmp(argv[1], "--mapped-plane-async") == 0;
+    if (argc != 1 && !prefix_only && !async_plane) return 2;
+    if (async_plane) _putenv_s("LEONIDA_TEXTURE_REFRESH_ASYNC", "1");  // read once, at the device's first refresh
     _putenv_s("LEONIDA_TITLE_TEXTURE_PERIOD_MS", "0");
     _putenv_s("LEONIDA_TITLE_TEXTURE_CHECK_KB", "0");
     vktest::Device vk;
@@ -2016,6 +2070,15 @@ int main(int argc, char** argv) {
         if (prefix_only) {
             if (!vk.host_pointer_alignment) return 77;
             const int result = check_host_prefix_buffers(ours.p);
+            return result || vk.validation_errors() ? 1 : 0;
+        }
+        if (async_plane) {
+            int result = vk.host_image_copy ? check_mapped_plane_first_use(ours.p) : 0;
+            auto no_host_copy = info;  // the staged upload too
+            no_host_copy.host_image_copy = false;
+            Ref<ID3D12Device> staged;
+            if (FAILED(rt::d3d12::create_vulkan_device(no_host_copy, IID_PPV_ARGS(&staged.p)))) return 1;
+            result += check_mapped_plane_first_use(staged.p);
             return result || vk.validation_errors() ? 1 : 0;
         }
         failures += check(ours.p, "vulkan");
