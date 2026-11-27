@@ -524,8 +524,9 @@ struct WriteBack {
     UINT64 gpu;
 };
 
-// One submission that dispatches through a root UAV at `va` and waits for it. False on a failed call.
-int submit_write(WriteBack& s, std::uint64_t va) {
+// One submission that dispatches through a root UAV at `va` (and at `va2` too, when given) and waits for it. False
+// on a failed call.
+int submit_write(WriteBack& s, std::uint64_t va, std::uint64_t va2 = 0) {
     EXPECT(s.allocator->Reset() == S_OK);
     EXPECT(s.list->Reset(s.allocator, s.c->pso) == S_OK);
     ID3D12DescriptorHeap* heaps[] = {s.heap};
@@ -536,6 +537,10 @@ int submit_write(WriteBack& s, std::uint64_t va) {
     s.list->SetComputeRootUnorderedAccessView(1, va);
     s.list->SetComputeRootDescriptorTable(2, D3D12_GPU_DESCRIPTOR_HANDLE{s.gpu});
     s.list->Dispatch(1, 1, 1);
+    if (va2) {
+        s.list->SetComputeRootUnorderedAccessView(1, va2);
+        s.list->Dispatch(1, 1, 1);
+    }
     D3D12_RESOURCE_BARRIER to_copy{};
     to_copy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     to_copy.Transition.pResource = s.out;
@@ -696,6 +701,143 @@ int check_window_write_back(Context& c, bool geometry) {
     EXPECT(kept == kElements);
 
     aliases.remove_title_memory(ring_va);
+    VirtualFree(ring, 0, MEM_RELEASE);
+    return 0;
+}
+
+// A write-back whose copy faults (#2418). The copy runs under its tracker's lock and can land on a page another guard
+// keeps read-only: here a hot page (write-watched, so this tracker does not guard it) that a geometry watch cell has
+// made read-only, as a geometry view over the same pages does in the title. The copy faults, the handler reopens the
+// cell and asks every tracker over the address, the writing one too; that one used to take its own (non-recursive)
+// lock again on the same thread and the submission never returned. A watchdog ends the process if it does not.
+//   1. the ring is write-watched and the first submission makes its window: the tracker guards the pages;
+//   2. the title writes the first page outside the words the shader writes: the fault makes its block hot (writable,
+//      asked about rather than guarded), and the next submission drops the GPU's words there (the page was written)
+//      and copies the page forward again;
+//   3. a geometry cell over the ring's first 64 KiB makes the hot page read-only, unknown to the tracker;
+//   4. the next submission's write-back faults on that page, and must return with the GPU's words in the pages.
+// With `same_tile`, a second run in the same 64 KiB tile: step 2's submission dispatches at the third page too, and
+// the title then writes the second page (hot, so no fault: the write watch has it). Step 4's write-back (of step 2's
+// results) then runs over [page 0] (faults; the geometry cell reopens the whole tile, and the tracker's pages there
+// with it), [page 1] (the title's: held) and [page 2 ...]. The tile's reopening on the write-back's own thread used to
+// make page 2 count as written by the title, so its GPU words were dropped and the forward copy put the title's zeros
+// over them. The title's word on page 1 must still win.
+int check_window_write_back_fault(Context& c, bool same_tile) {
+    if (!leonida::title_write_watch::enabled()) {
+        std::fprintf(stderr, "SKIP: write watching is off (LEONIDA_WRITE_WATCH=0, Wine, or no host heap)\n");
+        return 77;
+    }
+    constexpr UINT64 ring_bytes = 256 * 1024;
+    auto* ring = static_cast<std::uint32_t*>(
+        VirtualAlloc(nullptr, ring_bytes, MEM_TOP_DOWN | MEM_RESERVE | MEM_WRITE_WATCH, PAGE_READWRITE));
+    EXPECT(ring && VirtualAlloc(ring, ring_bytes, MEM_COMMIT, PAGE_READWRITE) == ring);
+    const auto ring_va = reinterpret_cast<std::uint64_t>(ring);
+    EXPECT((ring_va & (leonida::geometry_writes::tile_size - 1)) == 0);  // a reservation starts on 64 KiB
+    leonida::title_write_watch::add(ring_va, ring_bytes);  // as xmem records it
+    auto& aliases = leonida::title_va_aliases();
+    aliases.add_title_memory(ring_va, ring_bytes);
+    const auto protection = [](const void* p) {
+        MEMORY_BASIC_INFORMATION m{};
+        return VirtualQuery(p, &m, sizeof m) ? m.Protect & 0xff : 0;
+    };
+
+    const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
+    const auto uav = buffer_desc(kBytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    Ref<ID3D12Resource> out;
+    EXPECT(SUCCEEDED(c.device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &uav,
+                                                       D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                                       IID_PPV_ARGS(&out.p))));
+    D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 8,
+                                         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    Ref<ID3D12DescriptorHeap> heap;
+    EXPECT(SUCCEEDED(c.device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap.p))));
+    Ref<ID3D12CommandAllocator> allocator;
+    Ref<ID3D12GraphicsCommandList> list;
+    EXPECT(SUCCEEDED(c.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
+    EXPECT(SUCCEEDED(c.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, c.pso,
+                                                 IID_PPV_ARGS(&list.p))));
+    EXPECT(list->Close() == S_OK);
+    WriteBack s{&c, allocator.p, list.p, out.p, heap.p,
+                reinterpret_cast<XboxHeapHandleFn>(slot(heap.p, 10))(heap.p)};
+
+    // Step 1.
+    EXPECT(submit_write(s, ring_va) == 0);
+    EXPECT(aliases.shader_va(ring_va) != ring_va);  // a window was made for the title's pages
+    EXPECT(ring[0] == 0);                           // the copy took the write
+    const DWORD guarded = protection(ring);
+    EXPECT(guarded == PAGE_READONLY);  // guarded until written
+
+    // Step 2: word 1000 is on the first page, past the 64 words the shader writes.
+    const std::uint64_t faults_before = rt::d3d12::title_shadow_watch(c.inner).faults;
+    ring[1000] = 0x5EED0001u;
+    const std::uint64_t title_faults = rt::d3d12::title_shadow_watch(c.inner).faults - faults_before;
+    EXPECT(title_faults == 1);
+    EXPECT(rt::d3d12::title_shadow_watch(c.inner).watched_bytes > 0);  // the window's pages are write-watched
+    constexpr UINT kPageWords = 4096 / 4;
+    EXPECT(submit_write(s, ring_va, same_tile ? ring_va + 2 * 4096 : 0) == 0);
+    UINT dropped = 0;
+    for (UINT i = 0; i < kElements; ++i) dropped += ring[i] == 0;
+    EXPECT(dropped == kElements);  // the title wrote that page since it was copied: the GPU's words were not taken
+    const DWORD hot = protection(ring);
+    EXPECT(hot == PAGE_READWRITE);  // asked about, not guarded
+    EXPECT(rt::d3d12::title_shadow_watch(c.inner).hot_bytes > 0);
+    if (same_tile) {
+        EXPECT(protection(ring + kPageWords) == PAGE_READWRITE);  // the fault made the whole block hot
+        ring[kPageWords + 500] = 0x5EED0002u;                     // no fault: the write watch has it
+    }
+
+    // Step 3: what a geometry view over these pages arms (GeometryViews), standing in for the other guard.
+    const auto tile = std::uintptr_t(ring_va);
+    leonida::geometry_writes::Cell* cell = leonida::geometry_writes::acquire(tile);
+    EXPECT(cell && leonida::geometry_writes::arm(tile, *cell));
+    const DWORD armed = protection(ring);
+    EXPECT(armed == PAGE_READONLY);
+
+    // Step 4.
+    HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    EXPECT(done);
+    HANDLE watchdog = CreateThread(
+        nullptr, 0,
+        [](void* event) -> DWORD {
+            if (WaitForSingleObject(static_cast<HANDLE>(event), 20000) == WAIT_OBJECT_0) return 0;
+            std::fprintf(stderr, "FAIL: the submission whose write-back faulted on a page another guard keeps "
+                                 "read-only did not return in 20 s (the fault handler waits on the tracker's lock its "
+                                 "own thread holds)\n");
+            std::fflush(stderr);
+            TerminateProcess(GetCurrentProcess(), 3);
+            return 1;
+        },
+        done, 0, nullptr);
+    EXPECT(watchdog);
+    const int submitted = submit_write(s, ring_va);
+    SetEvent(done);
+    WaitForSingleObject(watchdog, INFINITE);
+    CloseHandle(watchdog);
+    CloseHandle(done);
+    EXPECT(submitted == 0);
+    UINT nonzero = 0;
+    for (UINT i = 0; i < kElements; ++i) nonzero += ring[i] != 0;
+    std::printf("write back fault: protection 0x%lx guarded, 0x%lx hot after %llu title fault, 0x%lx under the "
+                "geometry cell; the faulting write-back returned and %u of %u words the shader wrote are in the "
+                "title's pages, the title's own word %s\n",
+                guarded, hot, static_cast<unsigned long long>(title_faults), armed, nonzero, kElements,
+                ring[1000] == 0x5EED0001u ? "kept" : "lost");
+    EXPECT(nonzero > 0);
+    EXPECT(ring[1000] == 0x5EED0001u);
+    if (same_tile) {
+        // The run past the title's page, in the tile the faulting copy reopened: its GPU words went back too.
+        UINT later = 0;
+        for (UINT i = 0; i < kElements; ++i) later += ring[2 * kPageWords + i] != 0;
+        std::printf("write back fault, same tile: %u of %u words the second dispatch wrote on the third page are in "
+                    "the title's pages, the title's word on the second page %s\n",
+                    later, kElements, ring[kPageWords + 500] == 0x5EED0002u ? "kept" : "lost");
+        EXPECT(later == nonzero);  // the same shader, the same words
+        EXPECT(ring[kPageWords + 500] == 0x5EED0002u);
+    }
+
+    leonida::geometry_writes::release(tile);
+    aliases.remove_title_memory(ring_va);
+    leonida::title_write_watch::remove(ring_va);
     VirtualFree(ring, 0, MEM_RELEASE);
     return 0;
 }
@@ -1228,6 +1370,9 @@ int main(int argc, char** argv) {
     const bool rebind = api_copy || mirror_off || second_device || (argc == 2 && std::strcmp(argv[1], "--rebound-tables") == 0);
     const bool window_cap = argc == 2 && std::strcmp(argv[1], "--window-cap") == 0;
     const bool window_write_back = argc == 2 && std::strcmp(argv[1], "--window-writeback") == 0;
+    const bool window_write_back_tile = argc == 2 && std::strcmp(argv[1], "--window-writeback-fault-tile") == 0;
+    const bool window_write_back_fault =
+        window_write_back_tile || (argc == 2 && std::strcmp(argv[1], "--window-writeback-fault") == 0);
     const bool placed_write_back = argc == 2 && std::strcmp(argv[1], "--placed-writeback") == 0;
     const bool keep_refill = argc == 2 && std::strcmp(argv[1], "--shadow-keep-refill") == 0;
     if (window_cap) {
@@ -1359,6 +1504,16 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
                 return 1;
             }
+            return 0;
+        }
+        if (window_write_back_fault) {
+            if (const int result = check_window_write_back_fault(c, window_write_back_tile)) return result;
+            if (d.validation_errors()) {
+                std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
+                return 1;
+            }
+            std::printf("title window write back fault: a write-back copy that faulted on a page another guard keeps "
+                        "read-only returned, and the GPU's words reached the title's pages\n");
             return 0;
         }
         if (window_write_back) {

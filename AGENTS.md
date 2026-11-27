@@ -121,3 +121,5 @@ Shard runs write `index.part*.json`; merge them into `index.json` with `--merge`
   input gives the same bytes on every platform; `tests/test_text_write_line_endings.py` catches a writer that forgets.
 - Keep `make_game.py` working on Windows first: paths through `os.path`, no bash in the build.
 - In the pull request, say that it was AI-assisted, what you tested and on which GPU and driver.
+- How agents share results, ask each other for a test on a machine they do not have and say how sure a claim is:
+  [docs/agent_collaboration.md](docs/agent_collaboration.md).
