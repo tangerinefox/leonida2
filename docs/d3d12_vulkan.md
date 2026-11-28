@@ -1707,8 +1707,30 @@ The copies:
   (logged once otherwise).
 - Any **other address in the title's memory** gets a window: the 64 KiB-aligned pages it covers, clipped to the
   title's range, copied into the arena now and before every submission, through the same shadow refresh as slot 133
-  (so dirty-page tracking for that refresh applies to both). Windows stay until the device goes, up to
-  `LEONIDA_TITLE_WINDOWS_MB` (64 MiB by default). A window that
+  (so dirty-page tracking for that refresh applies to both). A window never covers bytes an existing range already
+  serves: it stays inside the free span around the address (and a stream-pool extent inside the free span in both of
+  the pair's views), because a range entered over a live one replaces it whole, and the copy that range answered from
+  would be left reached by nothing. Windows stay while an address range still answers from them, up to
+  `LEONIDA_TITLE_WINDOWS_MB` (64 MiB by default). A window that no range answers from any more (a slot-133 buffer the
+  title placed over its pages, or a BVH input's exact copy, replaced its ranges) is **retired** after the next
+  submission's refresh: the alias table's listener records the removed ranges' copies, and a window none of its
+  ranges is left for loses its stream-pool extent and its bytes of the budget at once. Its memory is freed once every
+  `ExecuteCommandLists` replay in progress then has recorded its submissions, every command list whose recording
+  began before the retirement is gone (reset, released, or a held batch's or the async worker's copy of it run), and
+  the submissions recorded by then have completed: a list resolves its root views when they are recorded, so one
+  recorded before the retirement and executed, or executed again, after it still names the window
+  (`src/command_list_epochs.h`). Until then its copy stays a target of its pages' tracker, refreshed like the others,
+  and what the GPU wrote in it goes back to the title's pages: with its submissions' write-back, and once more when it
+  is freed (a range noted when a list was recorded can be copied back before a held batch has run). A retired copy goes
+  back only on the bytes no live copy over them changed, byte by byte (the window and the buffer that replaced it can
+  each have written their own bytes of one 256-byte piece), and every copy is compared with the title's bytes as
+  they were before any copy went back. The bytes a retired copy returns are also written into every other copy over
+  them that still held the title's older bytes, as the next refresh would: a window is freed after its submission's
+  refresh, and the range that replaced it reads its last bytes in that same submission. `d3d12_title_window_orphans` covers it, with a writing batch held on a fence
+  while the next submission's refresh retires its window. A window is
+  not retired when its pages are released or remapped: a retail run measured no release at all of the pages windows
+  cover (the title remaps its pool frames instead), and the tracker follows the pages.
+  A tracker the window shared with a copy still live keeps its extent (a retirement never splits one). A window that
   cannot fit between the title's address reservations can use a separate mapped buffer. The buffer's device address
   must fit as a positive 47-bit offset from the arena base. The same window cap and dirty-page refresh apply.
   `LEONIDA_STREAM_BUFFER_WINDOWS=0` requires the window to fit in the arena.
@@ -1721,7 +1743,7 @@ The copies:
   title itself wrote in between keeps the title's newer bytes and its GPU result is dropped. The copy back asks the
   write watch first (the refresh's own asking comes after it, so a hot page's last answer is a submission old), passes
   over pages whose mapping changed, that a kernel write may be filling or that xmem maps at another address too, and
-  writes only the 256-byte pieces where the copy differs from the title's bytes: a read-only view writes nothing and
+  writes only the bytes where the copy differs from the title's (compared in 256-byte pieces): a read-only view writes nothing and
   its pages stay guarded. The copy runs under the tracker's lock and can still fault on a page another guard keeps
   read-only (the geometry watch, another view's shadow): the fault handler asks every tracker over the address, this
   one included, and on the thread whose copy faulted it does not take that lock again (an SRW lock is not
@@ -1738,9 +1760,22 @@ The copies:
   loses the device. The refusal and the count of zero-size views are logged.
 - A **stream pool** (the title's CPU view paired with a 16-24 GiB GPU-only
   alias) is not windowed per request. The GPU-only pages are translated to the CPU view of the same frames (rule B in
-  that note), and **one mapping serves a page-aligned readable run** of the pool (at most 1 MiB, a geometry copy when
-  the cap allows, a window otherwise). Both addresses of the pair are entered in the table, so a V# naming either
-  reaches that one mapping instead of asking for a second one; `LEONIDA_GEOMETRY_MB` is the preferred backing.
+  that note), and **one mapping serves a page-aligned readable run** of the pool (at most 1 MiB, and never past the
+  next mapping in either view; a geometry copy when the cap allows, a window otherwise). A request whose byte a
+  mapping already holds in either view is served by it when the mapping holds all of the request's bytes, and the
+  other view is entered as far as that mapping reaches. A request never gets a mapping shorter than its bytes (a V#'s
+  size, 64 KiB for a root view): one that runs into the next mapping, or past the end of the one holding its first
+  byte, gets one mapping over itself and every window it reaches, each whole, in both views (`title_pool_cover`,
+  `TitleVaAliases::replace_twin`), and those windows are retired at the next submission. `replace_twin` checks, under
+  the lock it replaces them under, that every range it would erase is one of those windows: a slot-133 buffer is
+  entered without the window lock, so one placed in the span after the plan makes it refuse, the new window is dropped
+  and the request falls back as below. Only with a range in the way
+  that is not a window (a slot-133 buffer, a geometry copy) or that reaches past the pool in its view, or pages that are
+  not readable, does it get a zero-size
+  view: a refusal there would also have the root views a title rings through a pool read zeros where it served them
+  before. `vsharp_address` asks again, like `TitleVaAliases::resolve`, when the range holding a V#'s base ends before
+  the V# does. Both addresses of the pair are entered in the table, so a V# naming either reaches that one mapping instead of
+  asking for a second one; `LEONIDA_GEOMETRY_MB` is the preferred backing.
   Acceleration-structure destinations and scratch also resolve through the table, and a structure no window holds
   whole gets a copy of its whole range, so the BVH builder's commands are recorded.
 - `LEONIDA_GEOMETRY_MB` sets the device-local memory cap for streamed buffer views. The default is 0.
@@ -3513,7 +3548,8 @@ The console has two list topologies Vulkan lacks: rectangle list (`IASetPrimitiv
   the driver's), as on D3D12.
 - GPU-writable slot-133 images on a default heap bind memory when replay, presentation or creation of a shader
   view first needs their Vulkan image. D3D12 placement and logical attachment views can precede that bind.
-  A CPU-fillable, typed BC texture can initially sample an immutable zero image of the same format, extent,
+  A CPU-fillable, typed BC texture (filled by host copies or the staged upload) can initially sample
+  an immutable zero image of the same format, extent,
   layer count and mip count. A CPU upload or explicit GPU command gives the placement private backing and
   republishes its existing descriptor keys. The cache holds at most 256 MiB. `LEONIDA_PLACED_IMAGE_DEFER=0`
   restores eager binding.
@@ -3521,6 +3557,15 @@ The console has two list topologies Vulkan lacks: rectangle list (`IASetPrimitiv
   complete CPU read. Copies of descriptors written earlier resolve to the fallback until that upload succeeds.
   `LEONIDA_TITLE_IMAGE_DEFER=0` allocates these textures eagerly. The memory probe reports the live unbound
   image count and its Vulkan memory requirements in MiB.
+- With `LEONIDA_TITLE_PARTIAL_MIPS=1`, such a texture can be filled before all its pages are readable. The XG
+  layout of a 2D texture of one slice stores its mips from the smallest to the largest, so the mips from `m` on are
+  the first `mip_chain_bytes(layout, m)` bytes from its base (`xg_xs_layout.h`; checked in `xg_xs_test` for tiled,
+  tail and linear layouts). The probe (`texture_memory_readable_bytes`) returns how many bytes from the base are
+  readable and `first_mip_within` the first mip those hold. When the last slot-70 view starts at that mip or later,
+  the mips from there on are filled and only the descriptor keys of views that start there or later are published.
+  The others stay on the fallback (`PendingImage::first_mip`) until a later fill has their mips. The image still has
+  memory for every mip: `LEONIDA_TITLE_PARTIAL_MIPS_MB` (2048) limits the image memory of the textures filled in
+  part. Arrays, cubes and volumes are filled whole or not at all.
 - Small optimal Vulkan images synthesized for slot-70 texture views share memory pages. Each slice meets the
   image's size, alignment and memory type requirements. The GPU retirement queue destroys the image before its
   slice can be reused. Large images, dedicated-only images, and failed pool allocations use individual memory
@@ -3566,6 +3611,14 @@ The console has two list topologies Vulkan lacks: rectangle list (`IASetPrimitiv
     without host-transfer usage before it is bound, and takes the staging path. `d3d12_vulkan_device_test` and
     `d3d12_subresource_copy_test` force this branch on any GPU with `VulkanDeviceInfo::force_host_transfer_retry`
     (their third CPU-copy path; the second compares it with the host runtime).
+  - `LEONIDA_HOST_IMAGE_COPY` chooses whether the device enables the extension at all (`src/host_image_copy_policy.h`,
+    tested by `host_image_copy_policy_test`): `1` wherever the device has it, `0` never, and `auto`, the default, as
+    `1` except on NVIDIA (`vendorID` `0x10DE`), where it is off. On an RTX 4070 SUPER (Windows 11) a real boot lost
+    the device with `WRITE_INVALID` in 7 of 7 runs that used host image copies and in 0 of 2 that did not; why is
+    still under investigation. Off, the extension is neither enabled nor chained, no texture gets host-transfer
+    usage, and every copy takes the staging path, as on a device without the extension. Device creation logs one
+    line, `[rt] d3d12: host image copy: on (available)` or `off (...)` with the reason. Results with
+    `LEONIDA_HOST_IMAGE_COPY=1` on other NVIDIA GPUs and drivers are welcome in an issue.
 - 96-bit textures (`R32G32B32_FLOAT`/`_UINT`/`_SINT`/`_TYPELESS`, D3D-62) are `R32G32B32A32` images
   (`ResourceBinding::rgb96`), on every GPU. Most GPUs have no optimal-tiling RGB32 image (an RX 9070 XT reports
   no optimal features for `R32G32B32_SFLOAT`), and one that has would not avoid the repack: D3D12 places

@@ -939,6 +939,12 @@ if(BUILD_TESTING)
   add_executable(vulkan_device_filter_test test/vulkan_device_filter_test.cpp)
   target_include_directories(vulkan_device_filter_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   add_test(NAME vulkan_device_filter COMMAND vulkan_device_filter_test)
+  # LEONIDA_HOST_IMAGE_COPY's choice (runtime/src/host_image_copy_policy.h): pure stdlib, no Vulkan instance.
+  add_executable(host_image_copy_policy_test test/host_image_copy_policy_test.cpp)
+  target_include_directories(host_image_copy_policy_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  add_test(NAME host_image_copy_policy COMMAND host_image_copy_policy_test)
+  add_executable(title_texture_refresh_test test/title_texture_refresh_test.cpp)
+  add_test(NAME title_texture_refresh COMMAND title_texture_refresh_test)
   add_executable(vk_presenter_capture_colour_test test/vk_presenter_capture_colour_test.cpp)
   add_test(NAME vk_presenter_capture_colour COMMAND vk_presenter_capture_colour_test)
   if(TARGET gta6rt)
@@ -1988,6 +1994,10 @@ if(NOT TARGET Vulkan::Headers)
   endif()
 endif()
 if(TARGET Vulkan::Headers)
+  # The standalone Khronos releases use glslang; older SDKs also provide glslangValidator.
+  find_program(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE NAMES glslangValidator glslang
+               HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
+
   add_executable(vulkan_device_fault_test test/vulkan_device_fault_test.cpp)
   target_link_libraries(vulkan_device_fault_test PRIVATE Vulkan::Headers)
   add_test(NAME vulkan_device_fault COMMAND vulkan_device_fault_test)
@@ -2192,9 +2202,6 @@ if(TARGET Vulkan::Headers)
     add_test(NAME vk_sync_validation COMMAND vk_sync_validation_selftest)
     set_tests_properties(vk_sync_validation PROPERTIES SKIP_RETURN_CODE 77)
   endif()
-  if(NOT Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
-    find_program(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE glslangValidator HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
-  endif()
   if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
     add_executable(vk_overlapping_occlusion_test test/vk_overlapping_occlusion_test.cpp)
     target_link_libraries(vk_overlapping_occlusion_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
@@ -2298,7 +2305,6 @@ if(TARGET Vulkan::Headers)
   if(MSVC)
     target_compile_options(vk_null_descriptor_test PRIVATE /W4 /permissive- /utf-8)
   endif()
-  find_program(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE glslangValidator HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
   if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
     set(_null_descriptors_spv ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_null_descriptors.spv)
     add_custom_command(OUTPUT ${_null_descriptors_spv}
@@ -2447,9 +2453,6 @@ if(TARGET Vulkan::Headers)
     add_test(NAME vk_present_dump_default COMMAND vk_present_dump_test --default)
     add_test(NAME vk_present_dump_invalid COMMAND vk_present_dump_test --invalid)
     set_tests_properties(vk_present_dump vk_present_dump_default vk_present_dump_invalid PROPERTIES SKIP_RETURN_CODE 77)
-  endif()
-  if(NOT Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
-    find_program(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE glslangValidator HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
   endif()
   if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
     add_executable(vk_binary_occlusion_test test/vk_binary_occlusion_test.cpp)
@@ -2988,6 +2991,13 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_fence_timing_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_fence_timing COMMAND d3d12_fence_timing_test)
     set_tests_properties(d3d12_fence_timing PROPERTIES SKIP_RETURN_CODE 77)
+    # CPU subresource copies through the staging queue wait for their own submission, not the direct queue (D9).
+    add_executable(d3d12_staged_copy_wait_test test/d3d12_staged_copy_wait_test.cpp)
+    target_link_libraries(d3d12_staged_copy_wait_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_staged_copy_wait_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_staged_copy_wait_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_staged_copy_wait COMMAND d3d12_staged_copy_wait_test)
+    set_tests_properties(d3d12_staged_copy_wait PROPERTIES SKIP_RETURN_CODE 77)
     # Fence events the host runtime sets or refuses (released fences, no fences), compared with the host devices.
     add_executable(d3d12_fence_events_test test/d3d12_fence_events_test.cpp)
     target_link_libraries(d3d12_fence_events_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
@@ -3947,9 +3957,6 @@ if(TARGET Vulkan::Headers)
 
     # The compute path: root signature, compute PSO from a translator-style index, root arguments, dispatch. Its
     # shader is GLSL written to the translator's push-constant/address contract, compiled here.
-    if(NOT Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
-      find_program(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE glslangValidator HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
-    endif()
     if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
       set(LEONIDA_TEST_CS ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_user_data.spv)
       add_custom_command(
@@ -3999,6 +4006,15 @@ if(TARGET Vulkan::Headers)
       # the title's pages at the next refresh, and the title's own newer words still win (#1537, WRITE_INVALID).
       add_test(NAME d3d12_title_window_write_back COMMAND d3d12_title_va_test --window-writeback)
       set_tests_properties(d3d12_title_window_write_back PROPERTIES SKIP_RETURN_CODE 77)
+      # No window nothing reaches: a stream-pool request just before an extent stops where it starts, and a window a
+      # slot-133 buffer replaced is retired at the next submission, its bytes returned and its memory freed.
+      add_test(NAME d3d12_title_window_orphans COMMAND d3d12_title_va_test --window-orphans)
+      set_tests_properties(d3d12_title_window_orphans PROPERTIES SKIP_RETURN_CODE 77)
+      # The same with no per-submission copy back: a retired window's GPU writes reach the title's pages only when it
+      # is freed, on the bytes no live copy changed (a buffer over the same 256-byte piece wrote the others).
+      add_test(NAME d3d12_title_window_orphans_free COMMAND d3d12_title_va_test --window-orphans)
+      set_tests_properties(d3d12_title_window_orphans_free PROPERTIES SKIP_RETURN_CODE 77
+                           ENVIRONMENT "LEONIDA_TITLE_WRITEBACK=0")
       # A write-back copy that faults on a page another guard (a geometry watch cell) keeps read-only: the fault
       # handler asks the tracker whose copy faulted too, which must not take its lock again on that thread (#2418).
       add_test(NAME d3d12_title_window_write_back_fault COMMAND d3d12_title_va_test --window-writeback-fault)
