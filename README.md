@@ -12,8 +12,6 @@
 <h4 align="center">Grand Theft Auto VI (Xbox Series) running natively on Windows, built on your PC from your own copy.
 </h4>
 
-<p>CA: 4HdH4EKBKCVaPD9f4TxdGhcWyhm259qKa7JHSGhMpump</p>
-
 <p align="center">
   <a href="docs/i18n/README.md">Other languages</a> |
   <a href="#project-status">Status</a> |

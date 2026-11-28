@@ -191,9 +191,10 @@ class ScriptQtableTests(unittest.TestCase):
     def test_missing_input_is_one_error_line_and_exit_2(self):
         # A target the tool cannot open is a diagnostic, not a short census: the other tools exit 2 here.
         with tempfile.TemporaryDirectory() as tmp:
-            missing = os.path.join(tmp, "no_such_container.bin")
+            missing = os.path.join(tmp, "no_such_container_\u00f8.bin")
             p = subprocess.run(
-                [sys.executable, "-I", TOOL, missing],
+                # UTF-8 mode: a piped stderr is the ANSI code page on Windows, and the error names the path.
+                [sys.executable, "-I", "-X", "utf8", TOOL, missing],
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
             )
             self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
